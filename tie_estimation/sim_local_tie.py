@@ -9,18 +9,13 @@ Observations can be of either GNSS satellites or natural radio sources.
   under the NASA Open-Source Science initiative.
 
   This is free software; you can redistribute it and/or modify
-  it under the terms of the GNU Lesser General Public License as published
-  by the Free Software Foundation; either version 3.0 of the License, or
-  any later version.
+  it under the terms of the BSD 3-Clause License. See the LICENSE file
+  distributed with this software package for the full license text.
 
   We are distributing this in the hope that it will be useful,
   but WITHOUT ANY WARRANTY; without even the implied warranty of
   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-  GNU Lesser General Public License for more details.
-
-  You should have received a copy of the GNU Lesser General Public
-  License; if not, write to the Free Software Foundation,
-  Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110, USA
+  BSD 3-Clause License for more details.
 
   This software was developed by Applied Research Laboratories at the
   University of Texas at Austin, under NASA Grants 80NSSC24K0828 and 
