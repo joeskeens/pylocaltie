@@ -24,7 +24,4 @@
    Austin GNSS toolkit. It has no public PyPI or conda-forge distribution, so
    `pylocaltie.yaml` does not install it. Build and install the Python
    bindings yourself following the instructions in that repo (`PYTHON.md`
-   and `INSTALL.md`) into the `pylocaltie` environment. If you're on ARL:UT's
-   network, its internal artifactory
-   (`[redacted-internal-host]/artifactory/api/conda/conda-toolkits/stable`)
-   also carries prebuilt conda packages.
+   and `INSTALL.md`) into the `pylocaltie` environment.
