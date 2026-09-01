@@ -1,16 +1,13 @@
 name: pylocaltie
 channels:
-  - http://[redacted-internal-host]/conda/pkgs/main
-  - http://[redacted-internal-host]/conda/pkgs/free
-  - https://[redacted-internal-host]/artifactory/api/conda/conda-toolkits/stable
+  - conda-forge
 dependencies:
-  - pip:
-    - georinex
   - pip
   - scipy
   - h5py
   - astropy
   - matplotlib
   - numba
-  - gnsstk
   - pytest
+  - pip:
+    - georinex
