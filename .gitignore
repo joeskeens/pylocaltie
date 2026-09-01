@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Editors
+*.swp
+*.swo
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
