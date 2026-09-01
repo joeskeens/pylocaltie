@@ -2,6 +2,26 @@
 """
 Use precise ephemerides to find high acccuracy right ascension and declination.
 Compare these to the pointing polynomials used by the VLBA.
+
+==============================================================================
+  This file is part of the PyLocalTie software package.  It has been prepared
+  under the NASA Open-Source Science initiative.
+
+  This is free software; you can redistribute it and/or modify
+  it under the terms of the BSD 3-Clause License. See the LICENSE file
+  distributed with this software package for the full license text.
+
+  We are distributing this in the hope that it will be useful,
+  but WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  BSD 3-Clause License for more details.
+
+  This software was developed by Applied Research Laboratories at the
+  University of Texas at Austin, under NASA Grants 80NSSC24K0828 and
+  80NSSC20K1732.
+
+  Copyright 2025, The Board of Regents of The University of Texas System
+==============================================================================
 """
 import datetime
 import numpy as np
