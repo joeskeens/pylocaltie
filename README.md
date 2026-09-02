@@ -24,4 +24,19 @@
    Austin GNSS toolkit. It has no public PyPI or conda-forge distribution, so
    `pylocaltie.yaml` does not install it. Build and install the Python
    bindings yourself following the instructions in that repo (`PYTHON.md`
-   and `INSTALL.md`) into the `pylocaltie` environment.
+   and `INSTALL.md`) into the `pylocaltie` environment. 
+   In the gnsstk directory: 
+   ```
+   ./build.sh -e -i $CONDA_PREFIX -j $(nproc) -- -DCMAKE_BUILD_TYPE=release
+   ```
+   NB: This may be fixed in gnsstk, but the last time I tried this I had to do
+   ```
+   sed -i 's/-DGNSSTK_EXPORT /-DGNSSTK_EXPORT= /' swig/CMakeLists.txt
+   CXXFLAGS="-include cstdint -Wno-deprecated" \
+   ./build.sh -c -e -i $CONDA_PREFIX -j $(nproc) -- -DCMAKE_BUILD_TYPE=release
+   ```
+   Due to bugs in the gnsstk build system.
+   You also may need to install swig, cmake, etc. into your conda environment if they aren't already on your machine:
+   ```
+   conda install -c conda-forge cmake swig compilers make
+   ```
