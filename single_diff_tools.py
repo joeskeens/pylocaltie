@@ -54,7 +54,7 @@ from scipy.stats import norm
 from pandas import Timestamp, Timedelta, to_datetime, to_timedelta, DataFrame, read_csv
 from collections.abc import Iterable
 from gnsstk import IonosphereFreeRange, RinexSatID, WGS84Ellipsoid, Position, AntexData, \
-                  PreciseRange, PhaseWindup, computeSolidEarthTides, MJD, TimeSystem, asTimeSystem,\
+                  computeSolidEarthTides, MJD, TimeSystem, asTimeSystem,\
                   AntexStream, EphTime, CommonTime, TimeSystem, northEastUpGeodetic,\
                   CivilTime, getTimeSystemCorrection, SatelliteSystem, NavSearchOrder, NavSatelliteID, Triple,\
                   Xvt, NavLibrary, NavDataFactory, MultiFormatNavDataFactory, SVHealth,\
@@ -119,7 +119,11 @@ planet_mu = {
 
 import matplotlib.font_manager as fm
 available_fonts = fm.findSystemFonts(fontpaths=None, fontext='ttf')
-for font in available_fonts: fm.fontManager.addfont(font)
+for font in available_fonts: 
+    try:
+        fm.fontManager.addfont(font)
+    except (NotImplementedError, RuntimeError, OSError):
+        pass
 
 # set publication-quality plotting defaults
 from cycler import cycler
