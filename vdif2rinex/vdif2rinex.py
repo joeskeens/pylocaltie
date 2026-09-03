@@ -27,7 +27,6 @@ import pickle
 from datetime import datetime, timedelta, timezone
 import gnsstk
 import sys
-sys.path.insert(0, '/home/jskeens/gnssvlbi/software/analysis')
 from single_diff_tools import import_key_gnss, read_key, AntennaInfo, GNSSTKStores, date_to_common, find_sigmas, NavStore
 from acq_routines import acq_prn_fft, analytic_signal_fft_1d, oversample_prn_code, shift_code_phase, compute_Gd_numeric_noncoherent,\
         compute_Gd_numeric_coherent, l1cp_overlay_s1, weil_code_from_wp, cs_hex_to_pm1, acq_aided, decode_nav_list, decode_e1b_with_time
