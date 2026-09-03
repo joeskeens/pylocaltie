@@ -7485,11 +7485,11 @@ class GNSSTKStores(object):
         rx2sat_mdt1 /= np.linalg.norm(rx2sat_mdt1) # normalize vector
         
         # adjust new satellite position for PCO/PCV
-        eph_time.addSeconds(-delta_1)
+        #eph_time.addSeconds(-delta_1)
         if PCV:
             sat_pos_mdt1 = self.sat_adj_PC(freq, sat_antenna, time_gps, eph_time, sat_xvt_mdt1.x, rx2sat_mdt1)
         x0_dt1, v0_dt1 = ECEF2ECI(-delta_1, sat_pos_mdt1, sat_vel_mdt1)
-        eph_time.addSeconds(delta_1)
+        #eph_time.addSeconds(delta_1)
         
         # compute adjusted pointing vector
         x_01 = v0_dt1*delta_1 + x0_dt1 - x1
@@ -7516,7 +7516,6 @@ class GNSSTKStores(object):
             
             # correct for LOS change due to Earth rotation -- this is where the rx 'sees' the satellite
             # NB: neglecting change in rx2sat vector 
-            eph_time.addSeconds
             if PCV:
                 sat_pos_final = self.sat_adj_PC(freq, sat_antenna, time_gps, eph_time, sat_xvt_corr.x, rx2sat_mdt1)
             else:

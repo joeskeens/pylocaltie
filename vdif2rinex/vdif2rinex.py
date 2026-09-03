@@ -970,7 +970,7 @@ def process_vdif(vdif_files, vdif_files_dual, output_files, satellites, rc_dir, 
 
             # get VDIF file setup
             thread_dual = thread+1
-            vdif_stats_dual, header_dual = get_vdif_stats(vdif_file_dual, thread_dual, args.num_channels)
+            vdif_stats_dual, header_dual = get_vdif_stats(vdif_file_dual, thread_dual, num_channels)
             consumed_dual = 0
             #total_bytes_dual = os.fstat(vdif_file_dual.fileno()).st_size
             total_bytes_dual = vdif_file_dual.shape[0]
