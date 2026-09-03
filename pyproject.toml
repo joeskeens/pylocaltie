@@ -16,5 +16,5 @@ requires-python = ">=3.10"
 # `from single_diff_tools import ...` resolves from any script, in any
 # subdirectory, regardless of current working directory.
 [tool.setuptools]
-py-modules = ["single_diff_tools"]
+py-modules = ["single_diff_tools", "LAMBDA"]
 packages = []
