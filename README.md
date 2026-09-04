@@ -42,3 +42,12 @@
    ```
    (SWIG 4.5 broke the RINEX header generation in vdif2rinex. I can confirm
    that 4.0.3 works)
+
+   OPTIONAL: **gnsstk-apps** (https://github.com/SGL-UT/gnsstk-apps)
+   ```
+   sed -i 's/-std=c++11/-std=c++17/' BuildSetup.cmake
+   CXXFLAGS="-include cstdint -Wno-deprecated" \
+   ./build.sh -c -e -i $CONDA_PREFIX -j $(nproc) -- -DCMAKE_BUILD_TYPE=release
+   ```
+   This repo has useful tools like RinEdit, which can be used to combine RINEX
+   files produced by vdif2rinex.py.
