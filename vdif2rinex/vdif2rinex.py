@@ -503,6 +503,11 @@ def add_args_to_parser(parser):
                          default=None,
                          help="Max number of seconds to correlate.",
                          )
+    parser.add_argument("--C_N0_min",
+                         type=int,
+                         default=None,
+                         help="Minimum C/N0 (dB-Hz) for observation. Overrides values in resolve_rinex_obs",
+                         )
     parser.add_argument("--blind_search",
                          action="store_true",
                          default=False,
@@ -937,7 +942,7 @@ class RinexFile():
         gnsstk.writeRinex3Obs(os.path.abspath(self.filename), self.header, self.dataset)
 
 def process_vdif(vdif_files, vdif_files_dual, output_files, satellites, rc_dir, thread, num_channels, channel,\
-        acq_cadence, f_IF, f_sky, store_handle, antenna_handle, aided=False, short_circuit=False, max_time=None):
+        acq_cadence, f_IF, f_sky, store_handle, antenna_handle, aided=False, short_circuit=False, max_time=None, C_N0_min=None):
     """ Read VDIF files, track GNSS signals """
     #if f_sky == 1176.45e6: short_circuit=True
     for idx, vdif_file_handle in enumerate(vdif_files):
@@ -1091,7 +1096,7 @@ def process_vdif(vdif_files, vdif_files_dual, output_files, satellites, rc_dir, 
                     soft_bits_full = pickle.load(f)
 
         print(f'uprighting bits and creating RINEX observables for source {source}')
-        resolve_rinex_obs(output_file, f_sky, source, soft_bits_full, hard_bits_full, model_full, store_handle, antenna_handle, time_gps, time_shift, aided, short_circuit)
+        resolve_rinex_obs(output_file, f_sky, source, soft_bits_full, hard_bits_full, model_full, store_handle, antenna_handle, time_gps, time_shift, aided, short_circuit, C_N0_min)
 
         print(f"Total bytes processed={consumed}")
 
@@ -2336,7 +2341,7 @@ def running_mean_block_average(x, N_win, N_avg):
 
     return out
 
-def resolve_rinex_obs(output_file, f_sky, source, soft_bits_full, hard_bits_full, model_full, store_handle, antenna_handle, time_gps, time_shift, aided, short_circuit):
+def resolve_rinex_obs(output_file, f_sky, source, soft_bits_full, hard_bits_full, model_full, store_handle, antenna_handle, time_gps, time_shift, aided, short_circuit, C_N0_min):
     """ Upright data bits, assimilate models, and produce RINEX observables """
     ranging_codes =  [key for key in model_full[0].keys()]
     nu_arr = []
@@ -2353,6 +2358,9 @@ def resolve_rinex_obs(output_file, f_sky, source, soft_bits_full, hard_bits_full
         C_N0_MIN = 52 # dB-Hz
     else:
         C_N0_MIN = 40
+    if C_N0_min is not None:
+        C_N0_MIN = C_N0_min
+
     use_idxs = np.zeros(len(model_full), dtype=bool)
     for idx, rc in enumerate(ranging_codes):
         C_N0_arr = []
@@ -2758,10 +2766,10 @@ def main():
 
     if args.input_files is not None:
         process_vdif(args.input_files[0], None, args.output_files[0], satellite, args.rc_directory, args.thread, \
-                args.num_channels, args.channel, args.acq_cadence, args.center_freq, args.sky_freq, store_handle, antenna_handle, aided, args.short_circuit, args.max_time)
+                args.num_channels, args.channel, args.acq_cadence, args.center_freq, args.sky_freq, store_handle, antenna_handle, aided, args.short_circuit, args.max_time, args.C_N0_min)
     elif args.input_files_x is not None and args.input_files_y is not None:
         process_vdif(args.input_files_x[0], args.input_files_y[0], args.output_files[0], satellite, args.rc_directory, args.thread, \
-                args.num_channels, args.channel, args.acq_cadence, args.center_freq, args.sky_freq, store_handle, antenna_handle, aided, args.short_circuit, args.max_time)
+                args.num_channels, args.channel, args.acq_cadence, args.center_freq, args.sky_freq, store_handle, antenna_handle, aided, args.short_circuit, args.max_time, args.C_N0_min)
     else:
         raise ValueError('Need to supply either R polarization or X + Y polarization input files')
 

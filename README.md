@@ -38,5 +38,7 @@
    Due to bugs in the gnsstk build system.
    You also may need to install swig, cmake, etc. into your conda environment if they aren't already on your machine:
    ```
-   conda install -c conda-forge cmake swig compilers make
+   conda install -c conda-forge cmake swig<4.3 compilers make
    ```
+   (SWIG 4.5 broke the RINEX header generation in vdif2rinex. I can confirm
+   that 4.0.3 works)
