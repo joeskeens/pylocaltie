@@ -353,6 +353,313 @@ def dms_to_deg(dms):
     d, m, s = [float(x) for x in dms.strip('+-').split(':')]
     return sign * (d + m / 60 + s / 3600)
 
+# RINEX3 satellite ID, e.g. E25, G07, C13
+SV_PATTERN = re.compile(r'^[GREJCIS]\d{2}$')
+ 
+# ----------------------------------------------------------------------------
+# low-level VEX parsing helpers
+# ----------------------------------------------------------------------------
+ 
+def _vex_strip_comments(text):
+    """ Remove VEX comments ('*' to end of line) """
+    lines = []
+    for line in text.splitlines():
+        idx = line.find('*')
+        if idx >= 0:
+            line = line[:idx]
+        lines.append(line)
+    return '\n'.join(lines)
+ 
+ 
+def _vex_blocks(vex_file):
+    """ Return {block_name: [statement, ...]} for a VEX file (statements are ';' delimited) """
+    with open(vex_file, 'r') as f:
+        text = _vex_strip_comments(f.read())
+ 
+    parts = re.split(r'\$([A-Za-z_]+)\s*;', text)
+    blocks = {}
+    for idx in range(1, len(parts) - 1, 2):
+        name = parts[idx].upper()
+        stmts = [s.strip() for s in parts[idx + 1].split(';')]
+        blocks.setdefault(name, []).extend([s for s in stmts if s])
+    return blocks
+ 
+ 
+def _vex_defs(statements):
+    """ Split a block's statements into {def_name: [statement, ...]} """
+    defs = {}
+    name = None
+    for stmt in statements:
+        low = stmt.lower()
+        if low.startswith('def '):
+            name = stmt[4:].strip()
+            defs[name] = []
+        elif low.startswith('enddef'):
+            name = None
+        elif name is not None:
+            defs[name].append(stmt)
+    return defs
+ 
+ 
+def _vex_value(stmt):
+    """ Return the right hand side of 'keyword = value' """
+    return stmt.split('=', 1)[1].strip()
+ 
+ 
+def _vex_epoch(epoch_str):
+    """ Convert a VEX epoch (2025y207d01h00m00s) to a datetime """
+    match = re.match(r'\s*(\d+)y(\d+)d(?:(\d+)h)?(?:(\d+)m)?(?:([\d.]+)s)?', epoch_str)
+    if match is None:
+        raise ValueError('Cannot parse VEX epoch ' + epoch_str)
+    year, day = int(match.group(1)), int(match.group(2))
+    hour = int(match.group(3)) if match.group(3) else 0
+    minute = int(match.group(4)) if match.group(4) else 0
+    second = float(match.group(5)) if match.group(5) else 0.0
+    return datetime.datetime(year, 1, 1) + datetime.timedelta(days=day - 1, hours=hour,
+                                                              minutes=minute, seconds=second)
+ 
+ 
+def _vex_ra_dec(ra_str, dec_str):
+    """ Convert VEX 02h40m08.17444s / -23d09'15.72989" to decimal degrees """
+    ra_hms = re.sub(r'[hm]', ':', ra_str.strip()).rstrip('s')
+    dec_dms = re.sub(r"[d']", ':', dec_str.strip()).rstrip('"')
+    return hms_to_deg(ra_hms), dms_to_deg(dec_dms)
+ 
+ 
+def _vex_seconds(field):
+    """ Parse a scan station field like '  30 sec' """
+    return float(field.replace('sec', '').strip())
+ 
+ 
+# ----------------------------------------------------------------------------
+# VEX equivalent of read_key()
+# ----------------------------------------------------------------------------
+ 
+def read_vex(vex_file, stations=None, sat_only=True):
+    """
+    Read a VEX schedule file and output the same arrays as read_key().
+ 
+    Args:
+        vex_file (str): VEX schedule file.
+ 
+    Keyword Args:
+        stations (list): station IDs ('Hb') or site names ('HOBART12') that must all be
+                         present in a scan for it to be kept.  Scan start/duration are taken
+                         from these stations only.  Default (None) uses every station in the scan.
+        sat_only (bool): keep only scans whose source maps to a RINEX satellite ID
+                         (drops fringe-check/calibrator scans on natural sources).
+ 
+    Returns:
+        sources_ra_dec, full_source_names, duration_array, source_array,
+        ra_array, dec_array, datetime_array, scan_nums
+    """
+    blocks = _vex_blocks(vex_file)
+ 
+    # --- station ID <-> site name map (from $SITE, cross-checked with $STATION) ---
+    id_of = {}
+    for site_name, stmts in _vex_defs(blocks.get('SITE', [])).items():
+        site_id = site_name
+        for stmt in stmts:
+            if stmt.lower().startswith('site_id'):
+                site_id = _vex_value(stmt)
+        id_of[site_id.upper()] = site_id
+        id_of[site_name.upper()] = site_id
+    for station_id in _vex_defs(blocks.get('STATION', [])):
+        id_of.setdefault(station_id.upper(), station_id)
+ 
+    if stations is not None:
+        stations_use = []
+        for station in stations:
+            if station.upper() not in id_of:
+                raise ValueError('Station ' + station + ' not found in ' + vex_file)
+            stations_use.append(id_of[station.upper()])
+        stations_use = set(stations_use)
+    else:
+        stations_use = None
+ 
+    # --- source coordinates from $SOURCE ---
+    src_coords = {}
+    for source_name, stmts in _vex_defs(blocks.get('SOURCE', [])).items():
+        ra_str = dec_str = None
+        name = source_name
+        for stmt in stmts:
+            low = stmt.lower()
+            if low.startswith('source_name'):
+                name = _vex_value(stmt)
+            elif low.startswith('ra_rate') or low.startswith('dec_rate'):
+                continue
+            elif low.startswith('ra'):
+                ra_str = _vex_value(stmt)
+            elif low.startswith('dec'):
+                dec_str = _vex_value(stmt)
+        if ra_str is None or dec_str is None:
+            continue
+        ra, dec = _vex_ra_dec(ra_str, dec_str)
+        src_coords[name] = (ra, dec)
+        src_coords[source_name] = (ra, dec)
+ 
+    # --- scans from $SCHED ---
+    datetime_array = []
+    source_array = []
+    full_source_names = []
+    duration_array = []
+    scan_nums = []
+    UTC2GPS = 0
+ 
+    scan_num = None
+    start_dt = None
+    source = None
+    offsets = []
+    for stmt in blocks.get('SCHED', []):
+        low = stmt.lower()
+        if low.startswith('scan '):
+            scan_num, start_dt, source, offsets = stmt[5:].strip(), None, None, []
+        elif low.startswith('start'):
+            start_dt = _vex_epoch(_vex_value(stmt))
+        elif low.startswith('source'):
+            source = _vex_value(stmt)
+        elif low.startswith('station'):
+            fields = _vex_value(stmt).split(':')
+            station_id = fields[0].strip()
+            if stations_use is not None and station_id not in stations_use:
+                continue
+            offsets.append((_vex_seconds(fields[1]), _vex_seconds(fields[2])))
+        elif low.startswith('endscan'):
+            if start_dt is None or source is None or len(offsets) == 0:
+                continue
+            if stations_use is not None and len(offsets) < len(stations_use):
+                continue  # a requested station did not observe this scan
+ 
+            # RINEX-style source ID, same convention as read_key()
+            if len(source) > 3:
+                src_id = source[0] + source[2] + source[3]
+            else:
+                src_id = source[0:3]
+            if sat_only and SV_PATTERN.match(src_id) is None:
+                continue
+ 
+            beg = min(off[0] for off in offsets)
+            end = max(off[1] for off in offsets)
+            dt = start_dt + datetime.timedelta(seconds=beg)
+ 
+            # VEX epochs are UTC -- shift to GPS as read_key() does
+            if UTC2GPS == 0:
+                civt = CivilTime()
+                civt.convertFromCommonTime(date_to_common(dt))
+                UTC2GPS = getTimeSystemCorrection(TimeSystem.UTC, TimeSystem.GPS,
+                                                  civt.year, civt.month, civt.day)
+            datetime_array.append(dt + datetime.timedelta(seconds=UTC2GPS))
+ 
+            scan_nums.append(scan_num)
+            full_source_names.append(source)
+            source_array.append(src_id)
+            duration_array.append(end - beg)
+ 
+    # --- pointing directions: only useful if every scheduled source has real coordinates.
+    # Satellite sources are usually placeholders (00h00m00s / +00d00'00") in a VEX file.
+    ra_array = []
+    dec_array = []
+    sources_ra_dec = []
+    have_coords = all(src_coords.get(src, (0.0, 0.0)) != (0.0, 0.0)
+                      for src in set(full_source_names))
+    if have_coords:
+        for src in sorted(set(full_source_names)):
+            sources_ra_dec.append(src)
+            ra_array.append(src_coords[src][0])
+            dec_array.append(src_coords[src][1])
+    sources_ra_dec = np.array(sources_ra_dec)
+ 
+    return sources_ra_dec, full_source_names, duration_array, source_array, \
+           ra_array, dec_array, datetime_array, scan_nums
+ 
+ 
+# ----------------------------------------------------------------------------
+# shared expansion of a schedule into per-epoch arrays
+# (body lifted verbatim from import_key_gnss -- that function can now be:
+#      def import_key_gnss(rinex_files, full_data, key_file, sim_data_rate=1):
+#          return _expand_schedule_gnss(rinex_files, full_data, sim_data_rate,
+#                                       *read_key(key_file))
+# ----------------------------------------------------------------------------
+ 
+def _expand_schedule_gnss(rinex_files, full_data, sim_data_rate, sources_ra_dec,
+                          full_source_names, duration_array, source_array,
+                          ra_array, dec_array, datetime_array, scan_nums):
+    """ Expand a scan schedule to per-epoch arrays, keeping only good data """
+    source_array_full = []
+    datetime_array_full = []
+    point_ra_dec_full = []
+    point_ra_dec = []
+    nscans = 0
+    for time_idx, time_obs in enumerate(datetime_array):
+        times_arr = []
+        src = source_array[time_idx]
+        if len(rinex_files) > 0:
+            for ant_idx, rinex_file in enumerate(rinex_files):
+                rinex_obs = full_data[rinex_file]
+                beg_time = time_obs
+                end_time = time_obs + to_timedelta(duration_array[time_idx], unit='s')
+                try:
+                    obs_sv = rinex_obs.sel(sv=src).dropna(dim='time', how='all')
+                    obs_time = obs_sv.sel(time=slice(beg_time, end_time))
+                except:  # no observations of the satellite at this epoch
+                    times_arr = []
+                    break
+                # check that data is good
+                SNR_vars = [var for var in obs_time.data_vars if var.startswith('S')]
+                idxs_good = np.zeros(len(obs_time.C1.values), dtype=bool)
+                for SNR_var in SNR_vars:
+                    idxs_good = np.bitwise_or(idxs_good, ~np.isnan(obs_time[str(SNR_var)].values))
+ 
+                if ant_idx == 0:
+                    times_arr = np.array(obs_time.time)
+                else:
+                    times_arr = np.union1d(times_arr, np.array(obs_time.time[idxs_good]))
+        else:
+            if sim_data_rate != 0:
+                duration = duration_array[time_idx]
+                time_dt = np.datetime64(time_obs, 'ns')
+                end_time = time_dt + np.timedelta64(int(duration * 1e9), 'ns')
+                times_arr = np.arange(time_dt, end_time + np.timedelta64(int(sim_data_rate * 1e9), 'ns'),
+                                      np.timedelta64(int(sim_data_rate * 1e9), 'ns'))
+            else:
+                times_arr = [np.datetime64(time_obs, 'ns')]
+ 
+        full_source = full_source_names[time_idx]
+        if len(sources_ra_dec) > 0:
+            source_idx = np.argwhere(sources_ra_dec == full_source)
+            if len(source_idx) == 0 and len(ra_array) > 0:
+                raise Exception('Source ' + full_source + ' in schedule has no dish pointing angle')
+        if len(ra_array) > 0:
+            ra = ra_array[source_idx[0][0]]
+            dec = dec_array[source_idx[0][0]]
+            point_ra_dec.append((ra, dec))
+ 
+        if len(times_arr) > 0:
+            nscans += 1
+        for time in times_arr:
+            datetime_array_full.append(time)
+            source_array_full.append(src)
+            if len(ra_array) > 0:
+                point_ra_dec_full.append((ra, dec))
+    print('Number of scans: ' + str(nscans))
+    if len(point_ra_dec_full) == 0:
+        point_ra_dec_full = None
+ 
+    return datetime_array_full, source_array_full, point_ra_dec_full, \
+           datetime_array, duration_array, source_array, point_ra_dec
+ 
+ 
+def import_vex_gnss(rinex_files, full_data, vex_file, sim_data_rate=1,
+                    stations=None, sat_only=True):
+    """
+    Read a VEX schedule file and output source arrays corresponding to good data.
+    Drop-in replacement for import_key_gnss() with a VEX file in place of the key file.
+ 
+    NB: currently supports only single-frequency
+    """
+    return _expand_schedule_gnss(rinex_files, full_data, sim_data_rate,
+                                 *read_vex(vex_file, stations=stations, sat_only=sat_only))
+
 def import_key_gnss(rinex_files, full_data, key_file, sim_data_rate=1):
     """
     Read key file and output source arrays corresponding to good data.

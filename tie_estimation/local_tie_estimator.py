@@ -27,19 +27,13 @@ GNSS satellites or natural radio sources.
 
 import LAMBDA
 import os
+from pathlib import Path
 use_custom_version = os.getenv('USE_CUSTOM_GEORINEX', 'false').lower() == 'true'
 if use_custom_version:
     import sys
-    sys.path.insert(0, '/home/jskeens/oscar_dir/scratch/jskeens')
-    sys.path.insert(0, '/trashcan/scratch/jskeens')
-    from georinex_custom import load
-    #sys.path.insert(0, '/sgl/ceph/work/jskeens')
-    #try: 
-    #    from georinex_custom import load
-    #except: 
-    #    sys.path.insert(0, '/home/jskeens/oscar_dir/scratch/jskeens')
-    #    sys.path.insert(0, '/trashcan/scratch/jskeens')
-    #    from georinex_custom import load
+    module_path = str(Path("~/georinex/src").expanduser())
+    sys.path.insert(0, module_path)
+    from georinex import load
 else:
     from georinex import load
 
@@ -64,7 +58,7 @@ import matplotlib.dates as mdates
 from gnsstk import std_vector_string, Position, AntennaStore, AntexData, OceanLoadTides, PoleTides, \
                   AtmLoadTides, SolarSystem, GlobalTropModel, SaasTropModel, NeillTropModel
 
-from single_diff_tools import import_key_gnss, import_data_vlbi, import_data_vlbi_farfield, import_data_vlbi_ngs, import_data_vlbi_vgosdb, \
+from single_diff_tools import import_key_gnss, import_vex_gnss, import_data_vlbi, import_data_vlbi_farfield, import_data_vlbi_ngs, import_data_vlbi_vgosdb, \
                   import_data_vlbi_vda, write_SINEX, datetime64_to_mjd, map_datasets, import_data_nc_sim,\
                   find_common_epochs, BaselineInfo, AntennaInfo, GNSSTKStores, ECEF2ECI, slip_detect_MW, slip_detect_single_freq,\
                   slip_detect_phase_delay, sample_poly_at_interval, trim_amb_Zdom, trim_amb_state, gen_phase_clock_state, adjust_stoch_params, thin_data,\
@@ -129,6 +123,9 @@ def add_args_to_parser(parser_in):
                          )
     parser.add_argument("--key_file", default=None,
                          help="Name of key file determining schedule. Source prefixes must match RINEX satellite names"
+                         )
+    parser.add_argument("--vex_file", default=None,
+                         help="Name of vex file determining schedule. Source prefixes must match RINEX satellite names"
                          )
     parser.add_argument("--src_file", default=None,
                          help="Name of source file (i.e. glo.src) giving far-field source positions in RA/Dec if using fringe_file"
@@ -2134,7 +2131,7 @@ if __name__ == '__main__':
             rinex_name = rinex_file.split('.')
             if rinex_name[1][-1] == 'o' or rinex_name[1] =='rnx': 
                 rinex_data_full = load(rinex_file)
-                #rinex_data_full.to_netcdf(rinex_name[0]+'.nc')
+                rinex_data_full.to_netcdf(rinex_name[-2]+'.nc')
             elif rinex_name[1] == 'nc':
                 rinex_data_full = xr.open_dataset(rinex_file)
             else:
@@ -2162,6 +2159,9 @@ if __name__ == '__main__':
         if args.key_file is not None:
             datetime_array, source_array, point_ra_dec_array, dt_key, duration_key, source_key, point_key  \
                     = import_key_gnss(rinex_files, full_data, args.key_file)
+        if args.vex_file is not None:
+            datetime_array, source_array, point_ra_dec_array, dt_key, duration_key, source_key, point_key  \
+                    = import_vex_gnss(rinex_files, full_data, args.vex_file)
         else:
             for idx, rinex_file in enumerate(rinex_files):
                 rinex_data = full_data[rinex_file]

@@ -1,0 +1,66 @@
+diff --git a/swig/Geomatics/Geomatics.i b/swig/Geomatics/Geomatics.i
+index cfca22995..1b5f70c1b 100644
+--- a/swig/Geomatics/Geomatics.i
++++ b/swig/Geomatics/Geomatics.i
+@@ -89,13 +89,16 @@ namespace std
+ %feature("flatnested", "");
+ %include "AntexHeader.hpp"
+ %include "AntexStream.hpp"
++%apply std::string &OUTPUT { std::string &name };
+ %include "AntennaStore.hpp"
++%clear std::string &name;
+ %include "EphTime.hpp"
+ %include "AtmLoadTides.hpp"
+ %include "CubicSpline.hpp"
+ /* %include "SatPass.hpp" */
+ /* %include "DiscCorr.hpp" */
+ %include "IERSConvention.hpp"
++%ignore gnsstk::EarthOrientation::ECEFtoJ2000;
+ %include "EarthOrientation.hpp"
+ %include "EOPPrediction.hpp"
+ %include "EOPStore.hpp"
+@@ -127,7 +130,7 @@ namespace std
+ %include "SolidEarthTides.hpp"
+ %include "SunEarthSatGeometry.i"
+ %include "SolarSystem.hpp"
+-%include "PreciseRange.hpp"
++/* %include "PreciseRange.hpp" */
+ /* %include "Rinex3ObsFileLoader.hpp" */
+ /* %include "SRIleastSquares.hpp" */
+ /* %include "SatPassIterator.hpp" */
+diff --git a/swig/gnsstk_swig.hpp b/swig/gnsstk_swig.hpp
+index fa8d10156..1988b476d 100644
+--- a/swig/gnsstk_swig.hpp
++++ b/swig/gnsstk_swig.hpp
+@@ -387,7 +387,7 @@
+ #include "SolidEarthTides.hpp"
+ #include "SunEarthSatGeometry.hpp"
+ #include "SolarSystem.hpp"
+-#include "PreciseRange.hpp" 
++/* #include "PreciseRange.hpp" */
+ #include "RACRotation.hpp"
+ /* #include "RTFileFrame.hpp" */
+ #include "Rinex3ClockBase.hpp"
+diff --git a/swig/gnsstk_swig.i b/swig/gnsstk_swig.i
+index 51ff7b48e..f56a26e48 100644
+--- a/swig/gnsstk_swig.i
++++ b/swig/gnsstk_swig.i
+@@ -225,6 +225,7 @@
+ /* %import(module="gnsstk") "DiscCorr.hpp" */
+ %import(module="gnsstk") "ENUUtil.hpp"
+ %import(module="gnsstk") "IERSConvention.hpp"
++%ignore gnsstk::EarthOrientation::ECEFtoJ2000;
+ %import(module="gnsstk") "EarthOrientation.hpp"
+ %import(module="gnsstk") "EOPPrediction.hpp" 
+ %import(module="gnsstk") "EOPStore.hpp" 
+@@ -458,8 +459,8 @@
+ %import(module="gnsstk") "SolarSystemEphemeris.hpp"
+ %import(module="gnsstk") "SunEarthSatGeometry.i"
+ %import(module="gnsstk") "SolidEarthTides.hpp"
+-%import(module="gnsstk") "SolarSystem.hpp" */
+-%import(module="gnsstk") "PreciseRange.hpp" */
++%import(module="gnsstk") "SolarSystem.hpp" 
++/* %import(module="gnsstk") "PreciseRange.hpp" */
+ %import(module="gnsstk") "RACRotation.hpp"
+ %import(module="gnsstk") "RNDouble.hpp"
+ /* %import(module="gnsstk") "RTFileFrame.hpp" */
