@@ -977,8 +977,7 @@ def lstsq_estimation(sol_type, plot_intermediate_results, ref_antenna, store_han
                 idx_start = 0
             rxpos = antenna_handle.ref_pos
             state[count*3:count*3+3] = rxpos
-            try: state[n_rxpos+n_clock_loop+idx_start] = antenna_handle.bulk_clock
-            except: breakpoint()
+            state[n_rxpos+n_clock_loop+idx_start] = antenna_handle.bulk_clock
 
             if store_handle.stochastic_clock is False:
                 antenna_handle.hold_range_clock_params(slice(n_clock_loop,n_clock_loop + nclock), antenna_handle.times_gps)
@@ -2408,7 +2407,6 @@ if __name__ == '__main__':
                 estimate_grav_def = True
             else:
                 estimate_grav_def = False
-
 
             if estimate_ao_ant and estimate_grav_def:
                 raise ValueError('Cannot estimate both axis offset and gravitational deformation (cos(el) term in both)')

@@ -966,7 +966,8 @@ def process_vdif(vdif_files, vdif_files_dual, output_files, satellites, rc_dir, 
         frame_len = header.data_frame_len
         header_size = VDIFHeader.size()
         word_size = VDIFHeader.WORD_SIZE
-
+        
+        n_skip=0
         if vdif_files_dual is not None:
             vdif_file_handle_dual = vdif_files_dual[idx]
             vdif_file_end_dual = os.path.basename(vdif_file_handle_dual)
@@ -984,15 +985,19 @@ def process_vdif(vdif_files, vdif_files_dual, output_files, satellites, rc_dir, 
             start_sec = header.seconds_from_ref_epoch + header.frame_no/vdif_stats.frames_per_sec
             start_sec_dual = header_dual.seconds_from_ref_epoch + header_dual.frame_no/vdif_stats.frames_per_sec
             frame_diff = int(np.round((start_sec - start_sec_dual)*vdif_stats.frames_per_sec))
+            n_skip = 0
             if frame_diff > 0:
                 # mismatch of start time -- need to align
                 consumed_dual += frame_diff*frame_len_dual
             elif frame_diff < 0:
                 consumed += abs(frame_diff)*frame_len
+                n_skip = abs(frame_diff)   # primary advanced; start epoch moves with it
 
 
         # remove tz info from file_start_utc to avoid warning 
         time_gps = np.datetime64(vdif_stats.file_start_utc.astimezone(timezone.utc).replace(tzinfo=None)) + np.timedelta64(UTC2GPS, 's')
+        sec_off, frame_off = divmod(header.frame_no + n_skip, vdif_stats.frames_per_sec)
+        time_gps += np.timedelta64(int(sec_off), 's')
         if satellites is not None:
             source = satellites[0]
         else:
@@ -1006,7 +1011,7 @@ def process_vdif(vdif_files, vdif_files_dual, output_files, satellites, rc_dir, 
                 closest_key = keys[np.argmin(deltas)]
                 source = store_handle.source_time_dict[closest_key]
 
-        time_shift = header.frame_no/vdif_stats.frames_per_sec # sec
+        time_shift = frame_off/vdif_stats.frames_per_sec # sec
         time_start = time_gps + np.timedelta64(int(time_shift*1e9), 'ns') # correct for start of VDIF
 
         if not short_circuit:

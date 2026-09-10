@@ -12267,31 +12267,31 @@ def analyze_ls_solution(sol_type, plot_results, ref_antenna, clock_idxs, trop_id
             #plt.close(fig)
 
             # plot gr_del residuals by source
-            #fig, ax = plt.subplots(figsize=(10, 6))
-            #for src in np.unique(source_array):
-            #    # get epochs of source
-            #    idxs_src = []
-            #    for idx, time in enumerate(times_gps):
-            #        if src == store_handle.source_time_dict[time]:
-            #            idxs_src.append(idx)
-            #    idx_src = np.array(idxs_src)
-            #    if phase_delay is True:
-            #        idxs_src, _, range_idxs = np.intersect1d(idxs_src, baseline_handle.range_data_idxs, return_indices=True)
-            #        ax.plot(time_deltas_full[idxs_src], residuals_range[range_idxs], marker='x', linestyle='None', label=src)
-            #    else:
-            #        ax.plot(time_deltas_full[idxs_src], residuals_range[idxs_src], marker='x', linestyle='None', label=src)
-            #ax.set_title('by-source ' +label1+' residuals (' + antenna2_handle.antenna_name + '—' + antenna1_handle.antenna_name + ')')
-            #ax.set_xlabel('time (sec)')
-            #ax.set_ylabel('meas. residuals (m)')
-            ##ax.legend()
-            ## Formatting the date on the x-axis
-            #if iono_free is True:
-            #    fig.savefig('./slip_figs/'+sol_type+'_'+sol_name+'_full_meas_residuals_'+\
-            #            antenna2_handle.antenna_name+'_' + antenna1_handle.antenna_name + 'ionofree.png')
-            #else:
-            #    fig.savefig('./slip_figs/'+sol_type+'_'+sol_name+'_full_meas_residuals_'+\
-            #            antenna2_handle.antenna_name+'_' + antenna1_handle.antenna_name + '.png')       
-            #plt.close(fig)
+            fig, ax = plt.subplots(figsize=(10, 6))
+            for src in np.unique(source_array):
+                # get epochs of source
+                idxs_src = []
+                for idx, time in enumerate(times_gps):
+                    if src == store_handle.source_time_dict[time]:
+                        idxs_src.append(idx)
+                idx_src = np.array(idxs_src)
+                if phase_delay is True:
+                    idxs_src, _, range_idxs = np.intersect1d(idxs_src, baseline_handle.range_data_idxs, return_indices=True)
+                    ax.plot(time_deltas_full[idxs_src], residuals_range[range_idxs], marker='x', linestyle='None', label=src)
+                else:
+                    ax.plot(time_deltas_full[idxs_src], residuals_range[idxs_src], marker='x', linestyle='None', label=src)
+            ax.set_title('by-source ' +label1+' residuals (' + antenna2_handle.antenna_name + '—' + antenna1_handle.antenna_name + ')')
+            ax.set_xlabel('time (sec)')
+            ax.set_ylabel('meas. residuals (m)')
+            #ax.legend()
+            # Formatting the date on the x-axis
+            if iono_free is True:
+                fig.savefig(sol_type+'_'+sol_name+'_full_meas_residuals_'+\
+                        antenna2_handle.antenna_name+'_' + antenna1_handle.antenna_name + '_bysrc_ionofree.png')
+            else:
+                fig.savefig(sol_type+'_'+sol_name+'_full_meas_residuals_'+\
+                        antenna2_handle.antenna_name+'_' + antenna1_handle.antenna_name + '_bysrc.png')       
+            plt.close(fig)
 
             # plot clock function
             fig, ax1 = plt.subplots(figsize=(10, 6))
