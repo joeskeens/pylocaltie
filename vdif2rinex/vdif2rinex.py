@@ -27,13 +27,13 @@ import pickle
 from datetime import datetime, timedelta, timezone
 import gnsstk
 import sys
-from single_diff_tools import import_key_gnss, read_key, AntennaInfo, GNSSTKStores, date_to_common, find_sigmas, NavStore
+from single_diff_tools import import_key_gnss, import_vex_gnss, read_key, read_vex, AntennaInfo, GNSSTKStores, date_to_common, find_sigmas, NavStore
 from acq_routines import acq_prn_fft, analytic_signal_fft_1d, oversample_prn_code, shift_code_phase, compute_Gd_numeric_noncoherent,\
         compute_Gd_numeric_coherent, l1cp_overlay_s1, weil_code_from_wp, cs_hex_to_pm1, acq_aided, decode_nav_list, decode_e1b_with_time
 import matplotlib.pyplot as plt
 import xarray as xr
 from numba import njit
-from vdif_tools import VDIFHeader, VDIFStats, get_vdif_stats, unpack_vdif_chunk
+from vdif_tools import VDIFHeader, VDIFStats, get_vdif_stats, unpack_vdif_chunk, get_vdif_stats_fast
 
 RANGING_CODES={
   'G': {
@@ -487,6 +487,9 @@ def add_args_to_parser(parser):
     parser.add_argument("--key_file", default=None,
                          help="Name of key file determining schedule. Source prefixes must match RINEX satellite names"
                          )
+    parser.add_argument("--vex_file", default=None,
+                         help="Name of key file determining schedule. Source prefixes must match RINEX satellite names"
+                         )
     parser.add_argument("--satellite", action="append", type=str, nargs="+", help = 'Alternative to key_file. Supply a satellite to track per VDIF file in RINEX format. Will override key_file if supplied')    
     parser.add_argument("--num_channels",
                          type=int,
@@ -507,6 +510,11 @@ def add_args_to_parser(parser):
                          type=int,
                          default=None,
                          help="Minimum C/N0 (dB-Hz) for observation. Overrides values in resolve_rinex_obs",
+                         )
+    parser.add_argument("--frames_per_sec",
+                         type=int,
+                         default=None,
+                         help="VDIF frames per second. If known, speeds up the --short_circuit path.",
                          )
     parser.add_argument("--blind_search",
                          action="store_true",
@@ -942,23 +950,32 @@ class RinexFile():
         gnsstk.writeRinex3Obs(os.path.abspath(self.filename), self.header, self.dataset)
 
 def process_vdif(vdif_files, vdif_files_dual, output_files, satellites, rc_dir, thread, num_channels, channel,\
-        acq_cadence, f_IF, f_sky, store_handle, antenna_handle, aided=False, short_circuit=False, max_time=None, C_N0_min=None):
+        acq_cadence, f_IF, f_sky, store_handle, antenna_handle, aided=False, short_circuit=False, max_time=None, C_N0_min=None, frames_per_sec=None):
     """ Read VDIF files, track GNSS signals """
     #if f_sky == 1176.45e6: short_circuit=True
     for idx, vdif_file_handle in enumerate(vdif_files):
         output_file = output_files[idx]
 
         # we assume one source per VDIF file 
-        vdif_file = np.memmap(vdif_file_handle, dtype=np.uint8, mode='r')
+        if short_circuit:
+            # avoid IO overflow in short circuit due to seeking
+            vdif_stats, header = get_vdif_stats_fast(vdif_file_handle, thread, num_channels, frames_per_sec)
+            #vdif_file = np.memmap(vdif_file_handle, dtype=np.uint8, mode='r')
+            #vdif_stats_check, header_check = get_vdif_stats(vdif_file, thread, num_channels)
+
+        else:
+            vdif_file = np.memmap(vdif_file_handle, dtype=np.uint8, mode='r')
+            vdif_stats, header = get_vdif_stats_fast(vdif_file_handle, thread, num_channels, frames_per_sec)
+            #vdif_stats, header = get_vdif_stats(vdif_file, thread, num_channels)
+            total_bytes = vdif_file.shape[0]
+
         vdif_file_end = os.path.basename(vdif_file_handle)
         print(f'processing file {vdif_file_end}')
 
         # get VDIF file setup
-        vdif_stats, header = get_vdif_stats(vdif_file, thread, num_channels)
         sample_rate = (vdif_stats.frames_per_sec * vdif_stats.data_bytes_per_frame * 8) \
             // (vdif_stats.bits_per_sample * vdif_stats.num_channels)
         consumed = 0
-        total_bytes = vdif_file.shape[0]
 
         IS_COMPLEX = vdif_stats.is_complex
         BITS_PER_SAMPLE = vdif_stats.bits_per_sample
@@ -971,15 +988,23 @@ def process_vdif(vdif_files, vdif_files_dual, output_files, satellites, rc_dir, 
         if vdif_files_dual is not None:
             vdif_file_handle_dual = vdif_files_dual[idx]
             vdif_file_end_dual = os.path.basename(vdif_file_handle_dual)
-            vdif_file_dual = np.memmap(vdif_file_handle_dual, dtype=np.uint8, mode='r')
+            thread_dual = thread+1
+
+            if short_circuit:
+                # avoid IO overflow in short circuit due to seeking
+                vdif_stats_dual, header_dual = get_vdif_stats_fast(vdif_file_handle_dual, thread_dual, num_channels, frames_per_sec)
+                #vdif_file_dual = np.memmap(vdif_file_handle_dual, dtype=np.uint8, mode='r')
+                #vdif_stats_dual_check, header_dual_check = get_vdif_stats(vdif_file_dual, thread_dual, num_channels)
+            else:
+                vdif_file_dual = np.memmap(vdif_file_handle_dual, dtype=np.uint8, mode='r')
+                vdif_stats_dual, header_dual = get_vdif_stats_fast(vdif_file_handle_dual, thread_dual, num_channels, frames_per_sec)
+                #vdif_stats_dual, header_dual = get_vdif_stats(vdif_file_dual, thread_dual, num_channels)
+                #total_bytes_dual = os.fstat(vdif_file_dual.fileno()).st_size
+                total_bytes_dual = vdif_file_dual.shape[0]
             print(f'processing file {vdif_file_end_dual}')
 
             # get VDIF file setup
-            thread_dual = thread+1
-            vdif_stats_dual, header_dual = get_vdif_stats(vdif_file_dual, thread_dual, num_channels)
             consumed_dual = 0
-            #total_bytes_dual = os.fstat(vdif_file_dual.fileno()).st_size
-            total_bytes_dual = vdif_file_dual.shape[0]
             frame_len_dual = header.data_frame_len
 
             start_sec = header.seconds_from_ref_epoch + header.frame_no/vdif_stats.frames_per_sec
@@ -993,7 +1018,6 @@ def process_vdif(vdif_files, vdif_files_dual, output_files, satellites, rc_dir, 
                 consumed += abs(frame_diff)*frame_len
                 n_skip = abs(frame_diff)   # primary advanced; start epoch moves with it
 
-
         # remove tz info from file_start_utc to avoid warning 
         time_gps = np.datetime64(vdif_stats.file_start_utc.astimezone(timezone.utc).replace(tzinfo=None)) + np.timedelta64(UTC2GPS, 's')
         sec_off, frame_off = divmod(header.frame_no + n_skip, vdif_stats.frames_per_sec)
@@ -1003,6 +1027,8 @@ def process_vdif(vdif_files, vdif_files_dual, output_files, satellites, rc_dir, 
         else:
             try: 
                 source = store_handle.source_time_dict[time_gps]
+                if antenna_handle.antenna_name == 'CEDUNA' and source[0] != 'E': 
+                    exit
             except:
                 # the baseband file was likely delayed due to slewing, etc. but we can
                 # find the right time tag by just searching for the closest key
@@ -2131,9 +2157,9 @@ def track(is_complex, f_sky, i_out, q_out, source, rc_dir, vdif_stats, sample_ra
         Gd = (2-(2-beta)*eml)/(2*(2-beta)) # analytic slope of true offset to code phase discriminator (E-L)/(E+L)
         do_coherent = False
         for it in range(max_iter):
-            if it >0 and C_N0 > 45: 
-                Gd=1 # dot product discriminator has unit gain
-                do_coherent = True
+            #if it >0 and C_N0 > 45: 
+            #    Gd=1 # dot product discriminator has unit gain
+            #    do_coherent = True
             cost_tau, cost_phi, phase_arr, d_arr, weight_arr, dt_true, S_prompt_arr = get_tap_meas(X_blocks, dt_full, num_blocks, N_k, ranging_code,\
                 prn_code, sample_rate, chip_rate, code_length_samples, eml, t_0, t_dot, phi_0, f_IF, f_D, f_D_dot, do_coherent)
             cost = cost_tau + cost_phi
@@ -2241,6 +2267,18 @@ def track(is_complex, f_sky, i_out, q_out, source, rc_dir, vdif_stats, sample_ra
         soft_bits_rc[ranging_code] = soft_bits
         hard_bits_rc[ranging_code] = hard_bits
         model_new[ranging_code] = (t_0, t_dot, phi_0, f_D, f_D_dot, C_N0)
+
+        if model is None:
+            np.savez(f'prompt_{source}_{ranging_code}_{antenna_handle.antenna_name}_'
+                     f'{vdif_file_handle.split("_")[-1]}.npz',
+                     S_prompt_arr=S_prompt_arr, code_period=code_period)
+
+        #S  = S_prompt_arr[1:]; S = S*np.sign(np.real(S))
+        #zb = S[:K*N_block].reshape(K, N_block)
+        #a  = np.abs(zb)
+        #ph = np.unwrap(np.angle(zb), axis=1)
+        #ph -= np.array([np.polyval(np.polyfit(np.arange(N_block), p, 1), np.arange(N_block)) for p in ph])
+        #print('phase var', ph.var(1).mean(), ' amp CV^2', (a.var(1)/a.mean(1)**2).mean())
 
         # temp -- test full model
         #dt_full = np.arange(N_k*num_blocks) * code_period / N_k 
@@ -2685,10 +2723,15 @@ def main():
     for rxpos_arg in args.rxpos:
         rxpos = [float(pos_comp) for pos_comp in rxpos_arg.split()]
 
-    if args.key_file is not None:
-        datetime_array, source_array, point_ra_dec_array, dt_key, duration_key, source_key, point_key  \
-                = import_key_gnss([], [], args.key_file, 0)
-        _, _, _, source_array_key, _, _, datetime_array_key, scan_nums_key = read_key(args.key_file)
+    if args.key_file is not None or args.vex_file is not None:
+        if args.key_file is not None:
+            datetime_array, source_array, point_ra_dec_array, dt_key, duration_key, source_key, point_key  \
+                    = import_key_gnss([], [], args.key_file, 0)
+            _, _, _, source_array_key, _, _, datetime_array_key, scan_nums_key = read_key(args.key_file)
+        else:
+            datetime_array, source_array, point_ra_dec_array, dt_key, duration_key, source_key, point_key  \
+                    = import_vex_gnss([], [], args.vex_file, 0)
+            _, _, _, source_array_key, _, _, datetime_array_key, scan_nums_key = read_vex(args.vex_file)
         times_sec = (datetime_array-datetime_array[0])/np.timedelta64(1,'s')
         avg_diff = mode(np.diff(times_sec), keepdims=True)[0][0]
 
@@ -2758,7 +2801,7 @@ def main():
     aided = not args.blind_search
 
     store_handle = GNSSTKStores('GNSS', 'GNSS', None, None, None, None, nav_store, False, '', True)
-    if args.key_file is not None:
+    if args.key_file is not None or args.vex_file is not None:
         store_handle.hold_source_array(source_array, datetime_array, duration_dict)
 
     if args.satellite is not None:
@@ -2771,10 +2814,10 @@ def main():
 
     if args.input_files is not None:
         process_vdif(args.input_files[0], None, args.output_files[0], satellite, args.rc_directory, args.thread, \
-                args.num_channels, args.channel, args.acq_cadence, args.center_freq, args.sky_freq, store_handle, antenna_handle, aided, args.short_circuit, args.max_time, args.C_N0_min)
+                args.num_channels, args.channel, args.acq_cadence, args.center_freq, args.sky_freq, store_handle, antenna_handle, aided, args.short_circuit, args.max_time, args.C_N0_min, args.frames_per_sec)
     elif args.input_files_x is not None and args.input_files_y is not None:
         process_vdif(args.input_files_x[0], args.input_files_y[0], args.output_files[0], satellite, args.rc_directory, args.thread, \
-                args.num_channels, args.channel, args.acq_cadence, args.center_freq, args.sky_freq, store_handle, antenna_handle, aided, args.short_circuit, args.max_time, args.C_N0_min)
+                args.num_channels, args.channel, args.acq_cadence, args.center_freq, args.sky_freq, store_handle, antenna_handle, aided, args.short_circuit, args.max_time, args.C_N0_min, args.frames_per_sec)
     else:
         raise ValueError('Need to supply either R polarization or X + Y polarization input files')
 
