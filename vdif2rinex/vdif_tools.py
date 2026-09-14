@@ -212,12 +212,74 @@ def get_vdif_stats(buf, thread, num_channels):
     header.unpack(bytes(buf[:VDIFHeader.size()])) # hold beginning in header
     return stats, header
 
+def _read_header(f, offset):
+    f.seek(offset)
+    h = VDIFHeader(**{"frames_per_sec": 1})
+    h.unpack(f.read(VDIFHeader.size()))
+    return h
+
+def get_vdif_stats_fast(path, thread, num_channels=None, frames_per_sec=None):
+    import os
+    total_bytes = os.path.getsize(path)
+    with open(path, 'rb') as f:
+        h0 = _read_header(f, 0)
+        if h0.legacy_mode:
+            raise ValueError('legacy (16-byte) VDIF header not supported')
+        frame_len = h0.data_frame_len
+
+        # how many threads are interleaved in this file?
+        n_thread = 1
+        while n_thread * frame_len + VDIFHeader.size() < total_bytes:
+            hk = _read_header(f, n_thread * frame_len)
+            if (hk.frame_no, hk.seconds_from_ref_epoch) != (h0.frame_no, h0.seconds_from_ref_epoch):
+                break
+            n_thread += 1
+
+        if frames_per_sec is None:
+            n_probe = ((total_bytes // frame_len) - 1) // n_thread * n_thread  # same thread as h0
+            h1 = _read_header(f, n_probe * frame_len)
+            dsec = h1.seconds_from_ref_epoch - h0.seconds_from_ref_epoch
+            if dsec < 1:
+                raise ValueError('span < 1 s; pass frames_per_sec explicitly')
+            frames_per_sec = int(round((n_probe // n_thread - h1.frame_no + h0.frame_no) / dsec))
+
+    data_bytes = frame_len - VDIFHeader.size()
+    bps = h0.bits_per_sample
+    is_complex = h0.data_type != "real"
+    if is_complex:
+        bps *= 2
+    if num_channels is None:
+        num_channels = h0.num_channels
+    years, months = divmod(6 * h0.ref_epoch, 12)
+    dt = (datetime(2000 + years, months + 1, 1, tzinfo=pytz.utc)
+          + timedelta(seconds=h0.seconds_from_ref_epoch))
+
+    stats = VDIFStats(total_frames=total_bytes // frame_len,
+                      frames_per_sec=frames_per_sec,
+                      frame_len=frame_len,
+                      data_bytes_per_frame=data_bytes,
+                      bits_per_sample=bps,
+                      bits_per_sample_component=h0.bits_per_sample,
+                      is_complex=is_complex,
+                      num_channels=num_channels,
+                      samples_per_frame=data_bytes * 8 // (bps * num_channels),
+                      file_start_utc=dt)
+    return stats, h0
+
+#@njit(cache=True)
+#def iq_thres_map(sample, bits_per_sample):
+#    if bits_per_sample == 2:
+#        sign = np.int8((sample >> 1) * 2 - 1)   # -1 or +1
+#        mag  = np.int8(1 + 2 * (sample & 1))    #  1 or  3
+#        return np.int8(sign * mag)
+#    if bits_per_sample == 1 and sample == 0:
+#        return np.int8(-1)
+#    return np.int8(1)
+
 @njit(cache=True)
 def iq_thres_map(sample, bits_per_sample):
     if bits_per_sample == 2:
-        sign = np.int8((sample >> 1) * 2 - 1)   # -1 or +1
-        mag  = np.int8(1 + 2 * (sample & 1))    #  1 or  3
-        return np.int8(sign * mag)
+        return np.int8(2 * np.int8(sample) - 3)
     if bits_per_sample == 1 and sample == 0:
         return np.int8(-1)
     return np.int8(1)
