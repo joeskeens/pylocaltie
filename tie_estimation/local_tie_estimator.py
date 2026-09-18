@@ -67,12 +67,12 @@ from single_diff_tools import import_key_gnss, import_vex_gnss, import_data_vlbi
                   detect_unresolved_amb_gnss, set_bounds_phase_clock, union_of_slices, get_residuals, iterative_weight_adjust, iterative_weight_adjust_ls_vce, \
                   iterative_weight_adjust_LS_VCE_full, sample_global_poly_at_interval, gen_key, VMF3Model, get_spanning_tree, \
                   read_thermal_deformation_coeffs, get_obs_weights, find_cont_penalty, mcmc_correlation, ls_correlation, load_kernel_parameters, vlbi_transform_data,\
-                  write_vda_phase, NavStore
+                  write_vda_phase, NavStore, fit_phase_clock_params_grdel
 
 MIN_SLICE = 0
 MIN_TROP_DIST = 0.5e3 # 1 km
 MU_EARTH = 3.9860044188e14
-TK_LAMBDA = 1e-9
+#TK_LAMBDA = 1e-9
 #TK_LAMBDA = 1e-9
 CT_PENALTY = 1000
 BLOCK_MAP = { # map for satellite blocks
@@ -167,6 +167,9 @@ def add_args_to_parser(parser_in):
                          )
     parser.add_argument("--utc2gps", default=None, type=float,
                          help="Number of seconds GPS is ahead of UTC (reqd for ngs_file)"
+                         )
+    parser.add_argument("--tikhonov_lambda", default=1e-9, type=float,
+                         help="Lambda parameter for Tikhonov regularization. Use --L_curve to find this if unsure."
                          )
     parser.add_argument("--ant_offset", action="append", type=str, nargs="+", help="Receiver offset  as 'N E U' (m), for receivers with a monument different from phase center")
     parser.add_argument("--ant_offset_names",
@@ -293,6 +296,11 @@ def add_args_to_parser(parser_in):
                          action="store_true",
                          default=False,
                          help="Use a stochastic (Kalman filter-like) model for clock bias. Replaces trop_poly_length",
+                         )
+    parser.add_argument("--L_curve",
+                         action="store_true",
+                         default=False,
+                         help="Compute L-curve for Tikhonov regularization (NB: this takes a long time and diverts from typical solution)",
                          )
     parser.add_argument("--estimate_disb",
                          action="store_true",
@@ -449,6 +457,10 @@ def add_args_to_parser(parser_in):
                               " If GNSS, specify ANTEX type in place of GNSS.", 
                         default=[], 
                         action='append')
+    parser.add_argument("--grdel_clock_apriori", action="store_true", default=False,
+                        help='Freeze the converged group delay clock variation and use it as an '\
+                             'a priori series for the phase clock stochastic model, so the phase '\
+                             'clock process noise covers only the residual clock.')
     parser.add_argument("--iono_free", action="store_true", default=False, help = 'Use ionosphere free combination in '\
             +'GNSS antenna to compensate in VLBI. CURRENTLY NOT FULLY IMPLEMENTED.')
     parser.add_argument("--ionex_files", dest="ionex_files", action="append", type=str, nargs="+", help = 'Compensate for ionosphere with an IONEX model. Repeat for multiple days.')
@@ -892,7 +904,8 @@ def update_measurements_vlbi(store_handle, src_type, baselines, baseline_handles
 def lstsq_estimation(sol_type, plot_intermediate_results, ref_antenna, store_handle, antenna_handles, baselines, baseline_handles, \
                      clock_poly_length, trop_poly_length, clock_file=None, estimate_AO=False, \
                      analytical_Jac=False, tikhonov_reg=False, cont_reg=False, recursive_amb=False, do_mcmc_correlation=False,
-                     do_ls_vce_correlation=False, covariance_kernel_range=None, covariance_kernel_phase=None, igs_data=False, baseline_strategy='Obs-Max', band=None):
+                     do_ls_vce_correlation=False, covariance_kernel_range=None, covariance_kernel_phase=None, igs_data=False, \
+                     baseline_strategy='Obs-Max', band=None, L_curve=False, TK_LAMBDA=1e-9):
     """
     Take the single-source data and produce a differential position estimate via least-squares adjustment
     """
@@ -1277,16 +1290,50 @@ def lstsq_estimation(sol_type, plot_intermediate_results, ref_antenna, store_han
         if sol_type == 'GNSS' and store_handle.vlbi_like is False:
             ls_grdel = iterative_weight_adjust_LS_VCE_full(store_handle, ls_grdel.x, bounds, ls_args, calc_residuals, jac, sol_type, 'range')
         elif (store_handle.stochastic_clock or store_handle.stochastic_trop):
-            if len(baseline_handles)==1:
-                ls_grdel = iterative_weight_adjust_ls_vce(store_handle, ls_grdel.x, bounds, ls_args, calc_residuals, jac, sol_type, 'range', no_PSD=True)
-            else:
-                ls_grdel = iterative_weight_adjust_ls_vce(store_handle, ls_grdel.x, bounds, ls_args, calc_residuals, jac, sol_type, 'range', no_PSD=True)
+            ls_grdel = iterative_weight_adjust_ls_vce(store_handle, ls_grdel.x, bounds, ls_args, calc_residuals, jac, sol_type, 'range')
         else:
             ls_grdel = iterative_weight_adjust(store_handle, ls_grdel.x, bounds, ls_args, calc_residuals, jac, sol_type, 'range')
+
+    if not store_handle.grdel_clock_apriori and store_handle.stochastic_clock:
+        for antenna_handle in antenna_handles:
+            antenna_handle.phase_clock_psd_rw = antenna_handle.clock_psd_rw
+            antenna_handle.phase_clock_psd_irw = antenna_handle.clock_psd_irw
+    elif store_handle.stochastic_clock:
+        # using group delay variation as a priori --> solve for phase phi_rw, phi_irw
+        fit_phase_clock_params_grdel(ls_grdel, clock_idxs, store_handle, ls_args, idx_start)
+
 
     grdel_clock_idxs = clock_idxs
     for baseline_handle in baseline_handles:
         baseline_handle.save_range_idxs()
+
+    if store_handle.stochastic_clock is True and getattr(store_handle, 'grdel_clock_apriori', False) is True:
+        # Freeze the group delay clock function ONCE, here.  Deliberately not refreshed
+        # on later outer LAMBDA iterations (see AntennaInfo.hold_grdel_clock).
+        if store_handle.global_linear_clock is True:
+            idx_start_clk = 1
+        elif store_handle.global_quadratic_clock is True:
+            idx_start_clk = 2
+        else:
+            idx_start_clk = 0
+        clock_states_grdel = ls_grdel.x[grdel_clock_idxs]
+        for antenna_handle in antenna_handles:
+            if ref_antenna == antenna_handle.antenna_name:
+                continue
+            clock_state_ant = clock_states_grdel[antenna_handle.range_clock_idxs]
+            clock_fcn = clock_state_ant[idx_start_clk:].copy()
+            if idx_start_clk > 0:
+                clock_fcn = clock_fcn + sample_global_poly_at_interval(
+                        clock_state_ant[:idx_start_clk], antenna_handle.clock_times,
+                        antenna_handle.times_gps[0], antenna_handle.times_gps[-1])
+            if len(clock_fcn) != len(antenna_handle.clock_times):
+                raise ValueError('grdel clock function length %d != %d clock epochs for %s'
+                                 % (len(clock_fcn), len(antenna_handle.clock_times),
+                                    antenna_handle.antenna_name))
+            antenna_handle.hold_grdel_clock(clock_fcn, antenna_handle.clock_times)
+            print('held a priori group delay clock variation for ' + antenna_handle.antenna_name
+                  + ' (peak-to-peak ' + str(np.round((clock_fcn.max()-clock_fcn.min())*1e12/const.c, 1))
+                  + ' ps)', flush=True)
 
     # analyze group delay LS solution
     sol_name='grdel'
@@ -1425,7 +1472,6 @@ def lstsq_estimation(sol_type, plot_intermediate_results, ref_antenna, store_han
     bound_low_expanded, bound_high_expanded, state_expanded = set_bounds_phase_clock(bound_low_expanded, bound_high_expanded,\
             CLOCK_BOUND, store_handle, antenna_handles, baseline_handles, baselines, ref_antenna, state_expanded, end_range_state, \
             clock_idxs, clock_poly_length, trop_idxs, disb_idxs, phase_clock_idxs, phase_disb_idxs, n_ao_state, n_grav_state, amb_state_idxs)
-    L_curve = False
     # compute float ambiguity carrier phase solution
     phase_delay = True
     phase_only = False
@@ -2268,6 +2314,7 @@ if __name__ == '__main__':
     store_handle = GNSSTKStores(sol_type, args.src_type, sol_sys, antenna_store, ocean_store, atm_store, nav_store, \
             args.iono_free, args.iono_freq, args.analytical_delay, args.stochastic_clock, args.stochastic_trop, args.global_linear_clock,\
             args.global_quadratic_clock, args.estimate_disb, args.estimate_phase_disb)
+    store_handle.grdel_clock_apriori = args.grdel_clock_apriori
     if args.trop_poly_length > 0:
         store_handle.estimate_trop = True
 
@@ -2469,7 +2516,8 @@ if __name__ == '__main__':
                      store_handle, antenna_handles, baselines, baseline_handles,\
                      clock_poly_length, trop_poly_length, args.clock_file, estimate_ao,\
                      args.analytical_Jac, args.tikhonov_reg, args.continuity_penalty, args.recursive_amb, args.do_mcmc_correlation,\
-                     args.do_ls_vce_correlation, args.load_covariance_kernel_range, args.load_covariance_kernel_phase, args.igs_data, args.baseline_strategy)
+                     args.do_ls_vce_correlation, args.load_covariance_kernel_range, args.load_covariance_kernel_phase, args.igs_data, \
+                     args.baseline_strategy, args.band, args.L_curve, args.tikhonov_lambda)
 
     if args.vda_file is not None and args.output_vda_file is not None:
         write_vda_phase(baseline_observations, args.vda_file, args.output_vda_file, phase_ambiguities, baseline_handles, baselines, antenna_names)

@@ -4113,9 +4113,9 @@ class BaselineInfo(object):
         self.weather_data = False
         self.use_cov_kernel_range = False
         self.use_cov_kernel_phase = False
-        self.q_range = 0 # additive weight in quadrature for range
+        self.q_range = 0.5 # additive weight in quadrature for range, guess 0.5 m
         self.q_range_satellite = 0 # satellite-based weight for GNSS observations (range)
-        self.q_phase = 0 # additive weight in quadrature for phase
+        self.q_phase = 0.005 # additive weight in quadrature for phase, guess 5 mm
         self.q_phase_satellite = 0 # satellite-based weight for GNSS observations (phase)
 
     def prepare_vlbi(self, group_delays, phase_delays, grdel_err, phdel_err, group_delays_dual=[], phase_delays_dual=[]):
@@ -4322,6 +4322,11 @@ class AntennaInfo(object):
         self.cable_cal_active = False
         self.weather_cal_active = False
         self.ppp_clock_active = False
+        # a priori clock variation carried over from the group delay solution
+        self.grdel_clock_active   = False
+        self.grdel_clock_function = None
+        self.grdel_clock_times    = None
+        self.grdel_clock_samples  = None
         self.offset_NEU = None
         self.l4r_name = None
         self.use_zwd_file = False
@@ -4337,9 +4342,10 @@ class AntennaInfo(object):
         
         self.clock_psd_irw = 0.078  # ps^2/hr^3 -- for VLBA H maser
         self.clock_psd_rw = 3.45  # ps^2/hr -- for VLBA H maser
-        self.clock_psd_rw = 3e6  # ps^2/hr -- AuScope
+        self.clock_psd_rw = 1e6  # ps^2/hr -- AuScope
         self.phase_clock_psd_irw = 0.078  # ps^2/hr^3 -- for VLBA H maser
         self.phase_clock_psd_rw = 3.45  # ps^2/hr -- for VLBA H maser
+        self.phase_clock_psd_rw = 1e2  # ps^2/hr -- for VLBA H maser
         self.trop_psd_rw = 10 # ps^2/hr
 
         self.range_clock_idxs = []
@@ -4942,6 +4948,46 @@ class AntennaInfo(object):
             plt.ylabel('clock bias (m)')
             plt.savefig('ppp_clock_samples'+self.antenna_name+'.png')
             plt.close()
+
+    def hold_grdel_clock(self, clock_function, clock_times):
+        """ Freeze the converged group delay clock function as an a priori series for
+            the phase clock stochastic model.
+
+            Call this ONCE, immediately after the group delay solution converges.  Do
+            not refresh it from the combined range+phase solution on later outer
+            LAMBDA iterations: the penalty residual would be driven toward zero and
+            would stop constraining anything.
+
+            args:
+                clock_function: numpy.ndarray, clock values at clock_times (m)
+                clock_times:    numpy.ndarray of numpy.datetime64
+        """
+        self.grdel_clock_function = np.asarray(clock_function, dtype=float)
+        self.grdel_clock_times    = np.asarray(clock_times)
+        self.grdel_clock_active   = True
+
+    def interp_grdel_clock(self, times=[]):
+        """ Sample the frozen group delay clock VARIATION at the given epochs.
+
+            Both time vectors are referenced to a common origin (grdel_clock_times[0]);
+            note that sample_stoch_params_at_times re-zeros the destination vector to
+            its own origin, which misaligns whenever phase_clock_times[0] differs from
+            clock_times[0].  Held, not extrapolated, past the endpoints.
+
+            Only the variation is kept -- the constant is dropped, since any genuine
+            group/phase delay clock bias cancels in the np.diff() below anyway.
+        """
+        if self.grdel_clock_active is False:
+            self.grdel_clock_samples = np.zeros(len(times))
+            return
+        t_src = (self.grdel_clock_times - self.grdel_clock_times[0])/np.timedelta64(1, 's')
+        t_dst = (times - self.grdel_clock_times[0])/np.timedelta64(1, 's')
+        interp_fcn = interp1d(t_src, self.grdel_clock_function, kind='linear',
+                              bounds_error=False,
+                              fill_value=(self.grdel_clock_function[0],
+                                          self.grdel_clock_function[-1]))
+        samples = interp_fcn(t_dst)
+        self.grdel_clock_samples = samples - samples[0]
 
     @staticmethod
     def _compute_relative_humidity(temp_C, dew_C):
@@ -11751,6 +11797,70 @@ def set_bounds_phase_clock(bound_low, bound_high, clock_bound, store_handle, ant
 
     return bound_low, bound_high, state_expanded
 
+def baseline_clock_fcn_sigma(cov_matrix_full, clock_idxs, antenna1_handle, antenna2_handle,
+                             ref_antenna, store_handle, times_gps, eval_times, phase=False):
+    """ 1-sigma of the differential clock function (antenna2 - antenna1) on a baseline.
+
+        Propagates the joint global-polynomial / epoch-wise covariance block for both
+        antennas, including the cross-covariance between them.  That cross term is not
+        optional: both clocks are estimated against the same reference, so the reference
+        clock is common mode and cancels in the difference.  Dropping V_12 inflates the
+        band by at least sqrt(2), and by far more where the correlation approaches unity.
+
+        A reference antenna has no clock parameters and contributes nothing.
+
+        returns:
+            sigma_absolute: 1-sigma of the differential clock function (m)
+            sigma_variation: 1-sigma of that function referenced to eval_times[0] (m)
+    """
+    if store_handle.global_linear_clock is True:
+        num_global = 1
+    elif store_handle.global_quadratic_clock is True:
+        num_global = 2
+    else:
+        num_global = 0
+
+    clock_columns = np.arange(clock_idxs.start, clock_idxs.stop)
+    state_columns, design_blocks = [], []
+
+    for antenna_handle, sign in ((antenna1_handle, -1.0), (antenna2_handle, 1.0)):
+        if antenna_handle.antenna_name == ref_antenna:
+            continue
+        if phase is True:
+            antenna_columns = antenna_handle.phase_clock_idxs
+            antenna_times = antenna_handle.phase_clock_times
+        else:
+            antenna_columns = antenna_handle.range_clock_idxs
+            antenna_times = antenna_handle.clock_times
+
+        sample_matrix = build_clock_sample_matrix(antenna_times, eval_times)
+        if num_global > 0:
+            global_partials = np.array([
+                global_poly_jac_at_epoch(np.zeros(num_global), epoch,
+                                         times_gps[0], times_gps[-1])
+                for epoch in eval_times])
+            design = np.hstack([global_partials, sample_matrix])
+        else:
+            design = sample_matrix
+
+        state_columns.append(clock_columns[antenna_columns])
+        design_blocks.append(sign * design)
+
+    if len(design_blocks) == 0:
+        return np.zeros(len(eval_times)), np.zeros(len(eval_times))
+
+    columns = np.concatenate(state_columns)
+    design_joint = np.hstack(design_blocks)
+    covariance = cov_matrix_full[np.ix_(columns, columns)] 
+
+    variance_absolute = np.einsum('ij,jk,ik->i', design_joint, covariance, design_joint)
+    design_variation = design_joint - design_joint[0]
+    variance_variation = np.einsum('ij,jk,ik->i', design_variation, covariance, design_variation)
+
+    sigma_absolute = np.sqrt(np.maximum(variance_absolute, 0.0))
+    sigma_variation = np.sqrt(np.maximum(variance_variation, 0.0))
+    return sigma_absolute, sigma_variation
+
 def analyze_ls_solution(sol_type, plot_results, ref_antenna, clock_idxs, trop_idxs, disb_idxs, ls_sol, store_handle, antenna_handles, sol_name, baselines,\
                         n_ao_state, baseline_handles=[], phase_delay=False, phase_only=False, phase_clock_idxs=[], phase_disb_idxs=[], use_phase_weights=False, integer_amb=[]):
     """Analyze the least-squares solution, print formal sigmas, plot relevant residuals"""
@@ -12071,6 +12181,7 @@ def analyze_ls_solution(sol_type, plot_results, ref_antenna, clock_idxs, trop_id
                     print(f'q_range (m): {baseline_handle.q_range:.5f}')
                     print(f'q_range (ps): {baseline_handle.q_range/const.c*1e12:.5f}')
             dt_range = to_datetime(times_gps)
+            times_clock = times_gps
             dc_range = diff_clock
         elif phase_only is False:
             baseline_handle = baseline_handles[jdx]
@@ -12091,6 +12202,7 @@ def analyze_ls_solution(sol_type, plot_results, ref_antenna, clock_idxs, trop_id
             
             dt_range = to_datetime(times_gps[baseline_handle.range_data_idxs])
             dc_range = diff_clock[baseline_handle.range_data_idxs]
+            times_clock = times_gps[baseline_handle.range_data_idxs]
             if baseline_handle.use_cov_kernel_range is False:
                 print(f'q_range (m): {baseline_handle.q_range:.5f}')
                 print(f'q_range (ps): {baseline_handle.q_range/const.c*1e12:.5f}')
@@ -12101,6 +12213,7 @@ def analyze_ls_solution(sol_type, plot_results, ref_antenna, clock_idxs, trop_id
         else:
             baseline_handle = baseline_handles[jdx]
             times_gps = baseline_handle.datetime_array
+            times_clock = times_gps
             residuals_phase = residuals[num_samples:\
                                      num_samples + len(baseline_handle.phase_data_idxs)]
             num_samples = num_samples + len(baseline_handle.phase_data_idxs)
@@ -12299,10 +12412,16 @@ def analyze_ls_solution(sol_type, plot_results, ref_antenna, clock_idxs, trop_id
                         antenna2_handle.antenna_name+'_' + antenna1_handle.antenna_name + '_bysrc.png')       
             plt.close(fig)
 
+            sigmas_absolute, _ = baseline_clock_fcn_sigma(cov_matrix_full, clock_idxs, antenna1_handle, antenna2_handle,
+                             ref_antenna, store_handle, times_clock, times_clock, phase=False)
+
             # plot clock function
             fig, ax1 = plt.subplots(figsize=(10, 6))
             ax2 = ax1.twinx()
-            ax1.plot(index_array, data['Clock'].to_numpy(), linestyle='-', color='b')
+            c_m = data['Clock'].to_numpy()
+            ax1.fill_between(index_array, c_m - sigmas_absolute, c_m + sigmas_absolute,
+                 alpha=0.25, lw=0, color='C0', label=r'$1\sigma$')
+            ax1.plot(index_array, c_m, linestyle='-', color='b')
 
             # Formatting the date on the x-axis
             ax1.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d %H:%M'))
@@ -12314,7 +12433,9 @@ def analyze_ls_solution(sol_type, plot_results, ref_antenna, clock_idxs, trop_id
             ax1.set_ylabel('diff. clock (m)')
             ax1.grid(True)
 
-            ax2.plot(index_array, data['Clock'].to_numpy()*1e6/const.c, linestyle='-', color='b')
+            ax2.fill_between(index_array, (c_m - sigmas_absolute)*1e6/const.c, (c_m + sigmas_absolute)*1e6/const.c,
+                 alpha=0.25, lw=0, color='C0', label=r'$1\sigma$')
+            ax2.plot(index_array, c_m*1e6/const.c, linestyle='-', color='b')
             ax2.set_ylabel('(microsec)')
             if iono_free is True:
                 fig.savefig(sol_type+'_'+sol_name+'_clock_fcn_'+antenna2_handle.antenna_name+'_' + antenna1_handle.antenna_name + '_ionofree.png')
@@ -12440,10 +12561,15 @@ def analyze_ls_solution(sol_type, plot_results, ref_antenna, clock_idxs, trop_id
                 plt.savefig(sol_type+'_'+sol_name+'_phase_elev_residuals_'+antenna2_handle.antenna_name+'_' + antenna1_handle.antenna_name + '.png')
             plt.close()
 
+            sigmas_absolute_phase, _ = baseline_clock_fcn_sigma(cov_matrix_full, phase_clock_idxs, antenna1_handle, antenna2_handle,
+                             ref_antenna, store_handle, dt_phase, dt_phase, phase=True)
             # plot clock function
+            c_m_phase =  data_phase['Clock'].to_numpy()
             fig, ax1 = plt.subplots(figsize=(10, 6))
             ax2 = ax1.twinx()
-            ax1.plot(phase_index_array, data_phase['Clock'].to_numpy(), linestyle='-', color='b')
+            ax1.fill_between(phase_index_array, c_m_phase - sigmas_absolute_phase, c_m_phase + sigmas_absolute_phase,
+                 alpha=0.25, lw=0, color='C0', label=r'$1\sigma$')
+            ax1.plot(phase_index_array, c_m_phase, linestyle='-', color='b')
 
             # Formatting the date on the x-axis
             ax1.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d %H:%M'))
@@ -12455,7 +12581,9 @@ def analyze_ls_solution(sol_type, plot_results, ref_antenna, clock_idxs, trop_id
             ax1.set_ylabel('diff. clock (m)')
             ax1.grid(True)
 
-            ax2.plot(phase_index_array, data_phase['Clock'].to_numpy()*1e6/const.c, linestyle='-', color='b')
+            ax2.fill_between(index_array, (c_m_phase - sigmas_absolute_phase)*1e6/const.c, (c_m_phase + sigmas_absolute_phase)*1e6/const.c,
+                 alpha=0.25, lw=0, color='C0', label=r'$1\sigma$')
+            ax2.plot(phase_index_array, c_m_phase*1e6/const.c, linestyle='-', color='b')
             ax2.set_ylabel('(microsec)')
             if iono_free is True:
                 fig.savefig(sol_type+'_'+sol_name+'_phase_clock_fcn_'+antenna2_handle.antenna_name+'_' + antenna1_handle.antenna_name + '_ionofree.png')
@@ -15193,6 +15321,119 @@ def _row_scale(mat: np.ndarray, scale: np.ndarray):
 def _col_scale(mat: np.ndarray, scale: np.ndarray):
     return mat * scale           # mat @ diag(scale)
 
+
+
+def build_clock_sample_matrix(src_times, dst_times):
+    """ Linear-interpolation matrix S with S @ x_src == x_src evaluated at dst_times.
+        Same operator interp_grdel_clock applies pointwise, exposed as a matrix so the
+        clock covariance can be propagated onto the phase clock epochs.
+
+        Both time vectors are referenced to a COMMON origin (src_times[0]); note that
+        sample_stoch_params_at_times re-zeros times_sec_new to the destination array's
+        own origin, which misaligns whenever dst_times[0] != src_times[0].  Endpoints
+        are held rather than extrapolated, matching interp_grdel_clock's fill_value.
+
+        Exact (a signed selection matrix) when dst_times is a subset of src_times.
+    """
+    t_src = (src_times - src_times[0]) / np.timedelta64(1, 's')
+    t_dst = (dst_times - src_times[0]) / np.timedelta64(1, 's')
+    n_src, n_dst = len(t_src), len(t_dst)
+    S = np.zeros((n_dst, n_src))
+    if n_src == 1:
+        S[:, 0] = 1.0
+        return S
+    idx = np.clip(np.searchsorted(t_src, t_dst, side='right') - 1, 0, n_src - 2)
+    w = np.clip((t_dst - t_src[idx]) / (t_src[idx + 1] - t_src[idx]), 0.0, 1.0)
+    rows = np.arange(n_dst)
+    S[rows, idx]     = 1.0 - w
+    S[rows, idx + 1] = w
+    return S
+
+def fit_phase_clock_params_grdel(ls_sol, clock_idxs, store_handle, ls_args, idx_start):
+    """ Project the group delay solution's clock covariance onto the {G_rw, G_irw}
+        basis to get starting phase clock PSDs, before ambiguity resolution makes
+        them fittable from phase data.
+
+        The frozen a priori means the phase clock residual is r = d - e, with e the
+        range clock estimation error.  D[e] is the clock block of Eq. 2.240, so the
+        pseudo-observation covariance is known analytically -- LS-VCE with
+        P_perp = I, i.e. a 2-parameter GLS per antenna.
+    """
+    MAX_ITER, TOL = 50, 1e-8
+
+    if store_handle.global_linear_clock is True:      idx_start = 1
+    elif store_handle.global_quadratic_clock is True: idx_start = 2
+    else:                                             idx_start = 0
+
+    # --- clock block of V from Eq. 2.240 --------------------------------
+    unit_var = get_unit_var_full(ls_sol.fun, ls_sol.x)
+    JtJ = ls_sol.jac.T @ ls_sol.jac
+    V = pinv(JtJ) if np.linalg.cond(JtJ) > 1e9 else np.linalg.inv(JtJ)
+    #V *= unit_var                                  # see note (1)
+    ci = np.arange(clock_idxs.start, clock_idxs.stop)
+    V_clk = V[np.ix_(ci, ci)]                      # m^2, see note (2)
+
+    ref_antenna    = ls_args[0]
+    antenna_handles = ls_args[3]
+    ref_handle = next(a for a in antenna_handles if a.antenna_name == ref_antenna)
+    clock_columns = np.arange(clock_idxs.start, clock_idxs.stop)
+
+    for ant in antenna_handles:
+        if ant.antenna_name == ref_antenna:
+            continue
+
+        # --- state -> clock function at the PHASE clock epochs ----------
+        antenna_columns = np.arange(len(clock_columns))[ant.range_clock_idxs]
+        covariance_antenna = V_clk[np.ix_(antenna_columns, antenna_columns)]
+
+        if idx_start > 0:
+            # Condition on the global polynomial rather than marginalizing over it:
+            # the phase solution estimates its own polynomial, so any a priori error in
+            # that subspace is absorbed there and must not be charged to the stochastic
+            # model.  Slicing alone leaves V_bb inflated by the poly/random-walk trade-off.
+            poly_block = slice(0, idx_start)
+            epoch_block = slice(idx_start, None)
+            covariance_poly = covariance_antenna[poly_block, poly_block]
+            covariance_cross = covariance_antenna[epoch_block, poly_block]
+            covariance_epoch = covariance_antenna[epoch_block, epoch_block]
+            covariance_antenna = covariance_epoch - covariance_cross @ np.linalg.solve(
+                    covariance_poly, covariance_cross.T)
+
+        increment_operator = np.diff(
+                build_clock_sample_matrix(ant.clock_times, ant.phase_clock_times), axis=0)
+        omega = np.maximum(np.einsum('ij,jk,ik->i', increment_operator,
+                                     covariance_antenna, increment_operator), 1e-30)
+
+        # --- cofactor columns on the phase clock grid -------------------
+        g_rw  = get_process_variance_times(store_handle, ant, 'clock', True,
+                                           only_mat=True, clock_mat_type='rw')
+        g_irw = get_process_variance_times(store_handle, ant, 'clock', True,
+                                           only_mat=True, clock_mat_type='irw')
+        G = np.column_stack([g_rw/FACTOR_RW, g_irw/FACTOR_IRW])   # m^2 per PSD unit
+
+        # --- LS-VCE with P_perp = I: iterated 2-parameter GLS -----------
+        phi = np.array([max(ant.phase_clock_psd_rw, 1e-2),
+                        max(ant.phase_clock_psd_irw, 1e-4)])
+        for _ in range(MAX_ITER):
+            s  = G @ phi
+            Gw = G / s[:, None]
+            N  = Gw.T @ Gw
+            phi_new = np.linalg.solve(N, Gw.T @ (omega/s))
+            if phi_new[1] <= 0:                    # see note (4)
+                col = (G[:, 0]/s)
+                phi_new = np.array([col @ (omega/s) / (col @ col), 0.0])
+            if np.linalg.norm(phi_new - phi) < TOL*np.linalg.norm(phi):
+                phi = phi_new
+                break
+            phi = phi_new
+
+        # --- the residual model sums ant + ref (see note 3) -------------
+        ant.phase_clock_psd_rw  = max(phi[0], 1e-2)
+        ant.phase_clock_psd_irw = max(phi[1], 1e-4)
+        print(f'{ant.antenna_name}: phase clock psd rw {ant.phase_clock_psd_rw:.4g} ps^2/hr, '
+              f'irw {ant.phase_clock_psd_irw:.4g} ps^2/hr^3, cond(N) {np.linalg.cond(N):.3g}, '
+              f'ratio to range rw {phi[0]/ant.clock_psd_rw:.4g}')
+
 def iterative_weight_adjust_ls_vce(
     store_handle,
     state_expanded,
@@ -15422,8 +15663,10 @@ def iterative_weight_adjust_ls_vce(
             s2 = max(sig_hat[idx], 1e-10)
             if observable == "range":
                 bl.q_range = np.sqrt(s2)
+                print(f"q: {bl.q_range} m")
             else:
                 bl.q_phase = np.sqrt(s2)
+                print(f"q: {bl.q_phase} m")
             idx += 1
 
         if not no_PSD and store_handle.stochastic_clock:
@@ -15432,10 +15675,13 @@ def iterative_weight_adjust_ls_vce(
                     continue
                 print(f'for antenna {ant.antenna_name}:')
                 if observable == 'range':
-                    ant.clock_psd_rw = min(max(sig_hat[idx], 1e-2), 3e6)
+                    #ant.clock_psd_rw = min(max(sig_hat[idx], 1e-2), 3e6)
+                    ant.clock_psd_rw = max(sig_hat[idx], 1e-2)
                     print(f"clock psd rw: {ant.clock_psd_rw} ps^2/hr")
                 elif observable == 'phase':
-                    ant.phase_clock_psd_rw = min(max(sig_hat[idx], 1e-2), 50)
+                    #ant.phase_clock_psd_rw = min(max(sig_hat[idx], 1e-2), 50)
+                    #ant.phase_clock_psd_rw = min(max(sig_hat[idx], 1e-2), 1e3)
+                    ant.phase_clock_psd_rw = max(sig_hat[idx], 1e-2)
                     print(f"clock psd rw: {ant.phase_clock_psd_rw} ps^2/hr")
                     #if False: #ant.antenna_name == 'FDV2':
                     #    ant.clock_psd_rw = min(max(sig_hat[idx], 1e-2), 4e6)
@@ -15449,12 +15695,13 @@ def iterative_weight_adjust_ls_vce(
                         ant.clock_psd_irw = max(sig_hat[idx], 1e-4)
                         print(f"clock psd irw: {ant.clock_psd_irw} ps^2/hr^3")
                     elif observable == 'phase':
-                        if ant.ppp_clock_active:
-                            #ant.clock_psd_irw = min(max(sig_hat[idx], 1e-3), 78)
-                            ant.phase_clock_psd_irw = min(max(sig_hat[idx], 1e-3), 0.0001)
-                        else:
-                            #ant.clock_psd_irw = min(max(sig_hat[idx], 1e-3), 780)
-                            ant.phase_clock_psd_irw = min(max(sig_hat[idx], 1e-3), 1e9)
+                        ant.phase_clock_psd_irw = max(sig_hat[idx], 1e-3)
+                        #if ant.ppp_clock_active:
+                        #    #ant.clock_psd_irw = min(max(sig_hat[idx], 1e-3), 78)
+                        #    ant.phase_clock_psd_irw = min(max(sig_hat[idx], 1e-3), 0.0001)
+                        #else:
+                        #    #ant.clock_psd_irw = min(max(sig_hat[idx], 1e-3), 780)
+                        #    ant.phase_clock_psd_irw = min(max(sig_hat[idx], 1e-3), 1e9)
                         print(f"clock psd irw: {ant.phase_clock_psd_irw} ps^2/hr^3")
                     idx += 1
 
@@ -16433,6 +16680,16 @@ def calc_residuals(state, ref_antenna, baselines, store_handle, antenna_handles,
                     if antenna_handle.ppp_clock_active:
                         antenna_handle.interp_ppp_clock(antenna_handle.phase_clock_times)
                         phase_clock_samples -= antenna_handle.ppp_clock_samples
+
+                    if antenna_handle.grdel_clock_active is True:
+                        # A priori clock variation frozen from the group delay solution.
+                        # NB the PSD that LS-VCE fits after this change is the spectrum of
+                        # (true clock - group delay estimate of it), dominated by group
+                        # delay estimation error rather than maser physics.  Do not report
+                        # it as a clock PSD; the check that still matters is
+                        # sqrt(Phi*dt) << lambda.
+                        antenna_handle.interp_grdel_clock(antenna_handle.phase_clock_times)
+                        phase_clock_samples -= antenna_handle.grdel_clock_samples
 
                     if store_handle.global_linear_clock is True or store_handle.global_quadratic_clock is True:
                         phase_clock_state_global = phase_clock_states[antenna_handle.phase_clock_idxs][:idx_start]
