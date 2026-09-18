@@ -2548,16 +2548,21 @@ def resolve_rinex_obs(output_file, f_sky, source, soft_bits_full, hard_bits_full
         phase_shift = PHASE_SHIFT_RC[rc]
         ADR += phase_shift
 
-        # test misses in adjacent intervals
-        if time_shift > 0: 
-            # shift to next integer second to account for frame start
-            # (we are interpolating at ceil integer second and extrapolating at floored integer second)
-            code_miss_m = (t_0_arr+t_dot_arr*(2-time_shift))/chip_rate * const.c
+        if time_shift > 0:
+            if shift_int is True:
+                # ADR epoch is dt = 1-time_shift, so the miss is at dt = 2-time_shift
+                code_miss_m = (t_0_arr+t_dot_arr*(2-time_shift))/chip_rate * const.c
+            else:
+                # ADR epoch is dt = 0, so the miss is at dt = 1
+                code_miss_m = (t_0_arr+t_dot_arr)/chip_rate * const.c
             code_miss_m -= time_shift_start/1e3 * const.c
-            ADR_miss = -(phi_0_arr + 2*np.pi*f_D_arr*(2-time_shift) + np.pi*f_D_dot_arr*(2-time_shift)**2)/(2*np.pi)
         else:
             code_miss_m = (t_0_arr+t_dot_arr)/chip_rate * const.c
-            ADR_miss = -(phi_0_arr + 2*np.pi*f_D_arr + np.pi*f_D_dot_arr)/(2*np.pi)
+        
+        # f_D_arr is at the ADR epoch in every branch, so this is branch-independent
+        ADR_miss = ADR - (f_D_arr + 0.5*f_D_dot_arr)
+
+
         pr_miss = -code_miss_m[:-1] + pr_amb*np.rint((pr_model[1:]+code_miss_m[:-1])/pr_amb)
         ADR_miss += phase_shift
         ADR_diff = ADR[1:]-ADR_miss[:-1]
