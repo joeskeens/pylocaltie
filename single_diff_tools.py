@@ -4337,6 +4337,9 @@ class AntennaInfo(object):
         
         self.clock_psd_irw = 0.078  # ps^2/hr^3 -- for VLBA H maser
         self.clock_psd_rw = 3.45  # ps^2/hr -- for VLBA H maser
+        self.clock_psd_rw = 3e6  # ps^2/hr -- AuScope
+        self.phase_clock_psd_irw = 0.078  # ps^2/hr^3 -- for VLBA H maser
+        self.phase_clock_psd_rw = 3.45  # ps^2/hr -- for VLBA H maser
         self.trop_psd_rw = 10 # ps^2/hr
 
         self.range_clock_idxs = []
@@ -9949,7 +9952,7 @@ def slip_detect_single_freq(f1, diff_phase_data, diff_phase_model, times_arr, so
         threshold_arr = np.array(threshold_arr)
         slip_fig = plt.figure()
         slip_ax = slip_fig.add_subplot(111)
-        slip_ax.plot(range(len(m_Bw_arr[~np.isnan(b_del)])),b_del[~np.isnan(b_del)]-m_Bw_arr[~np.isnan(b_del)],label='$d-\mu$')
+        slip_ax.plot(range(len(m_Bw_arr[~np.isnan(b_del)])),b_del[~np.isnan(b_del)]-m_Bw_arr[~np.isnan(b_del)],label=r'$d-\mu$')
         slip_ax.plot(range(len(m_Bw_arr[~np.isnan(b_del)])),threshold_arr[~np.isnan(b_del)],label='upper bound')
         slip_ax.plot(range(len(m_Bw_arr[~np.isnan(b_del)])),-threshold_arr[~np.isnan(b_del)],label='lower bound')
         slip_ax.legend()
@@ -10017,7 +10020,7 @@ def slip_detect_full(f1, diff_phase_data, diff_phase_model, times_arr, plot=Fals
         threshold_arr = np.array(threshold_arr)
         slip_fig = plt.figure()
         slip_ax = slip_fig.add_subplot(111)
-        slip_ax.plot(np.array(range(len(m_Bw_arr[~np.isnan(b_del)])))[good_idxs],b_del[~np.isnan(b_del)][good_idxs]-m_Bw_arr[~np.isnan(b_del)][good_idxs],label='$d-\mu$')
+        slip_ax.plot(np.array(range(len(m_Bw_arr[~np.isnan(b_del)])))[good_idxs],b_del[~np.isnan(b_del)][good_idxs]-m_Bw_arr[~np.isnan(b_del)][good_idxs],label=r'$d-\mu$')
         slip_ax.plot(np.array(range(len(m_Bw_arr[~np.isnan(b_del)])))[good_idxs],threshold_arr[~np.isnan(b_del)][good_idxs],label='upper bound')
         slip_ax.plot(np.array(range(len(m_Bw_arr[~np.isnan(b_del)])))[good_idxs],-threshold_arr[~np.isnan(b_del)][good_idxs],label='lower bound')
         slip_ax.legend()
@@ -10110,7 +10113,7 @@ def slip_detect_full_old(f1, diff_phase_data, diff_phase_model, times_arr, plot=
         threshold_arr = np.array(threshold_arr)
         slip_fig = plt.figure()
         slip_ax = slip_fig.add_subplot(111)
-        slip_ax.plot(np.array(range(len(m_Bw_arr[~np.isnan(b_del)])))[good_idxs],b_del[~np.isnan(b_del)][good_idxs]-m_Bw_arr[~np.isnan(b_del)][good_idxs],label='$d-\mu$')
+        slip_ax.plot(np.array(range(len(m_Bw_arr[~np.isnan(b_del)])))[good_idxs],b_del[~np.isnan(b_del)][good_idxs]-m_Bw_arr[~np.isnan(b_del)][good_idxs],label=r'$d-\mu$')
         slip_ax.plot(np.array(range(len(m_Bw_arr[~np.isnan(b_del)])))[good_idxs],threshold_arr[~np.isnan(b_del)][good_idxs],label='upper bound')
         slip_ax.plot(np.array(range(len(m_Bw_arr[~np.isnan(b_del)])))[good_idxs],-threshold_arr[~np.isnan(b_del)][good_idxs],label='lower bound')
         slip_ax.legend()
@@ -11597,9 +11600,12 @@ def get_process_variance_times(store_handle, antenna_handle, model_type, phase=F
                 process_variance = times_diff_sec**2*times_sec[:-1] + times_diff_sec**3/3 + duration_arr**3/120 
             else:
                 raise ValueError('Unknown clock model type ' + str(clock_mat_type) +' (should be either rw or irw)')
-        else:
+        elif phase is False:
             process_variance = antenna_handle.clock_psd_irw*(times_diff_sec**2*times_sec[:-1] + times_diff_sec**3/3 + duration_arr**3/120)/FACTOR_IRW \
                               + antenna_handle.clock_psd_rw*(times_diff_sec - duration_arr/6)/FACTOR_RW
+        else:
+            process_variance = antenna_handle.phase_clock_psd_irw*(times_diff_sec**2*times_sec[:-1] + times_diff_sec**3/3 + duration_arr**3/120)/FACTOR_IRW \
+                              + antenna_handle.phase_clock_psd_rw*(times_diff_sec - duration_arr/6)/FACTOR_RW
 
     elif model_type == 'trop':
         duration_arr = np.array([store_handle.duration_dict[time] for time in antenna_handle.trop_times[1:]])
@@ -14049,26 +14055,50 @@ def plot_time_units(ref_antenna, ls_sol_grdel, ls_sol_phdel, sol_type, store_han
         if store_handle.stochastic_clock is False:
             _, ant1_idxs, ant2_idxs = np.intersect1d(antenna1_handle.times_gps, \
                      antenna2_handle.times_gps, return_indices=True)
-            diff_clock = antenna2_handle.clock_samples[ant2_idxs ] - \
-                        antenna1_handle.clock_samples[ant1_idxs]
-            diff_clock_phase = antenna2_handle.phase_clock_samples[ant2_idxs ] - \
-                        antenna1_handle.phase_clock_samples[ant1_idxs]
+            diff_clock = clock_samples_ant2[ant2_idxs] - \
+                        clock_samples_ant1[ant1_idxs]
+            diff_clock_phase = phase_clock_samples_ant2[ant2_idxs] - \
+                        phase_clock_samples_ant1[ant1_idxs]
         else:
             _, ant1_idxs_clock, ant1_dt = np.intersect1d(antenna1_handle.clock_times, \
                     baseline_handle.datetime_array, return_indices=True)
             _, ant2_idxs_clock, ant2_dt = np.intersect1d(antenna2_handle.clock_times, \
                     baseline_handle.datetime_array, return_indices=True)
             diff_clock = np.zeros(len(baseline_handle.datetime_array))
-            diff_clock[ant2_dt] += antenna2_handle.clock_samples[ant2_idxs_clock]
-            diff_clock[ant1_dt] -= antenna1_handle.clock_samples[ant1_idxs_clock]
+            diff_clock[ant2_dt] += clock_samples_ant2[ant2_idxs_clock]
+            diff_clock[ant1_dt] -= clock_samples_ant1[ant1_idxs_clock]
             _, ant1_idxs_phase, ant1_dt = np.intersect1d(antenna1_handle.phase_clock_times, \
                     baseline_handle.datetime_array, return_indices=True)
             _, ant2_idxs_phase, ant2_dt = np.intersect1d(antenna2_handle.phase_clock_times, \
                     baseline_handle.datetime_array, return_indices=True)
             diff_clock_phase = np.zeros(len(baseline_handle.datetime_array))
 
-            diff_clock_phase[ant2_dt] += antenna2_handle.phase_clock_samples[ant2_idxs_phase]
-            diff_clock_phase[ant1_dt] -= antenna1_handle.phase_clock_samples[ant1_idxs_phase]
+            diff_clock_phase[ant2_dt] += phase_clock_samples_ant2[ant2_idxs_phase]
+            diff_clock_phase[ant1_dt] -= phase_clock_samples_ant1[ant1_idxs_phase]
+
+        #if store_handle.stochastic_clock is False:
+        #    _, ant1_idxs, ant2_idxs = np.intersect1d(antenna1_handle.times_gps, \
+        #             antenna2_handle.times_gps, return_indices=True)
+        #    diff_clock = antenna2_handle.clock_samples[ant2_idxs ] - \
+        #                antenna1_handle.clock_samples[ant1_idxs]
+        #    diff_clock_phase = antenna2_handle.phase_clock_samples[ant2_idxs ] - \
+        #                antenna1_handle.phase_clock_samples[ant1_idxs]
+        #else:
+        #    _, ant1_idxs_clock, ant1_dt = np.intersect1d(antenna1_handle.clock_times, \
+        #            baseline_handle.datetime_array, return_indices=True)
+        #    _, ant2_idxs_clock, ant2_dt = np.intersect1d(antenna2_handle.clock_times, \
+        #            baseline_handle.datetime_array, return_indices=True)
+        #    diff_clock = np.zeros(len(baseline_handle.datetime_array))
+        #    diff_clock[ant2_dt] += antenna2_handle.clock_samples[ant2_idxs_clock]
+        #    diff_clock[ant1_dt] -= antenna1_handle.clock_samples[ant1_idxs_clock]
+        #    _, ant1_idxs_phase, ant1_dt = np.intersect1d(antenna1_handle.phase_clock_times, \
+        #            baseline_handle.datetime_array, return_indices=True)
+        #    _, ant2_idxs_phase, ant2_dt = np.intersect1d(antenna2_handle.phase_clock_times, \
+        #            baseline_handle.datetime_array, return_indices=True)
+        #    diff_clock_phase = np.zeros(len(baseline_handle.datetime_array))
+
+        #    diff_clock_phase[ant2_dt] += antenna2_handle.phase_clock_samples[ant2_idxs_phase]
+        #    diff_clock_phase[ant1_dt] -= antenna1_handle.phase_clock_samples[ant1_idxs_phase]
 
         dc_range = diff_clock[baseline_handle.range_only_idxs]
         dc_phase = diff_clock_phase[baseline_handle.phase_data_idxs]       
@@ -15401,28 +15431,31 @@ def iterative_weight_adjust_ls_vce(
                 if ant.antenna_name == ref_antenna:
                     continue
                 print(f'for antenna {ant.antenna_name}:')
-                if True: #observable == 'range':
-                    if False: #ant.antenna_name == 'FDV2':
-                        ant.clock_psd_rw = min(max(sig_hat[idx], 1e-2), 4e6)
-                    else:
-                        #ant.clock_psd_rw = min(max(sig_hat[idx], 1e-2), 345)
-                        #ant.clock_psd_rw = min(max(sig_hat[idx], 1e-2), 50)
-                        ant.clock_psd_rw = min(max(sig_hat[idx], 1e-2), 50)
-                else:
-                    ant.clock_psd_rw = max(sig_hat[idx], 1e-3)
-                print(f"clock psd rw: {ant.clock_psd_rw} ps^2/hr")
+                if observable == 'range':
+                    ant.clock_psd_rw = min(max(sig_hat[idx], 1e-2), 3e6)
+                    print(f"clock psd rw: {ant.clock_psd_rw} ps^2/hr")
+                elif observable == 'phase':
+                    ant.phase_clock_psd_rw = min(max(sig_hat[idx], 1e-2), 50)
+                    print(f"clock psd rw: {ant.phase_clock_psd_rw} ps^2/hr")
+                    #if False: #ant.antenna_name == 'FDV2':
+                    #    ant.clock_psd_rw = min(max(sig_hat[idx], 1e-2), 4e6)
+                    #else:
+                    #    #ant.clock_psd_rw = min(max(sig_hat[idx], 1e-2), 345)
+                    #    #ant.clock_psd_rw = min(max(sig_hat[idx], 1e-2), 50)
+                    #    ant.clock_psd_rw = min(max(sig_hat[idx], 1e-2), 50)
                 idx += 1
                 if FIT_IRW:
-                    if True: # observable == 'range':
+                    if observable == 'range':
+                        ant.clock_psd_irw = max(sig_hat[idx], 1e-4)
+                        print(f"clock psd irw: {ant.clock_psd_irw} ps^2/hr^3")
+                    elif observable == 'phase':
                         if ant.ppp_clock_active:
                             #ant.clock_psd_irw = min(max(sig_hat[idx], 1e-3), 78)
-                            ant.clock_psd_irw = min(max(sig_hat[idx], 1e-3), 0.0001)
+                            ant.phase_clock_psd_irw = min(max(sig_hat[idx], 1e-3), 0.0001)
                         else:
                             #ant.clock_psd_irw = min(max(sig_hat[idx], 1e-3), 780)
-                            ant.clock_psd_irw = min(max(sig_hat[idx], 1e-3), 1e9)
-                    else:
-                        ant.clock_psd_irw = max(sig_hat[idx], 1e-4)
-                    print(f"clock psd irw: {ant.clock_psd_irw} ps^2/hr^3")
+                            ant.phase_clock_psd_irw = min(max(sig_hat[idx], 1e-3), 1e9)
+                        print(f"clock psd irw: {ant.phase_clock_psd_irw} ps^2/hr^3")
                     idx += 1
 
         if not no_PSD and store_handle.stochastic_trop:
@@ -15669,15 +15702,21 @@ def iterative_weight_adjust_ls_vce_alt(store_handle, state_expanded, bounds, ls_
             if store_handle.stochastic_clock is True:
                 for idx, antenna_handle in enumerate(antenna_handles):
                     if ref_antenna != antenna_handle.antenna_name:
-                        antenna_handle.clock_psd_rw = max(sig_hat[sig_count], 1e-3)
+                        if observable == 'range':
+                            antenna_handle.clock_psd_rw = max(sig_hat[sig_count], 1e-3)
+                            print('clock psd rw: ' + str(antenna_handle.clock_psd_rw) + ' cm^2/day')
+                        else:
+                            antenna_handle.phase_clock_psd_rw = max(sig_hat[sig_count], 1e-3)
+                            print('clock psd rw: ' + str(antenna_handle.phase_clock_psd_rw) + ' cm^2/day')
                         sig_count += 1
                         if FIT_IRW is True:
-                            antenna_handle.clock_psd_irw = max(sig_hat[sig_count], 1e-1)
+                            if observable == 'range':
+                                antenna_handle.clock_psd_irw = max(sig_hat[sig_count], 1e-1)
+                                print('clock psd irw: ' + str(antenna_handle.clock_psd_irw) + ' cm^2/day^3')
+                            elif observable == 'phase':
+                                antenna_handle.phase_clock_psd_irw = max(sig_hat[sig_count], 1e-1)
+                                print('clock psd irw: ' + str(antenna_handle.phase_clock_psd_irw) + ' cm^2/day^3')
                             sig_count += 1
-
-                        print('clock psd rw: ' + str(antenna_handle.clock_psd_rw) + ' cm^2/day')
-                        if FIT_IRW is True:
-                            print('clock psd irw: ' + str(antenna_handle.clock_psd_irw) + ' cm^2/day^3')
 
             if store_handle.stochastic_trop is True:
                 for idx, antenna_handle in enumerate(antenna_handles):
@@ -15711,349 +15750,6 @@ def iterative_weight_adjust_ls_vce_alt(store_handle, state_expanded, bounds, ls_
 
     return ls_sol
 
-
-def iterative_weight_adjust_ls_vce_old(store_handle, state_expanded, bounds, ls_args, res_fcn, jac, sol_type, observable='range', no_PSD=False):
-    """Implement LS-VCE to estimate variance components (https://link.springer.com/content/pdf/10.1007/s00190-007-0157-x.pdf) .
-    """
-    max_iter = 30
-    tol_var = 1e-4
-    n_iter = 0
-    chi_sq = np.inf
-    ref_antenna = ls_args[0]
-    baselines = ls_args[1]
-    antenna_handles = ls_args[3]
-    clock_idxs = ls_args[4]
-    trop_idxs = ls_args[6]
-    baseline_handles = ls_args[9]
-    if observable == 'range':
-        phase_delay = False
-        phase_only = False
-    if observable == 'phase':
-        use_phase_weights = ls_args[14]
-        phase_clock_idxs = ls_args[17]
-        phase_delay = True
-        phase_only = True
-
-    if store_handle.global_linear_clock is True:
-        idx_start = 1
-    elif store_handle.global_quadratic_clock is True:
-        idx_start = 2
-    else:
-        idx_start = 0
-
-    sig_hat_prev = np.ones(len(baseline_handles)) 
-    while n_iter < max_iter:
-        sigma_eta_squared_new = np.ones(len(baseline_handles)) 
-
-        # Perform least squares adjustment
-        ls_sol = least_squares(res_fcn, state_expanded, jac=jac, method='trf',
-                               max_nfev=100, bounds=bounds, verbose=0, x_scale='jac', xtol=1e-15,
-                               args=ls_args)
-        residuals = get_residuals(ls_sol.fun, baseline_handles, phase_delay, phase_only)
-
-        num_samples = 0 
-        weights = np.zeros((len(ls_sol.fun),len(ls_sol.fun)))
-        var_apr = np.zeros(len(ls_sol.fun))
-        for jdx, baseline in enumerate(baselines):
-            antenna1_handle = antenna_handles[baseline[0]]
-            antenna2_handle = antenna_handles[baseline[1]]
-            baseline_handle = baseline_handles[jdx]
-            if observable == 'range':
-                range_weight_mat = get_obs_weights(store_handle, antenna_handles[baseline[0]], antenna_handles[baseline[1]], 'range',\
-                        baseline_handle.range_data_idxs, baseline_handle)
-                weights[num_samples:num_samples + len(baseline_handle.range_data_idxs),\
-                        num_samples:num_samples + len(baseline_handle.range_data_idxs)] = range_weight_mat
-                if sol_type == 'VLBI':
-                    var_apr[num_samples:num_samples + len(baseline_handle.range_data_idxs)] = baseline_handle.grdel_err[baseline_handle.range_data_idxs]**2
-                num_samples += len(baseline_handle.range_data_idxs)
-            elif observable == 'phase':
-                phase_weight_mat = get_obs_weights(store_handle, antenna1_handle, antenna2_handle, 'phase',\
-                        baseline_handle.phase_data_idxs, baseline_handle, use_phase_weights)
-                weights[num_samples:num_samples + len(baseline_handle.phase_data_idxs),\
-                        num_samples:num_samples + len(baseline_handle.phase_data_idxs)] = phase_weight_mat
-                if sol_type == 'VLBI':
-                    var_apr[num_samples:num_samples + len(baseline_handle.phase_data_idxs)] = baseline_handle.phdel_err[baseline_handle.phase_data_idxs]**2
-                num_samples += len(baseline_handle.phase_data_idxs)
-
-        if store_handle.stochastic_clock is True:
-            for idx, antenna_handle in enumerate(antenna_handles):
-                if ref_antenna == antenna_handle.antenna_name:
-                    ref_handle = antenna_handle
-
-            for idx, antenna_handle in enumerate(antenna_handles):
-                if ref_antenna != antenna_handle.antenna_name:
-                    if observable == 'range':
-                        process_variance_clock = get_process_variance_times(store_handle, antenna_handle, 'clock')
-                        process_variance_ref_clock = get_process_variance_times(store_handle, ref_handle, 'clock', False, antenna_handle.clock_times)
-                        weights[num_samples:num_samples + len(antenna_handle.clock_times)-1,\
-                                num_samples:num_samples + len(antenna_handle.clock_times)-1] =\
-                                np.diag(1/np.sqrt(process_variance_clock + process_variance_ref_clock))
-                        num_samples += len(antenna_handle.clock_times)-1
-
-                    if observable == 'phase':
-                        process_variance_phase_clock = get_process_variance_times(store_handle, antenna_handle, 'clock', phase_delay)
-                        process_variance_ref_phase_clock = get_process_variance_times(store_handle, ref_handle, 'clock', phase_delay, antenna_handle.phase_clock_times)
-                        weights[num_samples:num_samples + len(antenna_handle.phase_clock_times)-1,\
-                                num_samples:num_samples + len(antenna_handle.phase_clock_times)-1] =\
-                                np.diag(1/np.sqrt(process_variance_phase_clock + process_variance_ref_phase_clock))
-                        num_samples += len(antenna_handle.phase_clock_times)-1
-
-        if store_handle.stochastic_trop is True:
-            for idx, antenna_handle in enumerate(antenna_handles):
-                if ref_antenna != antenna_handle.antenna_name and antenna_handle.estimate_trop is True:
-                    process_variance_trop = get_process_variance_times(store_handle, antenna_handle, 'trop')
-                    weights[num_samples:num_samples + len(antenna_handle.trop_times)-1,\
-                            num_samples:num_samples + len(antenna_handle.trop_times)-1] =\
-                            np.diag(1/np.sqrt(process_variance_trop))
-                    num_samples += len(antenna_handle.trop_times)-1
-
-        var_apr_mat = np.diag(var_apr)
-        #A_mat = ls_sol.jac
-        A_mat = np.linalg.inv(weights)@ls_sol.jac
-        n_param = ls_sol.jac.shape[1]
-        cov = np.linalg.inv(ls_sol.jac.T @ ls_sol.jac)
-        res_unweighted = (np.linalg.inv(weights) @ ls_sol.fun).reshape(-1, 1)
-
-        # get null space matrix B
-        U, s, Vt = np.linalg.svd(A_mat, full_matrices=True)
-        # Determine the effective rank by comparing singular values to a tolerance.
-        rtol = 1e-8
-        tol = rtol * s[0] if s.size > 0 else rtol
-        rank = (s > tol).sum()
-        # The columns of U from 'rank' to m-1 form an orthonormal basis for the left null space of H.
-        B_mat = U[:, rank:]
-        #t_vec = B_mat.T @ res_unweighted # ls_sol.fun
-        t_vec = B_mat.T @ y_com # ls_sol.fun
-        
-        # flags for controlling options in this code
-        ESTIMATE_PSD = True 
-        if no_PSD is True:
-            # override to prevent over-permissive clock model in initial range solution
-            ESTIMATE_PSD = False
-        ESTIMATE_CHI_SQ = True
-        EM_UPDATE = False
-        FIT_IRW = False
-        initiated = False
-
-        num_samples = 0 # start in lower right block diagonal 
-        for jdx, baseline in enumerate(baselines):
-            antenna1_handle = antenna_handles[baseline[0]]
-            antenna2_handle = antenna_handles[baseline[1]]
-            baseline_handle = baseline_handles[jdx]
-            Q_eta_full = np.zeros_like(weights)
-
-            # Construct cofactor matrix Q_eta_full
-            if observable == 'range':
-                Q_eta = construct_Q_eta(store_handle, baseline_handle, baseline_handle.range_data_idxs)
-                Q_eta_full[num_samples:num_samples+len(baseline_handle.range_data_idxs),\
-                        num_samples:num_samples+len(baseline_handle.range_data_idxs)] = Q_eta
-                num_samples = num_samples + len(baseline_handle.range_data_idxs) 
-            elif observable == 'phase':
-                Q_eta = construct_Q_eta(store_handle, baseline_handle, baseline_handle.phase_data_idxs)
-                Q_eta_full[num_samples:num_samples+len(baseline_handle.phase_data_idxs),\
-                        num_samples:num_samples+len(baseline_handle.phase_data_idxs)] = Q_eta
-                num_samples = num_samples + len(baseline_handle.phase_data_idxs)
-
-            if ESTIMATE_CHI_SQ is True:
-                if jdx == 0:
-                    initiated=True
-                    H_vh = vh_operator(B_mat.T @ Q_eta_full @ B_mat)[:,np.newaxis]
-                else:
-                    H_vh = np.hstack((H_vh, vh_operator(B_mat.T @ Q_eta_full @ B_mat)[:,np.newaxis]))
-
-        if ESTIMATE_PSD is True:
-            if EM_UPDATE is True:
-                phi_arr = []
-            if store_handle.stochastic_clock is True:
-                for idx, antenna_handle in enumerate(antenna_handles):
-                    if ref_antenna != antenna_handle.antenna_name:
-                        Q_clock_full_rw = np.zeros_like(weights) 
-                        Q_clock_full_irw = np.zeros_like(weights) 
-                        if observable == 'range':
-                            Q_clock_rw = get_process_variance_times(store_handle, antenna_handle, 'clock', phase_delay, only_mat=True, clock_mat_type='rw')
-                            Q_clock_irw = get_process_variance_times(store_handle, antenna_handle, 'clock', phase_delay, only_mat=True, clock_mat_type='irw')
-                            Q_clock_full_rw[num_samples:num_samples + len(antenna_handle.clock_times)-1,\
-                                    num_samples:num_samples + len(antenna_handle.clock_times)-1] = np.diag(Q_clock_rw/FACTOR_RW)
-                            Q_clock_full_irw[num_samples:num_samples + len(antenna_handle.clock_times)-1,\
-                                    num_samples:num_samples + len(antenna_handle.clock_times)-1] = np.diag(Q_clock_irw/FACTOR_IRW)
-                        elif observable == 'phase':
-                            Q_clock_rw = get_process_variance_times(store_handle, antenna_handle, 'clock', phase_delay, only_mat=True, clock_mat_type='rw')
-                            Q_clock_irw = get_process_variance_times(store_handle, antenna_handle, 'clock', phase_delay, only_mat=True, clock_mat_type='irw')
-                            Q_clock_full_rw[num_samples:num_samples + len(antenna_handle.phase_clock_times)-1,\
-                                    num_samples:num_samples + len(antenna_handle.phase_clock_times)-1] = np.diag(Q_clock_rw/FACTOR_RW)
-                            Q_clock_full_irw[num_samples:num_samples + len(antenna_handle.phase_clock_times)-1,\
-                                    num_samples:num_samples + len(antenna_handle.phase_clock_times)-1] = np.diag(Q_clock_irw/FACTOR_IRW)
-
-                        if EM_UPDATE is True:
-                            if observable == 'range':
-                                n_epochs = len(antenna_handle.clock_times)-1
-                                clock_idxs_range = np.arange(clock_idxs.start+idx_start, clock_idxs.stop)
-                                idxs_ant = clock_idxs_range[antenna_handle.range_clock_idxs]
-                            elif observable == 'phase':
-                                n_epochs = len(antenna_handle.phase_clock_times)-1
-                                clock_idxs_phase = np.arange(phase_clock_idxs.start+idx_start, phase_clock_idxs.stop)
-                                idxs_ant = clock_idxs_phase[antenna_handle.phase_clock_idxs]
-
-                            S_w_arr = []
-                            G_sum_rw_arr = []
-                            if FIT_IRW is True:
-                                G_sum_irw_arr = []
-                            for k in range(n_epochs):
-                                diff_mu = res_unweighted[num_samples+k]
-                                diff_var = cov[idxs_ant[k+1],idxs_ant[k+1]] + cov[idxs_ant[k],idxs_ant[k]] - 2*cov[idxs_ant[k],idxs_ant[k+1]]
-                                S_w = diff_mu**2 + diff_var
-                                S_w_arr.append(S_w)
-                                G_sum_rw_arr.append(Q_clock_rw[k])
-                                if FIT_IRW is True:
-                                    G_sum_irw_arr.append(Q_clock_irw[k])
-
-                            if FIT_IRW is True:
-                                G = np.column_stack((np.array(G_sum_rw_arr)/FACTOR_RW, np.array(G_sum_irw_arr)))
-                                S = np.array(S_w_arr)
-                                phi = np.linalg.solve(G.T@G, G.T@S)
-                                phi_arr.append(phi[0])
-                                phi_arr.append(phi[1])
-                            else:
-                                phi_arr.append(np.sum(np.array(S_w_arr))*FACTOR_RW/np.sum(np.array(G_sum_rw_arr)))
-                        else:
-                            if initiated is False:
-                                H_vh = vh_operator(B_mat.T @ Q_clock_full_rw @ B_mat)[:,np.newaxis]
-                                initiated = True
-                            else:
-                                H_vh = np.hstack((H_vh, vh_operator(B_mat.T @ Q_clock_full_rw @ B_mat)[:,np.newaxis]))
-                            if FIT_IRW is True:
-                                H_vh = np.hstack((H_vh, vh_operator(B_mat.T @ Q_clock_full_irw @ B_mat)[:,np.newaxis]))
-
-                        if observable == 'range':
-                            num_samples += len(antenna_handle.clock_times)-1
-                        elif observable == 'phase':
-                            num_samples += len(antenna_handle.phase_clock_times)-1
-
-            if store_handle.stochastic_trop is True:
-                for idx, antenna_handle in enumerate(antenna_handles):
-                    if ref_antenna != antenna_handle.antenna_name and antenna_handle.estimate_trop is True:
-                        Q_trop_full = np.zeros_like(weights)
-                        Q_trop = get_process_variance_times(store_handle, antenna_handle, 'trop', only_mat=True)
-                        Q_trop_full[num_samples:num_samples + len(antenna_handle.trop_times)-1,\
-                                num_samples:num_samples + len(antenna_handle.trop_times)-1] = np.diag(Q_trop/FACTOR_RW)
-
-                        if EM_UPDATE is True:
-                            n_epochs = len(antenna_handle.trop_times)-1
-                            trop_idxs = np.arange(trop_idxs.start, trop_idxs.stop)
-                            idxs_ant = trop_idxs[antenna_handle.trop_idxs]
-                            S_w = 0
-                            G_sum_rw = 0
-                            for k in range(n_epochs):
-                                diff_mu = res_unweighted[num_samples+k]
-                                diff_var = cov[idxs_ant[k+1],idxs_ant[k+1]] + cov[idxs_ant[k],idxs_ant[k]] - 2*cov[idxs_ant[k],idxs_ant[k+1]]
-                                S_w += diff_mu**2 + diff_var
-                                G_sum_rw += Q_clock_rw[k]
-                            phi_arr.append(S_w/G_sum_rw*FACTOR_RW)
-                        else:
-                            H_vh = np.hstack((H_vh, vh_operator(B_mat.T @ Q_trop_full @ B_mat)[:,np.newaxis]))
-                        
-                        num_samples += len(antenna_handle.trop_times)-1
-        
-        y_vh = vh_operator(t_vec@t_vec.T - B_mat.T@var_apr_mat@B_mat)
-        sig_hat = np.linalg.lstsq(H_vh, y_vh, rcond=None)[0]
-        if ESTIMATE_PSD is True:
-            Q_com_inv = weights.T@weights
-            y_com = np.concatenate((res_unweighted[:len(residuals)].flatten(), np.zeros(len(antenna_handles[1].clock_times)-1).flatten()))
-            P_A_perp = np.eye(len(y_com))-A_mat@cov@A_mat.T@Q_com_inv
-            test_perp = P_A_perp@A_mat # should be 0s, compare against B
-            n_11 = 0.5*np.trace(Q_eta_full@Q_com_inv@P_A_perp@Q_eta_full@Q_com_inv@P_A_perp)
-            n_12 = 0.5*np.trace(Q_eta_full@Q_com_inv@P_A_perp@Q_clock_full_rw@Q_com_inv@P_A_perp)
-            n_21 = 0.5*np.trace(Q_clock_full_rw@Q_com_inv@P_A_perp@Q_eta_full@Q_com_inv@P_A_perp)
-            n_22 = 0.5*np.trace(Q_clock_full_rw@Q_com_inv@P_A_perp@Q_clock_full_rw@Q_com_inv@P_A_perp)
-            v_vec = P_A_perp@y_com
-            l_1 = 0.5*v_vec.T@Q_com_inv@Q_eta_full@Q_com_inv@v_vec - 0.5*np.trace(Q_eta_full@Q_com_inv@P_A_perp@var_apr_mat@Q_com_inv@P_A_perp)
-            l_2 = 0.5*v_vec.T@Q_com_inv@Q_clock_full_rw@Q_com_inv@v_vec - 0.5*np.trace(Q_clock_full_rw@Q_com_inv@P_A_perp@var_apr_mat@Q_com_inv@P_A_perp)
-            N_arr = np.array([[n_11, n_12],[n_21,n_22]])
-            L_vec = np.array([l_1, l_2])
-            sig_hat_simple = np.linalg.solve(N_arr, L_vec)
-        #sig_hat  = nnls(H_vh, y_vh)[0] 
-
-        sig_count = 0
-        if ESTIMATE_CHI_SQ is True:
-            for jdx, baseline in enumerate(baselines):
-                baseline_handle = baseline_handles[jdx]
-                sigma_squared_baseline = max(sig_hat[jdx], 1e-10)
-
-                if observable == 'range':
-                    baseline_handle.q_range = np.sqrt(sigma_squared_baseline)
-                elif observable == 'phase':
-                    baseline_handle.q_phase = np.sqrt(sigma_squared_baseline)
-                sig_count += 1
- 
-        if ESTIMATE_PSD is True:
-            em_count = 0
-            if store_handle.stochastic_clock is True:
-                for idx, antenna_handle in enumerate(antenna_handles):
-                    if ref_antenna != antenna_handle.antenna_name:
-                        if EM_UPDATE is True:
-                            antenna_handle.clock_psd_rw = phi_arr[em_count]
-                            em_count += 1
-                            if FIT_IRW is True:
-                                antenna_handle.clock_psd_irw = phi_arr[em_count]
-                                em_count += 1
-                        else:
-                            antenna_handle.clock_psd_rw = max(sig_hat[sig_count], 1e-3)
-                            sig_count += 1
-                            if FIT_IRW is True:
-                                antenna_handle.clock_psd_irw = max(sig_hat[sig_count], 1e-1)
-                                sig_count += 1
-
-                        print('clock psd rw: ' + str(antenna_handle.clock_psd_rw) + ' cm^2/day')
-                        if FIT_IRW is True:
-                            print('clock psd irw: ' + str(antenna_handle.clock_psd_irw) + ' cm^2/day^3')
-
-            if store_handle.stochastic_trop is True:
-                for idx, antenna_handle in enumerate(antenna_handles):
-                    if ref_antenna != antenna_handle.antenna_name and antenna_handle.estimate_trop is True:
-                        if EM_UPDATE is True:
-                            antenna_handle.trop_psd_rw = phi_arr[em_count]
-                            em_count += 1
-                        else:
-                            antenna_handle.trop_psd_rw = max(sig_hat[sig_count], 1e-3)
-                            sig_count += 1
-                        print('trop psd rw: ' + str(antenna_handle.trop_psd_rw) + ' cm^2/day')
-
-        # Check convergence
-        if EM_UPDATE is True and ESTIMATE_PSD is True:
-            rel_change_arr = np.concatenate((sig_hat.flatten(),np.array(phi_arr).flatten()))
-        else:
-            rel_change_arr = sig_hat
-        if n_iter > 0:
-            rel_change_eta = np.abs(rel_change_arr - rel_change_prev) / np.abs(rel_change_arr)
-            rel_change_prev = rel_change_arr
-            var_change = max(rel_change_eta)
-            if var_change < tol_var:
-                break
-            print(f'max sigma^2_eta change: {var_change}')
-        else:
-            rel_change_prev = rel_change_arr
-
-        # Update variance components
-        print(f'iteration {n_iter}')
-        chi_sq = np.sum(ls_sol.fun**2)/(len(ls_sol.fun)-len(ls_sol.x))
-        print(f'chi-squared: {chi_sq:.3f}')
-
-        # after you build weights, A_mat, B_mat
-        #print("orthogonality ‖Bᵀ H‖:",
-        #      np.linalg.norm(B_mat.T @ A_mat))
-        #print("cond(H_vhᵀ H_vh):",
-        #      np.linalg.cond(H_vh.T @ H_vh))
-        #print("range vh PSD col magnitude:",
-        #np.linalg.norm(H_vh[:, -1]))
-
-        n_iter += 1
-
-    # Final least squares adjustment with estimated variance components
-    ls_sol = least_squares(res_fcn, state_expanded, jac=jac, method='trf',
-                           max_nfev=100, bounds=bounds, verbose=0, x_scale='jac', xtol=1e-15,
-                           args=ls_args)
-
-    return ls_sol
 
 def vh_operator(A):
     """

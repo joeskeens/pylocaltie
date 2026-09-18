@@ -1283,6 +1283,7 @@ def lstsq_estimation(sol_type, plot_intermediate_results, ref_antenna, store_han
                 ls_grdel = iterative_weight_adjust_ls_vce(store_handle, ls_grdel.x, bounds, ls_args, calc_residuals, jac, sol_type, 'range', no_PSD=True)
         else:
             ls_grdel = iterative_weight_adjust(store_handle, ls_grdel.x, bounds, ls_args, calc_residuals, jac, sol_type, 'range')
+
     grdel_clock_idxs = clock_idxs
     for baseline_handle in baseline_handles:
         baseline_handle.save_range_idxs()
@@ -2360,6 +2361,8 @@ if __name__ == '__main__':
             # remove stochastic model PSD scalings for reference antenna
             antenna_handle.clock_psd_rw = 0
             antenna_handle.clock_psd_irw = 0
+            antenna_handle.phase_clock_psd_rw = 0
+            antenna_handle.phase_clock_psd_irw = 0
             antenna_handle.trop_psd_rw = 0
 
         if len(args.sta_codes)==len(args.antenna_names) and len(args.domes_names)==len(args.antenna_names):
