@@ -23,16 +23,15 @@ import argparse
 import xarray as xr
 import re
 import numpy as np
-
+from pathlib import Path
 use_custom_version = os.getenv('USE_CUSTOM_GEORINEX', 'false').lower() == 'true'
 if use_custom_version:
     import sys
-    #sys.path.insert(0, '/sgl/ceph/work/jskeens')
-    sys.path.insert(0, '/home/jskeens/oscar_dir/scratch/jskeens')
-    sys.path.insert(0, '/trashcan/scratch/jskeens')
-    from georinex_custom import load
-else:
+    module_path = str(Path("~/georinex/src").expanduser())
+    sys.path.insert(0, module_path)
     from georinex import load
+else:
+    from georinex import loa
 from matplotlib import pyplot as plt
 
 def add_args_to_parser(parser_in):
