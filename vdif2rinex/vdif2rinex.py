@@ -1127,7 +1127,8 @@ def process_vdif(vdif_files, vdif_files_dual, output_files, satellites, rc_dir, 
                     soft_bits_full = pickle.load(f)
 
         print(f'uprighting bits and creating RINEX observables for source {source}')
-        resolve_rinex_obs(output_file, f_sky, source, soft_bits_full, hard_bits_full, model_full, store_handle, antenna_handle, time_gps, time_shift, aided, short_circuit, C_N0_min)
+        resolve_rinex_obs(output_file, f_sky, source, soft_bits_full, hard_bits_full, model_full, \
+                store_handle, antenna_handle, time_gps, time_shift, aided, short_circuit, C_N0_min, f_IF)
 
         print(f"Total bytes processed={consumed}")
 
@@ -2160,6 +2161,7 @@ def track(is_complex, f_sky, i_out, q_out, source, rc_dir, vdif_stats, sample_ra
             #if it >0 and C_N0 > 45: 
             #    Gd=1 # dot product discriminator has unit gain
             #    do_coherent = True
+            phi_0_meas = phi_0  # phase used to form S_prompt_arr this iteration
             cost_tau, cost_phi, phase_arr, d_arr, weight_arr, dt_true, S_prompt_arr = get_tap_meas(X_blocks, dt_full, num_blocks, N_k, ranging_code,\
                 prn_code, sample_rate, chip_rate, code_length_samples, eml, t_0, t_dot, phi_0, f_IF, f_D, f_D_dot, do_coherent)
             cost = cost_tau + cost_phi
@@ -2264,14 +2266,21 @@ def track(is_complex, f_sky, i_out, q_out, source, rc_dir, vdif_stats, sample_ra
         if n_slip != 0:
             phi_0 -= n_slip * np.pi
 
+        # align bit sign with the continuity-resolved phase branch (phi_0_hold)
+        if int(np.rint((phi_0_meas - phi_0_hold) / np.pi)) % 2:
+            print('ACTIVATING BUG FIX!!! \n \n \n')
+            # flip bits if slip is by a half-cycle
+            soft_bits = -soft_bits
+            hard_bits = -hard_bits
+
         soft_bits_rc[ranging_code] = soft_bits
         hard_bits_rc[ranging_code] = hard_bits
         model_new[ranging_code] = (t_0, t_dot, phi_0, f_D, f_D_dot, C_N0)
 
-        if model is None:
-            np.savez(f'prompt_{source}_{ranging_code}_{antenna_handle.antenna_name}_'
-                     f'{vdif_file_handle.split("_")[-1]}.npz',
-                     S_prompt_arr=S_prompt_arr, code_period=code_period)
+        #if model is None:
+        #    np.savez(f'prompt_{source}_{ranging_code}_{antenna_handle.antenna_name}_'
+        #             f'{vdif_file_handle.split("_")[-1]}.npz',
+        #             S_prompt_arr=S_prompt_arr, code_period=code_period)
 
         #S  = S_prompt_arr[1:]; S = S*np.sign(np.real(S))
         #zb = S[:K*N_block].reshape(K, N_block)
@@ -2384,7 +2393,8 @@ def running_mean_block_average(x, N_win, N_avg):
 
     return out
 
-def resolve_rinex_obs(output_file, f_sky, source, soft_bits_full, hard_bits_full, model_full, store_handle, antenna_handle, time_gps, time_shift, aided, short_circuit, C_N0_min):
+def resolve_rinex_obs(output_file, f_sky, source, soft_bits_full, hard_bits_full, model_full, \
+        store_handle, antenna_handle, time_gps, time_shift, aided, short_circuit, C_N0_min, f_IF):
     """ Upright data bits, assimilate models, and produce RINEX observables """
     ranging_codes =  [key for key in model_full[0].keys()]
     nu_arr = []
@@ -2431,7 +2441,13 @@ def resolve_rinex_obs(output_file, f_sky, source, soft_bits_full, hard_bits_full
     times_gps = []
     for jdx in range(len(model_full)):
         times_gps.append(time_gps + np.timedelta64(jdx, 's'))
+
     obs_times = np.array(times_gps)[use_idxs]
+    if time_shift > 0:
+        if shift_int:
+            obs_times = obs_times + np.timedelta64(1, 's')
+        else:
+            obs_times = obs_times + np.timedelta64(int(time_shift*1e9), 'ns')
 
     rinex_file = RinexFile(antenna_handle.ref_pos, output_file, obs_times)
     rinex_file.gen_header(nav_uprighter.carrier_code, ranging_codes_use, system_code) # cc should be the same
@@ -2501,6 +2517,10 @@ def resolve_rinex_obs(output_file, f_sky, source, soft_bits_full, hard_bits_full
             code_phase_m = t_0_arr/chip_rate * const.c # ambiguous pseudorange
             ADR = -phi_0_arr/(2*np.pi)
 
+        # RF-referenced ADR: phi_0 is relative to a mixer starting at the (non-integer-second)
+        # file start, so add f_IF*t_start (mod 1); integer seconds contribute integer cycles.
+        ADR += (f_IF*time_shift) % 1.0
+
         antenna_handle.times_gps = times_gps
         source_array = np.repeat(source, len(times_gps))
         #rxpos_series, R_obj  = store_handle.compute_tides(antenna_handle.times_gps, antenna_handle.ref_pos, antenna_handle.antenna_name) 
@@ -2562,9 +2582,7 @@ def resolve_rinex_obs(output_file, f_sky, source, soft_bits_full, hard_bits_full
         # f_D_arr is at the ADR epoch in every branch, so this is branch-independent
         ADR_miss = ADR - (f_D_arr + 0.5*f_D_dot_arr)
 
-
         pr_miss = -code_miss_m[:-1] + pr_amb*np.rint((pr_model[1:]+code_miss_m[:-1])/pr_amb)
-        ADR_miss += phase_shift
         ADR_diff = ADR[1:]-ADR_miss[:-1]
         pr_const_miss = 0.5*np.rint(2*np.median(ADR_diff))
         ADR_miss += pr_const_miss

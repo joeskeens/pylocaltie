@@ -155,6 +155,21 @@ def _plot_single_series(time_values, y1, y2, label1, label2, ylabel, title, out_
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
 
+def _wavelength(varname):
+    c = 299792458
+    if varname[:2] == 'L1':
+        return c/1575.42e6
+    elif varname[:2] == 'L2':
+        return c/1227.60e6
+    elif varname[:2] == 'L5':
+        return c/1176.45e6
+    elif varname[:3] == 'L7Q':
+        return c/1207.14e6
+    elif varname[:3] == 'L6I':
+        return c/1268.52e6
+    elif varname[:3] == 'L6C':
+        return c/1278.75e6
+    raise ValueError(f'No wavelength for {varname}')
 
 def plot_common_sv_signal_types(
     rinex_data_1: xr.Dataset,
@@ -230,19 +245,8 @@ def plot_common_sv_signal_types(
             # ---- ADR
             v1, v2 = _get("L")
             if v1 and v2:
-                c = 299792458
-                if v1[:2] == 'L1':
-                    wavelength = c/1575.42e6
-                elif v1[:2] == 'L2':
-                    wavelength = c/1227.60e6
-                elif v1[:2] == 'L5':
-                    wavelength = c/1176.45e6
-                elif v1[:3] == 'L7Q':
-                    wavelength = c/1207.14e6
-                elif v1[:3] == 'L6I':
-                    wavelength = c/1268.52e6
-                elif v1[:3] == 'L6C':
-                    wavelength = c/1278.75e6
+                wavelength = _wavelength(v1[:2])
+
                 t, y1, y2 = _paired_finite(ds1_sv[v1], ds2_sv[v2])
                 delta = np.rint(y2-y1)
                 y1 += delta
@@ -285,6 +289,7 @@ def plot_common_sv_signal_types(
                         title=f"{sv} {band}: C/N0 (dB-Hz)",
                         out_path=out_path,
                     )
+
 
 if __name__ == '__main__':    
     ### Parse command-line options
