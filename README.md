@@ -34,17 +34,8 @@
    ```
    (SWIG 4.5 broke the RINEX header generation in vdif2rinex. I can confirm
    that 4.0.3 works)
-5.
-   OPTIONAL: **gnsstk-apps** (https://github.com/SGL-UT/gnsstk-apps)
-   ```
-   sed -i 's/-std=c++11/-std=c++17/' BuildSetup.cmake
-   CXXFLAGS="-include cstdint -Wno-deprecated" \
-   ./build.sh -c -e -i $CONDA_PREFIX -j $(nproc) -- -DCMAKE_BUILD_TYPE=release
-   ```
-   This repo has useful tools like RinEdit, which can be used to combine RINEX
-   files produced by vdif2rinex.py.
-6. Fast loading for **georinex** (https://github.com/geospace-code/georinex)
-   The georinex package included in pip at time or writing does not have fast
+5. Fast loading for **georinex** (https://github.com/geospace-code/georinex)
+   The georinex package included in pip at time of writing does not have fast
    RINEX3 loading, which can make the loading times prohibitively long for many
    RINEX files. I have a fork of this library with fast RINEX3 implemented. 
    In your `/home/user/` directory, clone this repo,
@@ -53,3 +44,12 @@
    ```
    then add an environment variable `USE_CUSTOM_GEORINEX=true` to signal to
    `local_tie_estimator.py` to use the fast RINEX3 loading
+6.
+   OPTIONAL: **gnsstk-apps** (https://github.com/SGL-UT/gnsstk-apps)
+   ```
+   sed -i 's/-std=c++11/-std=c++17/' BuildSetup.cmake
+   CXXFLAGS="-include cstdint -Wno-deprecated" \
+   ./build.sh -c -e -i $CONDA_PREFIX -j $(nproc) -- -DCMAKE_BUILD_TYPE=release
+   ```
+   This repo has useful tools like RinEdit, which can be used to combine RINEX
+   files produced by vdif2rinex.py.

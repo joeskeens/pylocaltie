@@ -1298,16 +1298,15 @@ def lstsq_estimation(sol_type, plot_intermediate_results, ref_antenna, store_han
         for antenna_handle in antenna_handles:
             antenna_handle.phase_clock_psd_rw = antenna_handle.clock_psd_rw
             antenna_handle.phase_clock_psd_irw = antenna_handle.clock_psd_irw
-    elif store_handle.stochastic_clock:
-        # using group delay variation as a priori --> solve for phase phi_rw, phi_irw
-        fit_phase_clock_params_grdel(ls_grdel, clock_idxs, store_handle, ls_args, idx_start)
-
+    #elif store_handle.stochastic_clock:
+    #    # using group delay variation as a priori --> solve for phase phi_rw, phi_irw
+    #    fit_phase_clock_params_grdel(ls_grdel, clock_idxs, store_handle, ls_args, idx_start)
 
     grdel_clock_idxs = clock_idxs
     for baseline_handle in baseline_handles:
         baseline_handle.save_range_idxs()
 
-    if store_handle.stochastic_clock is True and getattr(store_handle, 'grdel_clock_apriori', False) is True:
+    if store_handle.stochastic_clock is True: # and getattr(store_handle, 'grdel_clock_apriori', False) is True:
         # Freeze the group delay clock function ONCE, here.  Deliberately not refreshed
         # on later outer LAMBDA iterations (see AntennaInfo.hold_grdel_clock).
         if store_handle.global_linear_clock is True:
@@ -1319,6 +1318,7 @@ def lstsq_estimation(sol_type, plot_intermediate_results, ref_antenna, store_han
         clock_states_grdel = ls_grdel.x[grdel_clock_idxs]
         for antenna_handle in antenna_handles:
             if ref_antenna == antenna_handle.antenna_name:
+                antenna_handle.hold_grdel_clock(antenna_handle.clock_samples, antenna_handle.clock_times, getattr(store_handle, 'grdel_clock_apriori', False))
                 continue
             clock_state_ant = clock_states_grdel[antenna_handle.range_clock_idxs]
             clock_fcn = clock_state_ant[idx_start_clk:].copy()
@@ -1330,10 +1330,10 @@ def lstsq_estimation(sol_type, plot_intermediate_results, ref_antenna, store_han
                 raise ValueError('grdel clock function length %d != %d clock epochs for %s'
                                  % (len(clock_fcn), len(antenna_handle.clock_times),
                                     antenna_handle.antenna_name))
-            antenna_handle.hold_grdel_clock(clock_fcn, antenna_handle.clock_times)
-            print('held a priori group delay clock variation for ' + antenna_handle.antenna_name
-                  + ' (peak-to-peak ' + str(np.round((clock_fcn.max()-clock_fcn.min())*1e12/const.c, 1))
-                  + ' ps)', flush=True)
+            antenna_handle.hold_grdel_clock(clock_fcn, antenna_handle.clock_times, getattr(store_handle, 'grdel_clock_apriori', False))
+            #print('held a priori group delay clock variation for ' + antenna_handle.antenna_name
+            #      + ' (peak-to-peak ' + str(np.round((clock_fcn.max()-clock_fcn.min())*1e12/const.c, 1))
+            #      + ' ps)', flush=True)
 
     # analyze group delay LS solution
     sol_name='grdel'

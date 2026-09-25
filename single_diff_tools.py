@@ -4344,8 +4344,8 @@ class AntennaInfo(object):
         self.clock_psd_rw = 3.45  # ps^2/hr -- for VLBA H maser
         self.clock_psd_rw = 1e6  # ps^2/hr -- AuScope
         self.phase_clock_psd_irw = 0.078  # ps^2/hr^3 -- for VLBA H maser
-        self.phase_clock_psd_rw = 3.45  # ps^2/hr -- for VLBA H maser
-        self.phase_clock_psd_rw = 1e2  # ps^2/hr -- for VLBA H maser
+        #self.phase_clock_psd_rw = 3.45  # ps^2/hr -- for VLBA H maser
+        self.phase_clock_psd_rw = 50  # ps^2/hr -- for VLBA H maser
         self.trop_psd_rw = 10 # ps^2/hr
 
         self.range_clock_idxs = []
@@ -4949,7 +4949,7 @@ class AntennaInfo(object):
             plt.savefig('ppp_clock_samples'+self.antenna_name+'.png')
             plt.close()
 
-    def hold_grdel_clock(self, clock_function, clock_times):
+    def hold_grdel_clock(self, clock_function, clock_times, grdel_clock_active):
         """ Freeze the converged group delay clock function as an a priori series for
             the phase clock stochastic model.
 
@@ -4964,7 +4964,7 @@ class AntennaInfo(object):
         """
         self.grdel_clock_function = np.asarray(clock_function, dtype=float)
         self.grdel_clock_times    = np.asarray(clock_times)
-        self.grdel_clock_active   = True
+        self.grdel_clock_active   = grdel_clock_active
 
     def interp_grdel_clock(self, times=[]):
         """ Sample the frozen group delay clock VARIATION at the given epochs.
@@ -12411,16 +12411,19 @@ def analyze_ls_solution(sol_type, plot_results, ref_antenna, clock_idxs, trop_id
                 fig.savefig(sol_type+'_'+sol_name+'_full_meas_residuals_'+\
                         antenna2_handle.antenna_name+'_' + antenna1_handle.antenna_name + '_bysrc.png')       
             plt.close(fig)
-
-            sigmas_absolute, _ = baseline_clock_fcn_sigma(cov_matrix_full, clock_idxs, antenna1_handle, antenna2_handle,
-                             ref_antenna, store_handle, times_clock, times_clock, phase=False)
-
+            
             # plot clock function
             fig, ax1 = plt.subplots(figsize=(10, 6))
             ax2 = ax1.twinx()
             c_m = data['Clock'].to_numpy()
-            ax1.fill_between(index_array, c_m - sigmas_absolute, c_m + sigmas_absolute,
-                 alpha=0.25, lw=0, color='C0', label=r'$1\sigma$')
+            if store_handle.stochastic_clock:
+                sigmas_absolute, _ = baseline_clock_fcn_sigma(cov_matrix_full, clock_idxs, antenna1_handle, antenna2_handle,
+                                 ref_antenna, store_handle, times_clock, times_clock, phase=False)
+                ax1.fill_between(index_array, c_m - sigmas_absolute, c_m + sigmas_absolute,
+                     alpha=0.25, lw=0, color='C0', label=r'$1\sigma$')
+                ax2.fill_between(index_array, (c_m - sigmas_absolute)*1e6/const.c, (c_m + sigmas_absolute)*1e6/const.c,
+                     alpha=0.25, lw=0, color='C0', label=r'$1\sigma$')
+
             ax1.plot(index_array, c_m, linestyle='-', color='b')
 
             # Formatting the date on the x-axis
@@ -12432,9 +12435,6 @@ def analyze_ls_solution(sol_type, plot_results, ref_antenna, clock_idxs, trop_id
             #ax1.set_xlabel('date + hr')
             ax1.set_ylabel('diff. clock (m)')
             ax1.grid(True)
-
-            ax2.fill_between(index_array, (c_m - sigmas_absolute)*1e6/const.c, (c_m + sigmas_absolute)*1e6/const.c,
-                 alpha=0.25, lw=0, color='C0', label=r'$1\sigma$')
             ax2.plot(index_array, c_m*1e6/const.c, linestyle='-', color='b')
             ax2.set_ylabel('(microsec)')
             if iono_free is True:
@@ -12560,15 +12560,20 @@ def analyze_ls_solution(sol_type, plot_results, ref_antenna, clock_idxs, trop_id
             else:
                 plt.savefig(sol_type+'_'+sol_name+'_phase_elev_residuals_'+antenna2_handle.antenna_name+'_' + antenna1_handle.antenna_name + '.png')
             plt.close()
-
-            sigmas_absolute_phase, _ = baseline_clock_fcn_sigma(cov_matrix_full, phase_clock_idxs, antenna1_handle, antenna2_handle,
-                             ref_antenna, store_handle, dt_phase, dt_phase, phase=True)
+             
             # plot clock function
             c_m_phase =  data_phase['Clock'].to_numpy()
             fig, ax1 = plt.subplots(figsize=(10, 6))
             ax2 = ax1.twinx()
-            ax1.fill_between(phase_index_array, c_m_phase - sigmas_absolute_phase, c_m_phase + sigmas_absolute_phase,
-                 alpha=0.25, lw=0, color='C0', label=r'$1\sigma$')
+
+            if store_handle.stochastic_clock:
+                sigmas_absolute_phase, _ = baseline_clock_fcn_sigma(cov_matrix_full, phase_clock_idxs, antenna1_handle, antenna2_handle,
+                                 ref_antenna, store_handle, dt_phase, dt_phase, phase=True)
+                ax1.fill_between(phase_index_array, c_m_phase - sigmas_absolute_phase, c_m_phase + sigmas_absolute_phase,
+                     alpha=0.25, lw=0, color='C0', label=r'$1\sigma$')
+                ax2.fill_between(phase_index_array, (c_m_phase - sigmas_absolute_phase)*1e6/const.c, (c_m_phase + sigmas_absolute_phase)*1e6/const.c,
+                     alpha=0.25, lw=0, color='C0', label=r'$1\sigma$')
+
             ax1.plot(phase_index_array, c_m_phase, linestyle='-', color='b')
 
             # Formatting the date on the x-axis
@@ -12581,8 +12586,6 @@ def analyze_ls_solution(sol_type, plot_results, ref_antenna, clock_idxs, trop_id
             ax1.set_ylabel('diff. clock (m)')
             ax1.grid(True)
 
-            ax2.fill_between(index_array, (c_m_phase - sigmas_absolute_phase)*1e6/const.c, (c_m_phase + sigmas_absolute_phase)*1e6/const.c,
-                 alpha=0.25, lw=0, color='C0', label=r'$1\sigma$')
             ax2.plot(phase_index_array, c_m_phase*1e6/const.c, linestyle='-', color='b')
             ax2.set_ylabel('(microsec)')
             if iono_free is True:
@@ -14109,8 +14112,6 @@ def plot_time_units(ref_antenna, ls_sol_grdel, ls_sol_phdel, sol_type, store_han
                 clock_state_global_ant1 = clock_state_ant1[:idx_start]
                 phase_clock_state_global_ant1 = phase_clock_state_ant1[:idx_start]
                 if store_handle.stochastic_clock is True:
-                    clock_samples_ant1 = sample_global_poly_at_interval(clock_state_global_ant1, antenna1_handle.clock_times,\
-                            antenna1_handle.times_gps[0], antenna1_handle.times_gps[-1])
                     phase_clock_samples_ant1 = sample_global_poly_at_interval(phase_clock_state_global_ant1, antenna1_handle.phase_clock_times,\
                             antenna1_handle.times_gps[0], antenna1_handle.times_gps[-1])
                 else:
@@ -14120,7 +14121,6 @@ def plot_time_units(ref_antenna, ls_sol_grdel, ls_sol_phdel, sol_type, store_han
                 phase_clock_state_ant1 = phase_clock_state_ant1[idx_start:]
             else:
                 if store_handle.stochastic_clock is True:
-                    clock_samples_ant1 = np.zeros(len(clock_state_ant1))
                     phase_clock_samples_ant1 = np.zeros(len(phase_clock_state_ant1))
                 else:
                     clock_samples_ant1 = np.zeros(len(antenna1_handle.times_gps))
@@ -14131,7 +14131,6 @@ def plot_time_units(ref_antenna, ls_sol_grdel, ls_sol_phdel, sol_type, store_han
                 phase_clock_samples_ant1 += sample_poly_at_interval(phase_clock_state_ant1,\
                                 clock_poly_length, antenna1_handle.times_gps, antenna1_handle.phase_clock_start)
             elif store_handle.stochastic_clock is True:
-                clock_samples_ant1 += clock_state_ant1
                 phase_clock_samples_ant1 += phase_clock_state_ant1
             else:
                 # only global clock model
@@ -14149,8 +14148,6 @@ def plot_time_units(ref_antenna, ls_sol_grdel, ls_sol_phdel, sol_type, store_han
                 clock_state_global_ant2 = clock_state_ant2[:idx_start]
                 phase_clock_state_global_ant2 = phase_clock_state_ant2[:idx_start]
                 if store_handle.stochastic_clock is True:
-                    clock_samples_ant2 = sample_global_poly_at_interval(clock_state_global_ant2, antenna2_handle.clock_times,\
-                            antenna2_handle.times_gps[0], antenna2_handle.times_gps[-1])
                     phase_clock_samples_ant2 = sample_global_poly_at_interval(phase_clock_state_global_ant2, antenna2_handle.phase_clock_times,\
                             antenna2_handle.times_gps[0], antenna2_handle.times_gps[-1])
                 else:
@@ -14160,7 +14157,6 @@ def plot_time_units(ref_antenna, ls_sol_grdel, ls_sol_phdel, sol_type, store_han
                 phase_clock_state_ant2 = phase_clock_state_ant2[idx_start:]
             else:
                 if store_handle.stochastic_clock is True:
-                    clock_samples_ant2 = np.zeros(len(clock_state_ant2))
                     phase_clock_samples_ant2 = np.zeros(len(phase_clock_state_ant2))
                 else:
                     clock_samples_ant2 = np.zeros(len(antenna2_handle.times_gps))
@@ -14171,7 +14167,6 @@ def plot_time_units(ref_antenna, ls_sol_grdel, ls_sol_phdel, sol_type, store_han
                 phase_clock_samples_ant2 = sample_poly_at_interval(phase_clock_state_ant2,\
                                 clock_poly_length, antenna2_handle.times_gps, antenna2_handle.phase_clock_start)
             elif store_handle.stochastic_clock is True:
-                clock_samples_ant2 = clock_state_ant2
                 phase_clock_samples_ant2 = phase_clock_state_ant2
             else:
                 clock_samples_ant2 += clock_state_ant2[0]
@@ -14179,6 +14174,7 @@ def plot_time_units(ref_antenna, ls_sol_grdel, ls_sol_phdel, sol_type, store_han
         else:
             clock_samples_ant2 = antenna2_handle.clock_samples
             phase_clock_samples_ant2 = antenna2_handle.phase_clock_samples
+
 
         if store_handle.stochastic_clock is False:
             _, ant1_idxs, ant2_idxs = np.intersect1d(antenna1_handle.times_gps, \
@@ -14188,13 +14184,13 @@ def plot_time_units(ref_antenna, ls_sol_grdel, ls_sol_phdel, sol_type, store_han
             diff_clock_phase = phase_clock_samples_ant2[ant2_idxs] - \
                         phase_clock_samples_ant1[ant1_idxs]
         else:
-            _, ant1_idxs_clock, ant1_dt = np.intersect1d(antenna1_handle.clock_times, \
+            _, ant1_idxs_clock, ant1_dt = np.intersect1d(antenna1_handle.grdel_clock_times, \
                     baseline_handle.datetime_array, return_indices=True)
-            _, ant2_idxs_clock, ant2_dt = np.intersect1d(antenna2_handle.clock_times, \
+            _, ant2_idxs_clock, ant2_dt = np.intersect1d(antenna2_handle.grdel_clock_times, \
                     baseline_handle.datetime_array, return_indices=True)
             diff_clock = np.zeros(len(baseline_handle.datetime_array))
-            diff_clock[ant2_dt] += clock_samples_ant2[ant2_idxs_clock]
-            diff_clock[ant1_dt] -= clock_samples_ant1[ant1_idxs_clock]
+            diff_clock[ant2_dt] += antenna2_handle.grdel_clock_function[ant2_idxs_clock]
+            diff_clock[ant1_dt] -= antenna1_handle.grdel_clock_function[ant1_idxs_clock]
             _, ant1_idxs_phase, ant1_dt = np.intersect1d(antenna1_handle.phase_clock_times, \
                     baseline_handle.datetime_array, return_indices=True)
             _, ant2_idxs_phase, ant2_dt = np.intersect1d(antenna2_handle.phase_clock_times, \
@@ -14203,30 +14199,6 @@ def plot_time_units(ref_antenna, ls_sol_grdel, ls_sol_phdel, sol_type, store_han
 
             diff_clock_phase[ant2_dt] += phase_clock_samples_ant2[ant2_idxs_phase]
             diff_clock_phase[ant1_dt] -= phase_clock_samples_ant1[ant1_idxs_phase]
-
-        #if store_handle.stochastic_clock is False:
-        #    _, ant1_idxs, ant2_idxs = np.intersect1d(antenna1_handle.times_gps, \
-        #             antenna2_handle.times_gps, return_indices=True)
-        #    diff_clock = antenna2_handle.clock_samples[ant2_idxs ] - \
-        #                antenna1_handle.clock_samples[ant1_idxs]
-        #    diff_clock_phase = antenna2_handle.phase_clock_samples[ant2_idxs ] - \
-        #                antenna1_handle.phase_clock_samples[ant1_idxs]
-        #else:
-        #    _, ant1_idxs_clock, ant1_dt = np.intersect1d(antenna1_handle.clock_times, \
-        #            baseline_handle.datetime_array, return_indices=True)
-        #    _, ant2_idxs_clock, ant2_dt = np.intersect1d(antenna2_handle.clock_times, \
-        #            baseline_handle.datetime_array, return_indices=True)
-        #    diff_clock = np.zeros(len(baseline_handle.datetime_array))
-        #    diff_clock[ant2_dt] += antenna2_handle.clock_samples[ant2_idxs_clock]
-        #    diff_clock[ant1_dt] -= antenna1_handle.clock_samples[ant1_idxs_clock]
-        #    _, ant1_idxs_phase, ant1_dt = np.intersect1d(antenna1_handle.phase_clock_times, \
-        #            baseline_handle.datetime_array, return_indices=True)
-        #    _, ant2_idxs_phase, ant2_dt = np.intersect1d(antenna2_handle.phase_clock_times, \
-        #            baseline_handle.datetime_array, return_indices=True)
-        #    diff_clock_phase = np.zeros(len(baseline_handle.datetime_array))
-
-        #    diff_clock_phase[ant2_dt] += antenna2_handle.phase_clock_samples[ant2_idxs_phase]
-        #    diff_clock_phase[ant1_dt] -= antenna1_handle.phase_clock_samples[ant1_idxs_phase]
 
         dc_range = diff_clock[baseline_handle.range_only_idxs]
         dc_phase = diff_clock_phase[baseline_handle.phase_data_idxs]       
