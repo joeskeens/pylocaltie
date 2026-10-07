@@ -118,6 +118,47 @@ planet_mu = {
     8: 6.8365299e15, # neptune
 }
 
+FREQ_TO_RINEX_ANT = {
+    1575.42e6:  'G01',   # GPS L1 / Galileo E1 / BeiDou B1C / QZSS L1 / SBAS L1
+    1602.00e6:  'R01',   # GLONASS G1, nominal center -- see note
+    1561.098e6: 'C02',   # BeiDou B1I
+    1278.75e6:  'E06',   # Galileo E6 / QZSS L6
+    1268.52e6:  'C06',   # BeiDou B3I
+    1246.00e6:  'R02',   # GLONASS G2, nominal center -- see note
+    1227.60e6:  'G02',   # GPS L2 / QZSS L2
+    1207.140e6: 'E07',   # Galileo E5b / BeiDou B2b
+    1202.025e6: 'R03',   # GLONASS G3 (CDMA)
+    1191.795e6: 'E08',   # Galileo E5 AltBOC / BeiDou B2
+    1176.45e6:  'G05',   # GPS L5 / Galileo E5a / BeiDou B2a / QZSS L5 / NavIC L5 / SBAS L5
+    2492.028e6: 'I09',   # NavIC S
+}
+_TX_FREQ_HZ = {
+    'G': {1575.42e6: 'G01', 1227.60e6: 'G02', 1176.45e6: 'G05'},
+    'R': {1602.00e6: 'R01', 1246.00e6: 'R02', 1202.025e6: 'R03'},
+    'E': {1575.42e6: 'E01', 1176.45e6: 'E05', 1278.75e6: 'E06',
+          1207.140e6: 'E07', 1191.795e6: 'E08'},
+    'C': {1575.42e6: 'C01', 1561.098e6: 'C02', 1176.45e6: 'C05',
+          1268.52e6: 'C06', 1207.140e6: 'C07', 1191.795e6: 'C08'},
+    'J': {1575.42e6: 'J01', 1227.60e6: 'J02', 1176.45e6: 'J05', 1278.75e6: 'J06'},
+    'I': {1176.45e6: 'I05', 2492.028e6: 'I09'},
+    'S': {1575.42e6: 'S01', 1176.45e6: 'S05'},
+}
+
+
+def transmitter_antex_code(frequency_hz, system_char):
+    """ ANTEX frequency code for a transmitting satellite antenna.
+
+        Satellite PCO/PCV is per-constellation hardware, so G01 and E01 index
+        different patterns despite sharing a carrier -- the system char is required.
+
+        args:
+            frequency_hz: carrier frequency in Hz
+            system_char: RINEX system identifier, one of GRECJIS
+        returns:
+            frequency code, e.g. 'E06'
+    """
+    return _TX_FREQ_HZ[str(system_char).upper()][float(frequency_hz)]
+
 import matplotlib.font_manager as fm
 available_fonts = fm.findSystemFonts(fontpaths=None, fontext='ttf')
 for font in available_fonts: 
@@ -606,7 +647,7 @@ def _expand_schedule_gnss(rinex_files, full_data, sim_data_rate, sources_ra_dec,
                     break
                 # check that data is good
                 SNR_vars = [var for var in obs_time.data_vars if var.startswith('S')]
-                idxs_good = np.zeros(len(obs_time.C1.values), dtype=bool)
+                idxs_good = np.zeros(len(obs_time.time.values), dtype=bool)
                 for SNR_var in SNR_vars:
                     idxs_good = np.bitwise_or(idxs_good, ~np.isnan(obs_time[str(SNR_var)].values))
  
@@ -689,7 +730,7 @@ def import_key_gnss(rinex_files, full_data, key_file, sim_data_rate=1):
                     break
                 # check that data is good
                 SNR_vars = [var for var in obs_time.data_vars if var.startswith('S')]
-                idxs_good = np.zeros(len(obs_time.C1.values), dtype=bool)
+                idxs_good = np.zeros(len(obs_time.time.values), dtype=bool)
                 for SNR_var in SNR_vars:
                     idxs_good = np.bitwise_or(idxs_good, ~np.isnan(obs_time[str(SNR_var)].values))
                     
@@ -2625,8 +2666,7 @@ def vlbi_transform_data(store_handle, antenna_handles, igs_data=False, dt_vlbi=N
             time_src = [datetime_array[idx]]
         src_last = src
 
-    f1 = 1575.42e6
-    wavelength = const.c/f1
+    wavelength = const.c/antenna_handle.f1
     plot = False
     # run through antenna handles and reduce the data
     for antenna_handle in antenna_handles:
@@ -4330,6 +4370,7 @@ class AntennaInfo(object):
         self.offset_NEU = None
         self.l4r_name = None
         self.use_zwd_file = False
+        self.f1 = None
 
         # currently hard-code a priori PSD scalings
         #if self.antenna_name == 'DBR205':
@@ -4362,27 +4403,37 @@ class AntennaInfo(object):
         else:
             self.domes_name = self.antenna_name.ljust(9)
 
-    def get_pr_data(self, iono_free = False, iono_freq = 'L2'):
+    def get_pr_data(self, freq_select = 'L1', iono_free = False, iono_freq = 'L2'):
         """Generate the pseudorange data series to be used in the least-squares estimation"""
         # currently hardcoding GPS freqs
         if iono_free is True:
-            freq1 = 'G01' # GPS L1
-            f1 = 1575.42
+            self.f1 = 1575.42e6
             pr_L1 = np.array(self.antenna_data.C1.values, dtype=float)
-
             if iono_freq == 'L2':
-                freq2 = 'G02' # GPS L2
-                f2 = 1227.60
+                self.f2 = 1227.60*1e6
                 pr_dual = np.array(self.antenna_data.P2.values, dtype=float)
             elif iono_freq == 'L5':
-                freq2 = 'G05'
-                f2 = 1176.45
+                self.f2 = 1176.45*1e6
                 pr_dual = np.array(self.antenna_data.C5.values, dtype=float)
+            elif iono_freq == 'E6':
+                self.f2 = 1176.45*1e6
 
             gamma = f1**2 / f2**2
             pr = (pr_dual - gamma*pr_L1)/(1 - gamma)
         else:
-            pref_order = ['C1L', 'C1S', 'C1X', 'C1P', 'C1W', 'C1']
+            if freq_select == 'L1':
+                self.f1 = 1575.42e6
+                pref_order = ['C1L', 'C1S', 'C1X', 'C1P', 'C1W', 'C1']
+            elif freq_select == 'L2':
+                self.f1 = 1227.60e6
+                pref_order = ['C2L', 'C2S', 'C2X', 'C2P', 'C2W', 'C2']
+            elif freq_select == 'L5':
+                self.f1 = 1176.45e6
+                pref_order = ['C5Q', 'C5X', 'C5I', 'C5']
+            elif freq_select == 'E6':
+                self.f1 = 1278.75e6
+                pref_order = ['C6C', 'C6X', 'C6Z', 'C6B', 'C6A', 'C6Q', 'C6I', 'C6']
+
             pr = None
             for var in pref_order:
                 if var in self.antenna_data:      # skip if not present
@@ -4397,7 +4448,7 @@ class AntennaInfo(object):
         
         pr_xarray = xr.DataArray(pr, coords={'time': pr.time.values}, dims='time')
         self.antenna_data = self.antenna_data.assign({'pr_data': pr_xarray})
-        self.antenna_data = self.antenna_data.sel(time=pr.time.values) # avoid nan epochd
+        self.antenna_data = self.antenna_data.sel(time=pr.time.values) # avoid nan epoch
         
         # get formal errors
         SNR_vars = [var for var in self.antenna_data.data_vars if var.startswith('S')]
@@ -4416,7 +4467,7 @@ class AntennaInfo(object):
         self.sta_code = sta_code
         self.domes_name = domes_name
 
-    def get_cp_data(self, iono_free = False, iono_freq = 'L2'):
+    def get_cp_data(self, freq_select = 'L1', iono_free = False, iono_freq = 'L2'):
         """Generate the carrier phase data series to be used in the least-squares estimation"""
 
         #if self.dither_phase is True:
@@ -4428,15 +4479,18 @@ class AntennaInfo(object):
 
         # currently hardcoding GPS freqs
         if iono_free is True:
-            f1 = 1575.42*1e6
+            self.f1 = 1575.42*1e6
             cp = self.antenna_data.L1.values
 
             if iono_freq == 'L2':
-                f2 = 1227.60*1e6
+                self.f2 = 1227.60*1e6
                 cp_dual = self.antenna_data.L2.values
             elif iono_freq == 'L5':
-                f2 = 1176.45*1e6
+                self.f2 = 1176.45*1e6
                 cp_dual = self.antenna_data.L5.values
+            elif iono_freq == 'E6':
+                self.f2 = 1176.45*1e6
+                cp_dual = self.antenna_data.L6C.values
 
             wavelength_1 = const.c/f1
             wavelength_2 = const.c/f2
@@ -4455,10 +4509,20 @@ class AntennaInfo(object):
             cp_dual_xarray = xr.DataArray(cp_dual*wavelength_2, coords={'time': self.antenna_data.time.values}, dims='time')
             self.antenna_data = self.antenna_data.assign({'cp_dual': cp_dual_xarray})
         else:
-            f1 = 1575.42*1e6
-            wavelength = const.c/f1
+            if freq_select == 'L1':
+                self.f1 = 1575.42e6
+                pref_order = ['L1L', 'L1S', 'L1X', 'L1P', 'L1W', 'L1']
+            elif freq_select == 'L2':
+                self.f1 = 1227.60e6
+                pref_order = ['L2L', 'L2S', 'L2X', 'L2P', 'L2W', 'L2']
+            elif freq_select == 'L5':
+                self.f1 = 1176.45e6
+                pref_order = ['L5Q', 'L5X', 'L5I', 'L5']
+            elif freq_select == 'E6':
+                self.f1 = 1278.75e6
+                pref_order = ['L6C', 'L6X', 'L6Z', 'L6B', 'L6A', 'L6Q', 'L6I', 'L6']
+            wavelength = const.c/self.f1
 
-            pref_order = ['L1L', 'L1S', 'L1X', 'L1P', 'L1W', 'L1']
             cp = None
             for var in pref_order:
                 if var in self.antenna_data:                    # skip if not present
@@ -5439,17 +5503,15 @@ class GNSSTKStores(object):
         # arrays for caching results of analysis
         ra_arr = []
         dec_arr = []
-
-        f1 = 1575.42*1e6
-        freq1_ant = 'G01' # antex frequency for receiver antenna
+        
+        freq1_ant = FREQ_TO_RINEX_ANT[self.f1]
         freq2 ='0'
-        f2 = 0
 
         if antenna_handle.is_VLBI is False:
             # RX PCO correction
             antennaPCOData = antenna_handle.antenna_PCO
-            offset_L1 = antennaPCOData.getPhaseCenterOffset(freq1_ant)
-            offset_L1 = np.array([offset_L1[0],offset_L1[1],offset_L1[2]])/1e3 # convert to m
+            offset_f1 = antennaPCOData.getPhaseCenterOffset(freq1_ant)
+            offset_f1 = np.array([offset_f1[0],offset_f1[1],offset_f1[2]])/1e3 # convert to m
 
         if antenna_handle.is_VLBI is True:
             a_vec = antenna_handle.calc_VLBI_mount_vec()
@@ -5462,13 +5524,7 @@ class GNSSTKStores(object):
             sat_antenna = self.antenna_map[str(sat_id)]  
             RSID = RinexSatID(str(sat_id))
             rxpos = antenna_handle.pos_series[idx,:]
-            system = RSID.systemString()
-            if system == 'GPS': # ref frequencies for precise range
-                freq1 = 'G01' # GPS L1
-            elif system == 'Galileo':
-                freq1 = 'E01'
-            elif system == 'BeiDou':
-                freq1 = 'C01' 
+            freq1 = transmitter_antex_code(antenna_handle.f1, RSID.systemChar())
             
             # find satellite position, pointing vector at receive time
             sat_xvt = self.nav_store.get_xvt(RSID, common_time)
@@ -5501,7 +5557,7 @@ class GNSSTKStores(object):
                 dt_therm = 0
                 ROT = antenna_handle.R_mat # rotation from NEU to XYZ (ECEF)
                 PCV_L1 = antennaPCOData.getPhaseCenterVariation(freq1_ant, azimuth, elevation)
-                rxpos_L1 = rxpos + ROT@offset_L1 - PCV_L1*1e-3*rx2sat
+                rxpos_L1 = rxpos + ROT@offset_f1 - PCV_L1*1e-3*rx2sat
  
             sat_pos_L1 = self.sat_adj_PC(freq1, sat_antenna, times_gps[idx], eph_time, sat_xvt.x, rx2sat)
             if self.iono_free:
@@ -5658,28 +5714,13 @@ class GNSSTKStores(object):
 
         if freq is not None:
             f1 = freq
-            if f1 == 1575.42e6:
-                freq1 = 'G01'
-            elif f1 == 1227.60e6:
-                freq1 = 'G02'
-            elif freq == 1176.45e6:
-                freq1 = 'G05'
-            elif freq == 1207.14e6:
-                freq1 = 'E07'
-            elif freq == 1561.098e6:
-                freq1 = 'C02'
+            freq1 = FREQ_TO_RINEX_ANT[f1]
         else:
-            f1 = 1575.42*1e6
-            freq1 = 'G01' # antex frequency for receiver antenna
+            f1 = antenna_handle.f1
+            freq1 = FREQ_TO_RINEX_ANT[f1]
             if self.iono_free: # iono-free only for GPS, ref frequency for precise range
-                if self.iono_freq == 'L2':
-                    f2 = 1227.60*1e6
-                    freq2 = 'G02'
-                elif self.iono_freq == 'L5': 
-                    f2 = 1176.45*1e6
-                    freq2 = 'G05'
-                if antennaPCOData.nFreq <= 4 and self.iono_freq == 'L5':
-                    freq2 = 'G02' 
+                f2 = antenna_handle.f2
+                freq2 = FREQ_TO_RINEX_ANT[f2]
             else:
                 freq2 ='0'
                 f2 = 0
@@ -5687,8 +5728,14 @@ class GNSSTKStores(object):
         if antenna_handle.is_VLBI is False:
             # RX PCO correction
             antennaPCOData = antenna_handle.antenna_PCO
-            offset_L1 = antennaPCOData.getPhaseCenterOffset(freq1)
-            offset_L1 = np.array([offset_L1[0],offset_L1[1],offset_L1[2]])/1e3 # convert to m
+            try: 
+                offset_f1 = antennaPCOData.getPhaseCenterOffset(freq1)
+            except:
+                if freq1=='E06':
+                    offset_f1 = antennaPCOData.getPhaseCenterOffset('G02')
+
+            
+            offset_f1 = np.array([offset_f1[0],offset_f1[1],offset_f1[2]])/1e3 # convert to m
             if self.iono_free is True:
                 offset_dual = antennaPCOData.getPhaseCenterOffset(freq2)
                 offset_dual = np.array([offset_dual[0],offset_dual[1],offset_dual[2]])/1e3 # convert to m
@@ -5738,47 +5785,10 @@ class GNSSTKStores(object):
 
             if antenna_handle.offset_NEU is not None:
                 rxpos += offset_XYZ
-            system = RSID.systemString()
-            if system == 'GPS': # ref frequencies for precise range
-                if f1 == 1575.42e6:
-                    freq1 = 'G01'
-                elif f1 == 1227.60e6:
-                    freq1 = 'G02'
-                elif freq == 1176.45e6:
-                    freq1 = 'G05'
-                if self.iono_free:
-                    if self.iono_freq == 'L2':
-                        freq2 = 'G02'
-                    elif self.iono_freq == 'L5':
-                        freq2 = 'G02' # only G02 available, no G05 for satellites
-            elif system == 'Galileo':
-                freq1 = 'E01'
-                if f1 == 1575.42e6:
-                    freq1 = 'E01'
-                elif f1 == 1207.14e6:
-                    freq1 = 'E07'
-                elif freq == 1176.45e6:
-                    freq1 = 'E05'
-                if self.iono_free:
-                    if self.iono_freq == 'L2':
-                        raise ValueError('No L2 frequency for BeiDou -- should not be here!')
-                    elif self.iono_freq == 'L5':
-                        freq2 = 'E05'
-            elif system == 'BeiDou':
-                if f1 == 1575.42e6:
-                    freq1 = 'C01'
-                elif f1 == 1207.14e6:
-                    freq1 = 'C07'
-                elif freq == 1176.45e6:
-                    freq1 = 'C05'
-                elif freq == 1561.098e6:
-                    freq1 = 'C02'
-          
-                if self.iono_free:
-                    if self.iono_freq == 'L2':
-                        raise ValueError('No L2 frequency for BeiDou -- should not be here!')
-                    elif self.iono_freq == 'L5':
-                        freq2 = 'C05'
+
+            freq1 = transmitter_antex_code(f1, RSID.systemChar())
+            if self.iono_free:
+                freq2 = transmitter_antex_code(f2, RSID.systemChar())
             
             # find satellite position, pointing vector at receive time
             sat_xvt = self.nav_store.get_xvt(RSID, common_time)
@@ -5824,11 +5834,11 @@ class GNSSTKStores(object):
                 dt_therm = 0
                 ROT = antenna_handle.R_mat # rotation from NEU to XYZ (ECEF)
                 try: PCV_L1 = antennaPCOData.getPhaseCenterVariation(freq1, azimuth, elevation)
-                except: 
-                     # some antennas have only GPS PCV
-                     PCV_L1 = antennaPCOData.getPhaseCenterVariation('G01', azimuth, elevation)
+                except:
+                    if freq1=='E06':
+                        PCV_L1 = antennaPCOData.getPhaseCenterVariation('G02', azimuth, elevation)
 
-                rxpos_L1 = rxpos + ROT@offset_L1 - PCV_L1*1e-3*rx2sat
+                rxpos_L1 = rxpos + ROT@offset_f1 - PCV_L1*1e-3*rx2sat
                 if self.iono_free:
                     PCV_dual = antennaPCOData.getPhaseCenterVariation(freq2, azimuth, elevation)
                     rxpos_dual = rxpos + ROT@(offset_dual) - PCV_dual*1e-3*rx2sat
@@ -5943,7 +5953,7 @@ class GNSSTKStores(object):
                 pr = float(data_idx.pr_data.values) 
                 synth_pr = PR_obj.ComputeAtTransmitTime(common_time, pr, rxpos_gnsstk, RSID, sat_antenna, freq1, freq2,\
                         self.sol_sys, self.nav_lib, isCOM, self.ellipsoid_model)
-                am_pc_rx = np.dot(ROT@(offset_L1 - PCV_L1*1e-3*rx2sat),rx2sat)
+                am_pc_rx = np.dot(ROT@(offset_f1 - PCV_L1*1e-3*rx2sat),rx2sat)
                 pr_pc_rx = antennaPCOData.getTotalPhaseCenterOffset(freq1_ant, azimuth, elevation)/1e3
                 am_tx_pos = np.array([sat_xvt_corr.x[0], sat_xvt_corr.x[1], sat_xvt_corr.x[2]])
                 pr_tx_pos = np.array([PR_obj.SatR[0],PR_obj.SatR[1],PR_obj.SatR[2]])
@@ -6110,19 +6120,13 @@ class GNSSTKStores(object):
         phase_model_arr = []
         cpw1_arr = []
         cpw2_arr = []
-        f1 = 1575.42*1e6
-        freq1_ant = 'G01' # antex frequency for receiver antenna
+        f1 = antenna1_handle.f1
+        freq1_ant = FREQ_TO_RINEX_ANT[f1]
         if self.iono_free: # iono-free only for GPS, ref frequency for precise range
+            f2 = antenna1_handle.f2
+            freq2_ant = FREQ_TO_RINEX_ANT[f2]
             if phase is True: 
                 phase_model_dual_arr = []
-            if self.iono_freq == 'L2':
-                f2 = 1227.60*1e6
-                freq2_ant = 'G02'
-            elif self.iono_freq == 'L5': 
-                f2 = 1176.45*1e6
-                freq2_ant = 'G05'
-            if antennaPCOData.nFreq <= 4 and self.iono_freq == 'L5':
-                freq2_ant = 'G02' 
         else:
             freq2 ='0'
             f2 = 0
@@ -6195,28 +6199,9 @@ class GNSSTKStores(object):
             rxpos1 = antenna1_handle.pos_series[idx,:]
             rxpos2 = antenna2_handle.pos_series[idx,:]
           
-            system = RSID.systemString()
-            if system == 'GPS': # ref frequencies for precise range
-                freq1 = 'G01' # GPS L1
-                if self.iono_free:
-                    if self.iono_freq == 'L2':
-                        freq2 = 'G02'
-                    elif self.iono_freq == 'L5':
-                        freq2 = 'G02' # only G02 available, no G05 for satellites
-            elif system == 'Galileo':
-                freq1 = 'E01'
-                if self.iono_free:
-                    if self.iono_freq == 'L2':
-                        raise ValueError('No L2 frequency for BeiDou -- should not be here!')
-                    elif self.iono_freq == 'L5':
-                        freq2 = 'E05'
-            elif system == 'BeiDou':
-                freq1 = 'C01' 
-                if self.iono_free:
-                    if self.iono_freq == 'L2':
-                        raise ValueError('No L2 frequency for BeiDou -- should not be here!')
-                    elif self.iono_freq == 'L5':
-                        freq2 = 'C05'
+            freq1 = transmitter_antex_code(f1, RSID.systemChar())
+            if self.iono_free:
+                freq2 = transmitter_antex_code(f2, RSID.systemChar())
             
             # find satellite position, pointing vector at receive time
             sat_xvt = self.nav_store.get_xvt(RSID, common_time)
@@ -6541,19 +6526,13 @@ class GNSSTKStores(object):
         # temp -- plot phase windup
         cpw1_arr = []
         cpw2_arr = []
-        f1 = 1575.42*1e6
-        freq1_ant = 'G01' # antex frequency for receiver antenna
+        f1 = antenna1_handle.f1
+        freq1_ant = FREQ_TO_RINEX_ANT[f1]
         if self.iono_free: # iono-free only for GPS, ref frequency for precise range
+            f2 = antenna1_handle.f2
+            freq2_ant = FREQ_TO_RINEX_ANT[f2]
             if phase is True: 
                 phase_model_dual_arr = []
-            if self.iono_freq == 'L2':
-                f2 = 1227.60*1e6
-                freq2_ant = 'G02'
-            elif self.iono_freq == 'L5': 
-                f2 = 1176.45*1e6
-                freq2_ant = 'G05'
-            if antennaPCOData.nFreq <= 4 and self.iono_freq == 'L5':
-                freq2_ant = 'G02' 
         else:
             freq2 ='0'
             f2 = 0
@@ -6943,25 +6922,19 @@ class GNSSTKStores(object):
          
         isCOM = True
         # arrays for caching results of analysis
-        f1 = 1575.42*1e6
-        freq1_ant = 'G01' # antex frequency for receiver antenna
+        f1 = antenna_handle.f1
+        freq1_ant = FREQ_TO_RINEX_ANT[f1]
         if self.iono_free: # iono-free only for GPS, ref frequency for precise range
-            if self.iono_freq == 'L2':
-                f2 = 1227.60*1e6
-                freq2_ant = 'G02'
-            elif self.iono_freq == 'L5': 
-                f2 = 1176.45*1e6
-                freq2_ant = 'G05'
-            if antennaPCOData.nFreq <= 4 and self.iono_freq == 'L5':
-                freq2_ant = 'G02' 
+            f2 = antenna_handle.f2
+            freq2_ant = FREQ_TO_RINEX_ANT[f2]
         else:
             freq2 ='0'
             f2 = 0
 
         if antenna_handle.is_VLBI is False:
             # RX PCO correction
-            offset_L1 = antennaPCOData.getPhaseCenterOffset(freq1_ant)
-            offset_L1 = np.array([offset_L1[0],offset_L1[1],offset_L1[2]])/1e3 # convert to m
+            offset_f1 = antennaPCOData.getPhaseCenterOffset(freq1_ant)
+            offset_f1 = np.array([offset_f1[0],offset_f1[1],offset_f1[2]])/1e3 # convert to m
             if self.iono_free is True:
                 offset_dual = antennaPCOData.getPhaseCenterOffset(freq2_ant)
                 offset_dual = np.array([offset_dual[0],offset_dual[1],offset_dual[2]])/1e3 # convert to m
@@ -7024,28 +6997,9 @@ class GNSSTKStores(object):
             eph_time = EphTime(common_time)
             eph_time.setTimeSystem(TimeSystem.UTC)
           
-            system = RSID.systemString()
-            if system == 'GPS': # ref frequencies for precise range
-                freq1 = 'G01' # GPS L1
-                if self.iono_free:
-                    if self.iono_freq == 'L2':
-                        freq2 = 'G02'
-                    elif self.iono_freq == 'L5':
-                        freq2 = 'G02' # only G02 available, no G05 for satellites
-            elif system == 'Galileo':
-                freq1 = 'E01'
-                if self.iono_free:
-                    if self.iono_freq == 'L2':
-                        raise ValueError('No L2 frequency for BeiDou -- should not be here!')
-                    elif self.iono_freq == 'L5':
-                        freq2 = 'E05'
-            elif system == 'BeiDou':
-                freq1 = 'C01' 
-                if self.iono_free:
-                    if self.iono_freq == 'L2':
-                        raise ValueError('No L2 frequency for BeiDou -- should not be here!')
-                    elif self.iono_freq == 'L5':
-                        freq2 = 'C05'
+            freq1 = transmitter_antex_code(f1, RSID.systemChar())
+            if self.iono_free:
+                freq2 = transmitter_antex_code(f2, RSID.systemChar())
             
             # find satellite position, pointing vector at receive time
             sat_xvt = self.nav_store.get_xvt(RSID, common_time)
@@ -7078,7 +7032,7 @@ class GNSSTKStores(object):
                 except:
                     # likely below horizon, just set to 0
                     PCV_L1 = 0
-                rxpos_L1 = rxpos + ROT@(offset_L1) - PCV_L1*1e-3*rx2sat
+                rxpos_L1 = rxpos + ROT@(offset_f1) - PCV_L1*1e-3*rx2sat
                 if self.iono_free:
                     PCV_dual = antennaPCOData.getPhaseCenterVariation(freq2_ant, azimuth, elevation)
                     rxpos_dual = rxpos + ROT@(offset_dual) - PCV_dual*1e-3*rx2sat
@@ -7982,17 +7936,11 @@ class GNSSTKStores(object):
         """
         isCOM = True
         times_gps = antenna_handle.times_gps
-        f1 = 1575.42*1e6
-        freq1_ant = 'G01' # antex frequency for receiver antenna
+        f1 = antenna_handle.f1
+        freq1_ant = FREQ_TO_RINEX_ANT[f1]
         if self.iono_free: # iono-free only for GPS, ref frequency for precise range
-            if self.iono_freq == 'L2':
-                f2 = 1227.60*1e6
-                freq2_ant = 'G02'
-            elif self.iono_freq == 'L5': 
-                f2 = 1176.45*1e6
-                freq2_ant = 'G05'
-            if antennaPCOData.nFreq <= 4 and self.iono_freq == 'L5':
-                freq2_ant = 'G02' 
+            f2 = antenna_handle.f2
+            freq2_ant = FREQ_TO_RINEX_ANT[f2]
         else:
             freq2 ='0'
             f2 = 0
@@ -8007,8 +7955,8 @@ class GNSSTKStores(object):
         if antenna_handle.is_VLBI is False:
             # RX PCO correction
             antennaPCOData = antenna_handle.antenna_PCO
-            offset_L1 = antennaPCOData.getPhaseCenterOffset(freq1_ant)
-            offset_L1 = np.array([offset_L1[0],offset_L1[1],offset_L1[2]])/1e3 # convert to m
+            offset_f1 = antennaPCOData.getPhaseCenterOffset(freq1_ant)
+            offset_f1 = np.array([offset_f1[0],offset_f1[1],offset_f1[2]])/1e3 # convert to m
             if self.iono_free is True:
                 offset_dual = antennaPCOData.getPhaseCenterOffset(freq2_ant)
                 offset_dual = np.array([offset_dual[0],offset_dual[1],offset_dual[2]])/1e3 # convert to m
@@ -8052,28 +8000,9 @@ class GNSSTKStores(object):
             RSID = RinexSatID(str(sat_id))
             rxpos = antenna_handle.pos_series[idx,:]
           
-            system = RSID.systemString()
-            if system == 'GPS': # ref frequencies for precise range
-                freq1 = 'G01' # GPS L1
-                if self.iono_free:
-                    if self.iono_freq == 'L2':
-                        freq2 = 'G02'
-                    elif self.iono_freq == 'L5':
-                        freq2 = 'G02' # only G02 available, no G05 for satellites
-            elif system == 'Galileo':
-                freq1 = 'E01'
-                if self.iono_free:
-                    if self.iono_freq == 'L2':
-                        raise ValueError('No L2 frequency for BeiDou -- should not be here!')
-                    elif self.iono_freq == 'L5':
-                        freq2 = 'E05'
-            elif system == 'BeiDou':
-                freq1 = 'C01' 
-                if self.iono_free:
-                    if self.iono_freq == 'L2':
-                        raise ValueError('No L2 frequency for BeiDou -- should not be here!')
-                    elif self.iono_freq == 'L5':
-                        freq2 = 'C05'
+            freq1 = transmitter_antex_code(f1, RSID.systemChar())
+            if self.iono_free:
+                freq2 = transmitter_antex_code(f2, RSID.systemChar())
             
             # find satellite position, pointing vector at receive time
             sat_xvt = self.nav_store.get_xvt(RSID, common_time)
@@ -8108,7 +8037,7 @@ class GNSSTKStores(object):
                 ROT = antenna_handle.R_mat # rotation from NEU to XYZ (ECEF) 
                 try: PCV_L1 = antennaPCOData.getPhaseCenterVariation(freq1_ant, azimuth, elevation)
                 except: PCV_L1 = np.zeros(3)
-                rxpos_L1 = rxpos + ROT@(offset_L1) - PCV_L1*1e-3*rx2sat
+                rxpos_L1 = rxpos + ROT@(offset_f1) - PCV_L1*1e-3*rx2sat
                 if self.iono_free:
                     PCV_dual = antennaPCOData.getPhaseCenterVariation(freq2_ant, azimuth, elevation)
                     rxpos_dual = rxpos + ROT@(offset_dual) - PCV_dual*1e-3*rx2sat
@@ -8201,16 +8130,11 @@ class GNSSTKStores(object):
         """ Compute an analytical Jacobian using nav ephemeris and analytical delay model.
         """
         isCOM = True
-        f1 = const.c/baseline_handle.wavelength
-        freq1_ant = 'G01' # antex frequency for receiver antenna
+        f1 = antenna_handle.f1
+        freq1_ant = FREQ_TO_RINEX_ANT[f1]
         if self.iono_free: # iono-free only for GPS, ref frequency for precise range
-            f2 = const.c/baseline_handle.wavelength_dual
-            if self.iono_freq == 'L2':
-                freq2_ant = 'G02'
-            elif self.iono_freq == 'L5': 
-                freq2_ant = 'G05'
-            if antennaPCOData.nFreq <= 4 and self.iono_freq == 'L5':
-                freq2_ant = 'G02' 
+            f2 = antenna_handle.f2
+            freq2_ant = FREQ_TO_RINEX_ANT[f2]
         else:
             freq2 ='0'
             f2 = 0
@@ -8293,28 +8217,9 @@ class GNSSTKStores(object):
             rxpos1 = antenna1_handle.pos_series[idx,:]
             rxpos2 = antenna2_handle.pos_series[idx,:]
           
-            system = RSID.systemString()
-            if system == 'GPS': # ref frequencies for precise range
-                freq1 = 'G01' # GPS L1
-                if self.iono_free:
-                    if self.iono_freq == 'L2':
-                        freq2 = 'G02'
-                    elif self.iono_freq == 'L5':
-                        freq2 = 'G02' # only G02 available, no G05 for satellites
-            elif system == 'Galileo':
-                freq1 = 'E01'
-                if self.iono_free:
-                    if self.iono_freq == 'L2':
-                        raise ValueError('No L2 frequency for BeiDou -- should not be here!')
-                    elif self.iono_freq == 'L5':
-                        freq2 = 'E05'
-            elif system == 'BeiDou':
-                freq1 = 'C01' 
-                if self.iono_free:
-                    if self.iono_freq == 'L2':
-                        raise ValueError('No L2 frequency for BeiDou -- should not be here!')
-                    elif self.iono_freq == 'L5':
-                        freq2 = 'C05'
+            freq1 = transmitter_antex_code(f1, RSID.systemChar())
+            if self.iono_free:
+                freq2 = transmitter_antex_code(f2, RSID.systemChar())
             
             # find satellite position, pointing vector at receive time
             sat_xvt = self.nav_store.get_xvt(RSID, common_time)
@@ -8535,8 +8440,16 @@ class GNSSTKStores(object):
                 phase_clock_start = antenna1_handle.phase_clock_start
             else:
                 phase_clock_start = antenna2_handle.phase_clock_start
-        f1 = const.c/baseline_handle.wavelength
-        freq1_ant = 'G01' # antex frequency for receiver antenna
+
+        f1 = antenna_handle.f1
+        freq1_ant = FREQ_TO_RINEX_ANT[f1]
+        if self.iono_free: # iono-free only for GPS, ref frequency for precise range
+            f2 = antenna_handle.f2
+            freq2_ant = FREQ_TO_RINEX_ANT[f2]
+        else:
+            freq2 ='0'
+            f2 = 0
+
         if self.iono_free: # iono-free only for GPS, ref frequency for precise range
             f1 = const.c/baseline_handle.wavelength_dual
             if phase is True: 

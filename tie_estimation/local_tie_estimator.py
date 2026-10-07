@@ -466,6 +466,8 @@ def add_args_to_parser(parser_in):
     parser.add_argument("--ionex_files", dest="ionex_files", action="append", type=str, nargs="+", help = 'Compensate for ionosphere with an IONEX model. Repeat for multiple days.')
     parser.add_argument("--iono_freq", type=str, default='L2',
                        help = 'Carrier frequency to use in iono-free combination (L2 or L5). NB: will only use GPS satellites with L2.')
+    parser.add_argument("--freq_select", type=str, default='L1',
+                       help = 'Carrier frequency to use in single-difference GNSS baseline estimation. (L2, E6, L5) NB: will only use GPS satellites with L2.')
    
 def define_amb_state_vlbi(store_handle, baseline_handles):
     """ Detect cycle slips in carrier phase measurements. This will determine the number of float ambiguity states
@@ -689,7 +691,7 @@ def redefine_amb_state(sol_type, store_handle, baseline_handles, baselines, ante
 def define_baseline_handles_gnss(store_handle, clock_state, clock_poly_length, antenna_handles, ref_antenna, baselines):
     """ Define the baseline handle constructs for GNSS solution type """
     baseline_handles = []
-    f1 = 1575.42*1e6
+    f1 = antenna_handles[0].f1
     wavelength1 = const.c/f1
     for jdx, baseline in enumerate(baselines): # generate differential measurements on the baselines
        antenna1_handle = antenna_handles[baseline[0]]
@@ -719,13 +721,7 @@ def define_baseline_handles_gnss(store_handle, clock_state, clock_poly_length, a
        diff_pr_data = data_ant2.pr_data.values[ant2_idxs] - data_ant1.pr_data.values[ant1_idxs]
  
        if store_handle.iono_free:
-           if store_handle.iono_freq == 'L2':
-               f2 = 1227.60*1e6
-               diff_pr_dual = data_ant2.P2.values[ant2_idxs] - data_ant1.P2.values[ant1_idxs]
-    
-           elif store_handle.iono_freq == 'L5':
-               f2 = 1176.45*1e6
-               diff_pr_dual = data_ant2.C5.values[ant2_idxs] - data_ant1.C5.values[ant1_idxs]
+           f2 = antenna_handle.f2
            diff_cp_dual_model = data_ant2.cp_dual_model.values[ant2_idxs] - data_ant1.cp_dual_model.values
            diff_cp_dual = data_ant2.cp_dual.values[ant2_idxs] - data_ant1.cp_dual.values[ant1_idxs]
            wavelength2 = const.c/f2
@@ -905,7 +901,7 @@ def lstsq_estimation(sol_type, plot_intermediate_results, ref_antenna, store_han
                      clock_poly_length, trop_poly_length, clock_file=None, estimate_AO=False, \
                      analytical_Jac=False, tikhonov_reg=False, cont_reg=False, recursive_amb=False, do_mcmc_correlation=False,
                      do_ls_vce_correlation=False, covariance_kernel_range=None, covariance_kernel_phase=None, igs_data=False, \
-                     baseline_strategy='Obs-Max', band=None, L_curve=False, TK_LAMBDA=1e-9):
+                     baseline_strategy='Obs-Max', band=None, L_curve=False, TK_LAMBDA=1e-9, freq_select='L1'):
     """
     Take the single-source data and produce a differential position estimate via least-squares adjustment
     """
@@ -1073,8 +1069,8 @@ def lstsq_estimation(sol_type, plot_intermediate_results, ref_antenna, store_han
             antenna_handle.hold_trop(trop_samples)
         
         if sol_type == 'GNSS':
-            antenna_handle.get_pr_data(store_handle.iono_free, store_handle.iono_freq)
-            antenna_handle.get_cp_data(store_handle.iono_free, store_handle.iono_freq)
+            antenna_handle.get_pr_data(freq_select, store_handle.iono_free, store_handle.iono_freq)
+            antenna_handle.get_cp_data(freq_select, store_handle.iono_free, store_handle.iono_freq)
             data_corrected = store_handle.correct_PR_CP(antenna_handle, phase=True)
             antenna_handle.hold_data(data_corrected)
 
@@ -1158,6 +1154,8 @@ def lstsq_estimation(sol_type, plot_intermediate_results, ref_antenna, store_han
             baseline_handle = baseline_handles[jdx]
             antenna1_handle = antenna_handles[baseline[0]]
             antenna2_handle = antenna_handles[baseline[1]]
+            antenna1_handle.f1 = baseline_handle.f1
+            antenna2_handle.f1 = baseline_handle.f1
             _, ant1_idxs, _ = np.intersect1d(antenna1_handle.times_gps, \
                     baseline_handle.datetime_array, return_indices=True)
             _, ant2_idxs, _ = np.intersect1d(antenna2_handle.times_gps, \
@@ -1884,6 +1882,11 @@ def lstsq_estimation(sol_type, plot_intermediate_results, ref_antenna, store_han
         elif (store_handle.stochastic_clock or store_handle.stochastic_trop):
             ls_phfixed_phaseonly_first = iterative_weight_adjust_ls_vce(store_handle, ls_phfixed_phaseonly_first.x, bounds,\
                     ls_args, calc_residuals, jac, sol_type, 'phase')
+            # TEMP
+            #print('ADJUSTING PSD')
+            #antenna_handles[1].phase_clock_psd_rw = 2750.1554989349975
+            #antenna_handles[1].phase_clock_psd_irw = 0.001
+
         else:
             ls_phfixed_phaseonly_first = iterative_weight_adjust(store_handle, ls_phfixed_phaseonly_first.x, bounds,\
                     ls_args, calc_residuals, jac, sol_type, 'phase')
@@ -2333,6 +2336,11 @@ if __name__ == '__main__':
         antenna_type = antenna_types[antenna_idx]
         if sol_type == 'GNSS':
             antenna_data = thinned_data[antenna_name]
+
+        #if sol_type == 'GNSS' and not args.igs_data:
+        #    antenna_data = thinned_data[antenna_name]
+        #else:
+        #    antenna_data = full_data[antenna_name]
         if sol_type == 'GNSS' and args.rxpos is None:
             if args.rxpos is None:
                 antenna_position = antenna_data.position 
@@ -2517,7 +2525,7 @@ if __name__ == '__main__':
                      clock_poly_length, trop_poly_length, args.clock_file, estimate_ao,\
                      args.analytical_Jac, args.tikhonov_reg, args.continuity_penalty, args.recursive_amb, args.do_mcmc_correlation,\
                      args.do_ls_vce_correlation, args.load_covariance_kernel_range, args.load_covariance_kernel_phase, args.igs_data, \
-                     args.baseline_strategy, args.band, args.L_curve, args.tikhonov_lambda)
+                     args.baseline_strategy, args.band, args.L_curve, args.tikhonov_lambda, args.freq_select)
 
     if args.vda_file is not None and args.output_vda_file is not None:
         write_vda_phase(baseline_observations, args.vda_file, args.output_vda_file, phase_ambiguities, baseline_handles, baselines, antenna_names)

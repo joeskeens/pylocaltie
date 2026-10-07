@@ -195,6 +195,8 @@ def add_args_to_parser(parser_in):
     parser.add_argument("--iono_free", action="store_true", default=False, help = 'Generate a second frequency to be used in ionosphere free combination. CURRENTLY NOT FULLY IMPLEMENTED.')
     parser.add_argument("--iono_freq", type=str, default='L2',
                                        help = 'Carrier frequency to use in iono-free combination (L2 or L5). NB: will only use GPS satellites with L2.')
+    parser.add_argument("--freq_select", type=str, default='L1',
+                       help = 'Carrier frequency to use in single-difference GNSS baseline estimation. (L2, E6, L5) NB: will only use GPS satellites with L2.')
 
 
 def simulate_data(nc_out, mdh_out, obs_type, store_handle, antenna_handles, baselines, baseline_handles, \
@@ -464,12 +466,9 @@ def simulate_data(nc_out, mdh_out, obs_type, store_handle, antenna_handles, base
                     pseudorange_dual = np.array(pseudorange_dual)[ant_idxs]
                     carrier_phase_dual = np.array(carrier_phase_dual)[ant_idxs]
 
-            f1 = 1575.42e6
+            f1 = antenna_handle.f1
             if store_handle.iono_free is True:
-                if self.iono_freq == 'L2':
-                    f2 = 1227.60*1e6
-                elif self.iono_freq == 'L5':
-                    f2 = 1176.45*1e6
+                f2 = antenna_handle.f2
 
             # generate noise -- inner noise by source and outer noise between sources
             if q_range is not None or q_phase is not None:
@@ -884,6 +883,23 @@ if __name__ == '__main__':
         else:
             antenna_handle = AntennaInfo(antenna_name, antenna_position, antenna_type, bulk_clock, 0, False) 
 
+        if args.freq_select == 'L1':
+            antenna_handle.f1 = 1575.42e6
+        elif args.freq_select == 'L2':
+            antenna_handle.f1 = 1227.60e6
+        elif args.freq_select == 'L5':
+            antenna_handle.f1 = 1176.45e6
+        elif args.freq_select == 'E6':
+            antenna_handle.f1 = 1278.75e6 
+
+        if args.iono_free is True:
+            if args.iono_freq == 'L2':
+                antenna_handle.f2 = 1227.60*1e6
+            elif args.iono_freq == 'L5':
+                antenna_handle.f2 = 1176.45*1e6
+            elif args.iono_freq == 'E6':
+                antenna_handle.f2 = 1176.45*1e
+
         if antenna_name in vlbi_antennas:
             # phase center is handled by geometric calculation, no PCO
             idx_vlbi = [i for i, val in enumerate(vlbi_antennas) if val == antenna_name]
@@ -894,8 +910,6 @@ if __name__ == '__main__':
             antennaPCOData = AntexData()
             store_handle.antenna_store.getAntenna(antenna_handle.antenna_type, antennaPCOData) # memory leak, needs investigation
             antenna_handle.hold_PCO(antennaPCOData)      
-            if antennaPCOData.nFreq <= 4 and args.iono_freq == 'L5':
-                print('No L5 data in ANTEX file -- using L2 mapping (danger)')
         if obs_type == 'GNSS':
             if args.rinex_files is None:
                 antenna_handle.hold_times(np.array(datetime_array))

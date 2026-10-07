@@ -169,6 +169,8 @@ def _wavelength(varname):
         return c/1268.52e6
     elif varname[:3] == 'L6C':
         return c/1278.75e6
+    elif varname[:3] == 'L6':
+        return c/1278.75e6
     raise ValueError(f'No wavelength for {varname}')
 
 def plot_common_sv_signal_types(
