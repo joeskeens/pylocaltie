@@ -914,7 +914,7 @@ def lstsq_estimation(sol_type, plot_intermediate_results, ref_antenna, store_han
                      clock_poly_length, trop_poly_length, clock_file=None, estimate_AO=False, \
                      analytical_Jac=False, tikhonov_reg=False, cont_reg=False, recursive_amb=False, do_mcmc_correlation=False,
                      do_ls_vce_correlation=False, covariance_kernel_range=None, covariance_kernel_phase=None, igs_data=False, \
-                     baseline_strategy='Obs-Max', band=None, L_curve=False, TK_LAMBDA=1e-9, freq_select='L1'):
+                     baseline_strategy='Obs-Max', band=None, L_curve=False, TK_LAMBDA=1e-9, freq_select='L1', o_c_only=False):
     """
     Take the single-source data and produce a differential position estimate via least-squares adjustment
     """
@@ -2559,7 +2559,7 @@ if __name__ == '__main__':
                      clock_poly_length, trop_poly_length, args.clock_file, estimate_ao,\
                      args.analytical_Jac, args.tikhonov_reg, args.continuity_penalty, args.recursive_amb, args.do_mcmc_correlation,\
                      args.do_ls_vce_correlation, args.load_covariance_kernel_range, args.load_covariance_kernel_phase, args.igs_data, \
-                     args.baseline_strategy, args.band, args.L_curve, args.tikhonov_lambda, args.freq_select)
+                     args.baseline_strategy, args.band, args.L_curve, args.tikhonov_lambda, args.freq_select, args.o_c_only)
 
     if args.vda_file is not None and args.output_vda_file is not None:
         write_vda_phase(baseline_observations, args.vda_file, args.output_vda_file, phase_ambiguities, baseline_handles, baselines, antenna_names)

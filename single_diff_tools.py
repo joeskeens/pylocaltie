@@ -8591,7 +8591,7 @@ class GNSSTKStores(object):
             else:
                 phase_clock_start = antenna2_handle.phase_clock_start
 
-        f1 = antenna_handle.f1
+        f1 = antenna1_handle.f1
         freq1_ant = FREQ_TO_RINEX_ANT[f1]
         if self.iono_free: # iono-free only for GPS, ref frequency for precise range
             f2 = antenna_handle.f2
