@@ -1413,7 +1413,7 @@ def lstsq_estimation(sol_type, plot_intermediate_results, ref_antenna, store_han
                         clock_samples = sample_global_poly_at_interval(clock_state_global, antenna_handle.clock_times)
                     clock_state_ant = clock_state_ant[idx_start:]
                 else:
-                    clock_samples = np.zeros(len(times_gps))
+                    clock_samples = np.zeros(len(antenna_handle.clock_times))
 
                 if store_handle.stochastic_clock is False and clock_poly_length > 0:
                     clock_samples += sample_poly_at_interval(clock_state_ant, clock_poly_length, times_gps)

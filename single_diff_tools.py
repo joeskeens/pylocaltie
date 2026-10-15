@@ -44,7 +44,7 @@ from scipy.stats import linregress
 from scipy.stats import median_abs_deviation as mad     
 from scipy.spatial.transform import Rotation as rot
 from scipy.spatial.transform import Slerp
-from scipy.linalg import pinv
+from scipy.linalg import pinv, solve_triangular
 import scipy.constants as const
 from copy import deepcopy
 import argparse
@@ -11647,7 +11647,10 @@ def get_process_variance_times(store_handle, antenna_handle, model_type, phase=F
                 if np.any(process_variance<0):
                     process_variance[process_variance<0] = times_diff_sec
             elif clock_mat_type == 'irw':
-                process_variance = times_diff_sec**2*times_sec[:-1] + times_diff_sec**3/3 + duration_arr**3/120 
+                # marginal variance of each IRW increment (diagonal of the increment covariance; the
+                # off-diagonal terms are in clock_process_operator). Only fit_phase_clock_params_grdel
+                # still uses this, as a diagonal approximation for its starting values.
+                process_variance = times_diff_sec**2*times_sec[:-1] + times_diff_sec**3/3 + duration_arr**3/120
             else:
                 raise ValueError('Unknown clock model type ' + str(clock_mat_type) +' (should be either rw or irw)')
         elif phase is False:
@@ -11670,8 +11673,153 @@ def get_process_variance_times(store_handle, antenna_handle, model_type, phase=F
         raise ValueError('Unknown model type: ' + model_type)
 
     if np.any(process_variance<0): breakpoint()
-    
+
     return process_variance
+
+def clock_psd_pair(antenna_handle, ref_handle, phase=False):
+    """ (rw, irw) PSDs [ps^2/hr, ps^2/hr^3] of the single-difference clock process (antenna + reference) """
+    if phase:
+        psd_rw  = antenna_handle.phase_clock_psd_rw
+        psd_irw = antenna_handle.phase_clock_psd_irw
+        if ref_handle is not None:
+            psd_rw  += ref_handle.phase_clock_psd_rw
+            psd_irw += ref_handle.phase_clock_psd_irw
+    else:
+        psd_rw  = antenna_handle.clock_psd_rw
+        psd_irw = antenna_handle.clock_psd_irw
+        if ref_handle is not None:
+            psd_rw  += ref_handle.clock_psd_rw
+            psd_irw += ref_handle.clock_psd_irw
+    return float(psd_rw), float(psd_irw)
+
+def clock_process_operator(store_handle, antenna_handle, ref_handle, phase=False):
+    """ Pseudo-observations for a stochastic clock u sampled at the (phase) clock epochs, modeled as the
+        sum of two independent processes  u = a + b:
+            a -- random walk (PSD psd_rw)
+            b -- integrated random walk carried with its rate c (PSD psd_irw), b_0 = c_0 = 0, i.e. rate known
+                 (zero) at the first clock epoch -- the datum of Herring et al. (1990) Appendix B,
+                 R(t1,t2) = Phi t1^2 (3 t2 - t1)/6. Any deterministic rate is the global clock polynomial's.
+        Per interval dt the raw pseudo-observations (all with expectation zero) are
+            RW:  (u_{k+1}-u_k) - (b_{k+1}-b_k)                       variance psd_rw  * (dt - D/6)  / FACTOR_RW
+            IRW: L^-1 [b_{k+1}-b_k-dt c_k ; c_{k+1}-c_k],  L L' = M,  variance psd_irw * 1            / FACTOR_IRW
+        with M = [[dt^3/3, dt^2/2], [dt^2/2, dt]]. Each raw row carries a single variance component, so the
+        stochastic model stays linear in (psd_rw, psd_irw) with diagonal cofactors (see clock_process_expansion).
+        The auxiliary states (b, c) enter no measurement and are eliminated exactly. What remains is the
+        marginal model for the increments du: Cov(du) = Sigma = q_rw diag(dt - D/6) + q_irw C, with
+            C_ij = dt_i dt_j (t_i + dt_i/2)  (i < j),   C_ii = dt_i^2 t_i + dt_i^3/3,
+        and the returned rows are  s = S u,  S = chol(Sigma)^-1 diff  -- n-1 rows per clock, as before, and
+        ||s||^2 equals the minimum of the raw-row cost over (b, c). S is the exact Jacobian.
+        With psd_irw <= 0, S reduces to the random-walk rows diff(u)/sigma.
+        Returns a dict with S (n-1, n) plus what clock_process_expansion needs.
+    """
+    times = antenna_handle.phase_clock_times if phase else antenna_handle.clock_times
+    times = np.asarray(times)
+    psd_rw, psd_irw = clock_psd_pair(antenna_handle, ref_handle, phase)
+    key = (bool(phase), psd_rw, psd_irw, len(times), hash(times.tobytes()))
+    cache = antenna_handle.__dict__.setdefault('_clock_op_cache', {})
+    if key in cache:
+        return cache[key]
+    if len(cache) > 4:
+        cache.clear()
+
+    n = len(times)
+    k = max(n - 1, 0)
+    times_sec = (times - times[0])/np.timedelta64(1, 's') if n > 0 else np.zeros(0)
+    dt = np.diff(times_sec)
+    durations = np.array([store_handle.duration_dict[time] for time in times[1:]], dtype=float)
+    durations[dt - durations < 0] = 0 # sometimes in VLBI we have measurements with a shifted reference time
+    g_rw = dt - durations/6
+    g_rw[g_rw <= 0] = dt[g_rw <= 0]
+    sig_rw = np.sqrt(psd_rw*g_rw/FACTOR_RW)
+
+    diff_op = np.zeros((k, n))
+    diff_op[np.arange(k), np.arange(k)] = -1.0
+    diff_op[np.arange(k), np.arange(k) + 1] = 1.0
+
+    op = dict(psd_rw=psd_rw, psd_irw=psd_irw, dt=dt, g_rw=g_rw, sig_rw=sig_rw, k=k)
+    if psd_irw <= 0 or k == 0:
+        op.update(S=diff_op/sig_rw[:, None], chol=None)
+    else:
+        q_irw = psd_irw/FACTOR_IRW
+        t_start = times_sec[:-1]
+        mid = t_start + dt/2
+        idx = np.arange(k)
+        earlier = np.minimum.outer(idx, idx)
+        C = np.outer(dt, dt)*mid[earlier]
+        C[idx, idx] = dt**2*t_start + dt**3/3
+        Sigma = q_irw*C
+        Sigma[idx, idx] += sig_rw**2
+        chol = np.linalg.cholesky(Sigma)
+        op.update(S=solve_triangular(chol, diff_op, lower=True), chol=chol)
+    cache[key] = op
+    return op
+
+def clock_process_expansion(op):
+    """ Raw-row view of a clock_process_operator block, for LS-VCE (computed on demand, O(k^3)):
+            E      (m, k)  orthonormal map from the compressed rows s to the whitened raw residuals r* = E s
+                           (r* is the raw-row residual after the least-squares elimination of (b, c))
+            Q1     (m, p)  orthonormal basis of the whitened (b, c) design: the redundancy those states consume
+            sig    (m,)    raw-row standard deviations [m]
+            cof_rw, cof_irw (m,)  raw-row cofactors [m^2 per PSD unit], zero on rows of the other component
+        Raw rows: k RW rows, then 2k IRW rows (pairs per interval). With no IRW, m = k, E = I and Q1 is empty.
+    """
+    if 'E' in op:
+        return op
+    k, dt, sig_rw = op['k'], op['dt'], op['sig_rw']
+    if op['chol'] is None:
+        op.update(E=np.eye(k), Q1=np.zeros((k, 0)), sig=sig_rw, cof_rw=op['g_rw']/FACTOR_RW, cof_irw=np.zeros(k))
+        return op
+    sig_irw = np.sqrt(op['psd_irw']/FACTOR_IRW)
+    m, p = 3*k, 2*k
+    Az = np.zeros((m, p))      # whitened, columns: b_1..b_k, then c_1..c_k
+    rows = np.arange(k)
+    Az[rows, rows] = -1.0/sig_rw                      # -b_{j+1}
+    Az[rows[1:], rows[1:] - 1] = 1.0/sig_rw[1:]       # +b_j  (b_0 = 0)
+    # IRW rows: L^-1 = [[1/l11, 0], [-l21/(l11 l22), 1/l22]] applied to [b_{j+1}-b_j-dt_j c_j ; c_{j+1}-c_j]
+    l11, l21, l22 = np.sqrt(dt**3/3), np.sqrt(3*dt)/2, np.sqrt(dt)/2
+    a_co = 1.0/(l11*sig_irw)                  # first row:  a_co * e1
+    b_co = -l21/(l11*l22*sig_irw)             # second row: b_co * e1 + d_co * e2
+    d_co = 1.0/(l22*sig_irw)
+    r1, r2 = k + 2*rows, k + 2*rows + 1
+    j1 = rows[1:]                             # intervals with a previous state (b_0 = c_0 = 0)
+    Az[r1, rows] = a_co                       # +b_{j+1}
+    Az[r2, rows] = b_co
+    Az[r2, k + rows] = d_co                   # +c_{j+1}
+    Az[r1[1:], j1 - 1] = -a_co[1:]            # -b_j
+    Az[r2[1:], j1 - 1] = -b_co[1:]
+    Az[r1[1:], k + j1 - 1] = -a_co[1:]*dt[1:]                 # -dt_j c_j
+    Az[r2[1:], k + j1 - 1] = -b_co[1:]*dt[1:] - d_co[1:]      # -dt_j c_j (from e1), -c_j (from e2)
+    Q1, _ = np.linalg.qr(Az)
+    lift = np.zeros((m, k))
+    lift[:k] = op['chol']/sig_rw[:, None]             # whitened raw RW rows from s: diag(1/sig) L s
+    E = lift - Q1 @ (Q1.T @ lift)
+    op.update(E=E, Q1=Q1,
+              sig=np.concatenate((sig_rw, np.full(p, sig_irw))),
+              cof_rw=np.concatenate((op['g_rw']/FACTOR_RW, np.zeros(p))),
+              cof_irw=np.concatenate((np.zeros(k), np.full(p, 1.0/FACTOR_IRW))))
+    return op
+
+def expand_clock_rows(fun, jac, n_data, clock_ops):
+    """ Re-expand compressed clock pseudo-observation rows (see clock_process_expansion) to the raw-row basis:
+        fun_e = E s, J_e = E J_s for each clock block; data rows before and trailing rows after are unchanged.
+        clock_ops must be expanded and in the row order of the residual vector, starting at n_data.
+    """
+    if len(clock_ops) == 0:
+        return fun, jac
+    fun_parts, jac_parts = [fun[:n_data]], [jac[:n_data]]
+    row = n_data
+    for op in clock_ops:
+        n_c = op['S'].shape[0]
+        fun_parts.append(op['E'] @ fun[row:row + n_c])
+        jac_parts.append(op['E'] @ jac[row:row + n_c])
+        row += n_c
+    fun_parts.append(fun[row:])
+    jac_parts.append(jac[row:])
+    return np.concatenate(fun_parts), np.vstack(jac_parts)
+
+def clock_process_rows(store_handle, antenna_handle, ref_handle, clock_values, phase=False):
+    """ Compressed clock pseudo-observation residuals S u (n-1 rows), see clock_process_operator """
+    return clock_process_operator(store_handle, antenna_handle, ref_handle, phase)['S'] @ clock_values
 
 def union_of_slices(array, *slices):
     """ Get an array with indices from union of multiple slice objects """
@@ -15410,6 +15558,15 @@ def fit_phase_clock_params_grdel(ls_sol, clock_idxs, store_handle, ls_args, idx_
               f'irw {ant.phase_clock_psd_irw:.4g} ps^2/hr^3, cond(N) {np.linalg.cond(N):.3g}, '
               f'ratio to range rw {phi[0]/ant.clock_psd_rw:.4g}')
 
+def _nnls_quadratic(N, L):
+    """Non-negative LS-VCE step: argmin_{x >= 0} (x - N^-1 L)' N (x - N^-1 L) = argmin 1/2 x'Nx - L'x.
+    With N = R'R this is nnls(R, R^-T L). nnls(N, L) instead minimizes ||N x - L||^2, which agrees only when
+    no bound is active; with one active it shifts the free components by fitting the bounded component's
+    normal equation as well."""
+    R = np.linalg.cholesky(N).T
+    return nnls(R, solve_triangular(R, L, trans='T'))[0]
+
+
 def iterative_weight_adjust_ls_vce(
     store_handle,
     state_expanded,
@@ -15422,7 +15579,7 @@ def iterative_weight_adjust_ls_vce(
     no_PSD=False,
 ):
     max_iter, tol_var = 30, 1e-4
-    FIT_IRW = False
+    FIT_IRW = True
 
     ref_antenna, baselines = ls_args[0], ls_args[1]
     antenna_handles, baseline_handles = ls_args[3], ls_args[9]
@@ -15430,7 +15587,7 @@ def iterative_weight_adjust_ls_vce(
         phase_delay, use_phase_weights = True, ls_args[14]
         phase_only = True
     else:
-        FIT_IRW = False
+        #FIT_IRW = False
         phase_delay, use_phase_weights = False, None
         phase_only = False
 
@@ -15445,7 +15602,19 @@ def iterative_weight_adjust_ls_vce(
         )
 
         residuals = get_residuals(ls_sol.fun, baseline_handles, phase_delay, phase_only)
-        m = len(ls_sol.fun)
+        n_data = len(residuals)
+        m_fit = len(ls_sol.fun)
+
+        # clock pseudo-observations: re-expand the compressed rows to raw RW/IRW rows (one variance
+        # component per row); the eliminated IRW states are restored through their projector below
+        clock_ops = []
+        if store_handle.stochastic_clock:
+            for ant in antenna_handles:
+                if ant.antenna_name == ref_antenna:
+                    continue
+                clock_ops.append(clock_process_expansion(clock_process_operator(store_handle, ant, ref_handle, phase_delay)))
+        fun_e, J_e = expand_clock_rows(ls_sol.fun, ls_sol.jac, n_data, clock_ops)
+        m = len(fun_e)
         w_diag, var_apr = np.zeros(m), np.zeros(m)
         num_samples = 0 # start in lower right block diagonal 
         # ---------------- Observation weights ---------------------------
@@ -15474,21 +15643,13 @@ def iterative_weight_adjust_ls_vce(
             num_samples += len(w_vec)
 
         # ---------------- Stochastic clocks -----------------------------
-        if store_handle.stochastic_clock:
-            for ant in antenna_handles:
-                if ant.antenna_name == ref_antenna:
-                    continue
-                if observable == "range":
-                    pv = get_process_variance_times(store_handle, ant, "clock")
-                    pv_ref = get_process_variance_times(store_handle, ref_handle, "clock", False, ant.clock_times)
-                    sig = np.sqrt(pv + pv_ref)
-                else:
-                    pv = get_process_variance_times(store_handle, ant, "clock", phase_delay)
-                    pv_ref = get_process_variance_times(store_handle, ref_handle, "clock", phase_delay, ant.phase_clock_times)
-                    sig = np.sqrt(pv + pv_ref)
-                n = len(sig)
-                w_diag[num_samples:num_samples+n] = 1.0 / sig
-                num_samples += n
+        for op in clock_ops:
+            n = len(op['sig'])
+            w_diag[num_samples:num_samples+n] = 1.0 / op['sig']
+            if no_PSD or not FIT_IRW:
+                # IRW variance is known here, not estimated
+                var_apr[num_samples:num_samples+n] += op['psd_irw']*op['cof_irw']
+            num_samples += n
 
         # ---------------- Stochastic troposphere ------------------------
         if store_handle.stochastic_trop:
@@ -15504,11 +15665,20 @@ def iterative_weight_adjust_ls_vce(
         # ---------------- Weighted LS algebra --------------------------- 
         inv_w, q_inv = 1.0 / w_diag, w_diag ** 2
         J = ls_sol.jac
-        A = _row_scale(J, inv_w)
-        cov = np.linalg.inv(J.T @ J)
-        y_u = (inv_w * ls_sol.fun).reshape(-1, 1)
-        y_u[len(residuals):] *= 0
+        A = _row_scale(J_e, inv_w)
+        cov = np.linalg.inv(J.T @ J)        # = inv(J_e'J_e): E has orthonormal columns
+        # post-fit residuals of all rows, pseudo-observations included: they already satisfy P_perp e = e,
+        # zeroing the pseudo rows (as before) projects the wrong vector and biases the PSD components
+        y_u = (inv_w * fun_e).reshape(-1, 1)
         P_perp = np.eye(m) - _col_scale(A @ cov @ A.T, q_inv)
+        # the eliminated IRW states also consume redundancy: range(Q1) is orthogonal (whitened) to range(E)
+        row = n_data
+        for op in clock_ops:
+            n = len(op['sig'])
+            if op['Q1'].shape[1] > 0:
+                blk = slice(row, row + n)
+                P_perp[blk, blk] -= inv_w[blk][:, None] * (op['Q1'] @ op['Q1'].T) * w_diag[blk][None, :]
+            row += n
         v = P_perp @ y_u
 
         # ---------------- Build Q vectors -------------------------------
@@ -15533,26 +15703,16 @@ def iterative_weight_adjust_ls_vce(
         # stochastic PSD matrices (clock / trop)
         if not no_PSD:
             if store_handle.stochastic_clock is True:
-                for idx, antenna_handle in enumerate(antenna_handles):
-                    if ref_antenna != antenna_handle.antenna_name:
-                        Q_full_rw = np.zeros(m)
-                        Q_full_irw = np.zeros(m)
-                        if observable == 'range':
-                            Q_clock_rw = get_process_variance_times(store_handle, antenna_handle, 'clock', phase_delay, only_mat=True, clock_mat_type='rw')
-                            Q_clock_irw = get_process_variance_times(store_handle, antenna_handle, 'clock', phase_delay, only_mat=True, clock_mat_type='irw')
-                            Q_full_rw[num_samples:num_samples+len(antenna_handle.clock_times)-1] = Q_clock_rw
-                            Q_full_irw[num_samples:num_samples+len(antenna_handle.clock_times)-1] = Q_clock_irw
-                            num_samples += len(antenna_handle.clock_times)-1
-                        elif observable == 'phase':
-                            Q_clock_rw = get_process_variance_times(store_handle, antenna_handle, 'clock', phase_delay, only_mat=True, clock_mat_type='rw')
-                            Q_clock_irw = get_process_variance_times(store_handle, antenna_handle, 'clock', phase_delay, only_mat=True, clock_mat_type='irw')
-                            Q_full_rw[num_samples:num_samples+len(antenna_handle.phase_clock_times)-1] = Q_clock_rw
-                            Q_full_irw[num_samples:num_samples+len(antenna_handle.phase_clock_times)-1] = Q_clock_irw
-                            num_samples += len(antenna_handle.phase_clock_times)-1
-
-                        Q_vecs.append(Q_full_rw/FACTOR_RW)
-                        if FIT_IRW is True:
-                            Q_vecs.append(Q_full_irw/FACTOR_IRW)
+                for op in clock_ops:
+                    n = len(op['sig'])
+                    Q_full_rw = np.zeros(m)
+                    Q_full_irw = np.zeros(m)
+                    Q_full_rw[num_samples:num_samples+n] = op['cof_rw']      # m^2 per ps^2/hr
+                    Q_full_irw[num_samples:num_samples+n] = op['cof_irw']    # m^2 per ps^2/hr^3
+                    num_samples += n
+                    Q_vecs.append(Q_full_rw)
+                    if FIT_IRW is True:
+                        Q_vecs.append(Q_full_irw)
 
 
             if store_handle.stochastic_trop is True:
@@ -15594,7 +15754,7 @@ def iterative_weight_adjust_ls_vce(
         if cond_N_s <= C_target:
             # no ridge necessary
             #sig_hat_s = np.linalg.solve(N_s, L_s)
-            sig_hat_s, _ = nnls(N_s, L_s)
+            sig_hat_s = _nnls_quadratic(N_s, L_s)
             lam_s     = 0.0
         else:
             print('using ridge regression to stabilize LS-VCE')
@@ -15604,7 +15764,7 @@ def iterative_weight_adjust_ls_vce(
             s_min  = max(s_min, np.spacing(s_max))           # IEEE guard
             lam_s  = (s_max - C_target * s_min) / (C_target - 1.0)
         
-            sig_hat_s, _ = nnls(N_s + lam_s*np.eye(len(N_s)), L_s)
+            sig_hat_s = _nnls_quadratic(N_s + lam_s*np.eye(len(N_s)), L_s)
         
         # 5.  Back-transform to physical units:  x = S · x_s
         sig_hat = S_inv * sig_hat_s        # element-wise
@@ -15700,16 +15860,17 @@ def iterative_weight_adjust_ls_vce(
                 idx += 1
 
         # ---------------- Diagnostics & convergence ----------------------
-        chi_sq = np.sum(ls_sol.fun ** 2) / (m - len(ls_sol.x))
+        chi_sq = np.sum(ls_sol.fun ** 2) / (m_fit - len(ls_sol.x))
         print(f"iteration {n_iter}")
         print(f"chi-squared: {chi_sq:.3f}")
 
         if sig_hat_prev is not None:
-            rel = np.linalg.norm(sig_hat - sig_hat_prev) / np.linalg.norm(sig_hat)
-            #max_delta = np.max(rel)
-            print(f"relative change: {rel}")
+            # per-component relative change (unit-free); the old norm only saw the largest-magnitude component
+            rel = np.max(np.abs(np.log(sig_hat / sig_hat_prev)))
+            print(f"max relative change: {rel:.3e}")
             if rel < tol_var:
                 break
+
         sig_hat_prev = sig_hat.copy()
         n_iter += 1
 
@@ -16635,8 +16796,6 @@ def calc_residuals(state, ref_antenna, baselines, store_handle, antenna_handles,
         for antenna_handle in antenna_handles:
             if ref_antenna != antenna_handle.antenna_name:
                 if phase_only is False:
-                    process_variance_clock = get_process_variance_times(store_handle, antenna_handle, 'clock')
-                    process_variance_ref_clock = get_process_variance_times(store_handle, ref_handle, 'clock', False, antenna_handle.clock_times)
                     clock_samples = antenna_handle.clock_samples.copy()
                     if antenna_handle.ppp_clock_active:
                         antenna_handle.interp_ppp_clock(antenna_handle.clock_times)
@@ -16645,13 +16804,12 @@ def calc_residuals(state, ref_antenna, baselines, store_handle, antenna_handles,
                         clock_state_global = clock_states[antenna_handle.range_clock_idxs][:idx_start]
                         clock_global = sample_global_poly_at_interval(clock_state_global, antenna_handle.clock_times,\
                                 antenna_handle.times_gps[0], antenna_handle.times_gps[-1])
-                        diff_clock = np.diff(clock_samples-clock_global)
+                        clock_stochastic = clock_samples-clock_global
                     else:
-                        diff_clock = np.diff(clock_samples)
-                    residuals = np.concatenate((residuals, 1/np.sqrt(process_variance_clock + process_variance_ref_clock)*diff_clock))
+                        clock_stochastic = clock_samples
+                    residuals = np.concatenate((residuals, clock_process_rows(store_handle, antenna_handle, ref_handle,
+                                                                              clock_stochastic, False)))
                 if phase_delay is True:
-                    process_variance_phase_clock = get_process_variance_times(store_handle, antenna_handle, 'clock', phase_delay)
-                    process_variance_ref_phase_clock = get_process_variance_times(store_handle, ref_handle, 'clock', phase_delay, antenna_handle.phase_clock_times)
                     phase_clock_samples = antenna_handle.phase_clock_samples.copy()
 
                     if antenna_handle.ppp_clock_active:
@@ -16672,10 +16830,11 @@ def calc_residuals(state, ref_antenna, baselines, store_handle, antenna_handles,
                         phase_clock_state_global = phase_clock_states[antenna_handle.phase_clock_idxs][:idx_start]
                         phase_clock_global = sample_global_poly_at_interval(phase_clock_state_global, antenna_handle.phase_clock_times,\
                                 antenna_handle.times_gps[0], antenna_handle.times_gps[-1])
-                        diff_phase_clock = np.diff(phase_clock_samples-phase_clock_global)
+                        phase_clock_stochastic = phase_clock_samples-phase_clock_global
                     else:
-                        diff_phase_clock = np.diff(phase_clock_samples)
-                    residuals = np.concatenate((residuals, 1/np.sqrt(process_variance_phase_clock + process_variance_ref_phase_clock)*diff_phase_clock))
+                        phase_clock_stochastic = phase_clock_samples
+                    residuals = np.concatenate((residuals, clock_process_rows(store_handle, antenna_handle, ref_handle,
+                                                                              phase_clock_stochastic, True)))
                 #if np.any(np.abs(residuals)>1e6): breakpoint()
 
     if store_handle.stochastic_trop is True:
@@ -17217,33 +17376,21 @@ def calc_jac(state, ref_antenna, baselines, store_handle, antenna_handles, \
             if ref_antenna == antenna_handle.antenna_name:
                 ref_handle = antenna_handle
 
-        idx_clock = 0
-        idx_phase_clock = 0
         for idx, antenna_handle in enumerate(antenna_handles):
             if ref_antenna != antenna_handle.antenna_name:
-                if idx_clock != 0 and phase_only is False:
-                    # need to skip an index when we move to a new antenna handle
-                    idx_clock += 1 + idx_start 
-                if idx_phase_clock != 0 and phase_delay is True:
-                    idx_phase_clock += 1 + idx_start
+                # pseudo-observation rows act on the stochastic clock samples only (global polynomial excluded)
                 if phase_only is False:
-                    jac_ant_clock = np.zeros((len(antenna_handle.clock_times)-1, analytical_jac.shape[1]))
-                    process_variance_clock = get_process_variance_times(store_handle, antenna_handle, 'clock')
-                    process_variance_ref_clock = get_process_variance_times(store_handle, ref_handle, 'clock', False, antenna_handle.clock_times)
-                    for jdx in range(len(antenna_handle.clock_times)-1):
-                        jac_ant_clock[jdx, clock_idxs.start+idx_clock+idx_start] = -1/np.sqrt(process_variance_clock[jdx] + process_variance_ref_clock[jdx])
-                        jac_ant_clock[jdx, clock_idxs.start+idx_clock+1+idx_start] = 1/np.sqrt(process_variance_clock[jdx] + process_variance_ref_clock[jdx])
-                        idx_clock += 1
+                    clock_cols = np.arange(clock_idxs.start, clock_idxs.stop)[antenna_handle.range_clock_idxs][idx_start:]
+                    S_clock = clock_process_operator(store_handle, antenna_handle, ref_handle, False)['S']
+                    jac_ant_clock = np.zeros((S_clock.shape[0], analytical_jac.shape[1]))
+                    jac_ant_clock[:, clock_cols] = S_clock
                     analytical_jac = np.vstack([analytical_jac, jac_ant_clock])
 
                 if phase_delay is True:
-                    jac_ant_phase_clock = np.zeros((len(antenna_handle.phase_clock_times)-1, analytical_jac.shape[1]))
-                    process_variance_phase_clock = get_process_variance_times(store_handle, antenna_handle, 'clock', phase_delay)
-                    process_variance_ref_phase_clock = get_process_variance_times(store_handle, ref_handle, 'clock', phase_delay, antenna_handle.phase_clock_times)
-                    for jdx in range(len(antenna_handle.phase_clock_times)-1):
-                        jac_ant_phase_clock[jdx, phase_clock_idxs.start+idx_phase_clock+idx_start] = -1/np.sqrt(process_variance_phase_clock[jdx] + process_variance_ref_phase_clock[jdx])
-                        jac_ant_phase_clock[jdx, phase_clock_idxs.start+idx_phase_clock+1+idx_start] = 1/np.sqrt(process_variance_phase_clock[jdx] + process_variance_ref_phase_clock[jdx])
-                        idx_phase_clock += 1
+                    phase_clock_cols = np.arange(phase_clock_idxs.start, phase_clock_idxs.stop)[antenna_handle.phase_clock_idxs][idx_start:]
+                    S_phase_clock = clock_process_operator(store_handle, antenna_handle, ref_handle, True)['S']
+                    jac_ant_phase_clock = np.zeros((S_phase_clock.shape[0], analytical_jac.shape[1]))
+                    jac_ant_phase_clock[:, phase_clock_cols] = S_phase_clock
                     analytical_jac = np.vstack([analytical_jac, jac_ant_phase_clock])
 
     if store_handle.stochastic_trop is True:
