@@ -67,7 +67,7 @@ from single_diff_tools import import_key_gnss, import_vex_gnss, import_data_vlbi
                   detect_unresolved_amb_gnss, set_bounds_phase_clock, union_of_slices, get_residuals, iterative_weight_adjust, iterative_weight_adjust_ls_vce, \
                   iterative_weight_adjust_LS_VCE_full, sample_global_poly_at_interval, gen_key, VMF3Model, get_spanning_tree, \
                   read_thermal_deformation_coeffs, get_obs_weights, find_cont_penalty, mcmc_correlation, ls_correlation, load_kernel_parameters, vlbi_transform_data,\
-                  write_vda_phase, NavStore, fit_phase_clock_params_grdel
+                  write_vda_phase, NavStore, fit_phase_clock_params_grdel, nearest_rinex_ant_code
 
 MIN_SLICE = 0
 MIN_TROP_DIST = 0.5e3 # 1 km
@@ -1154,8 +1154,8 @@ def lstsq_estimation(sol_type, plot_intermediate_results, ref_antenna, store_han
             baseline_handle = baseline_handles[jdx]
             antenna1_handle = antenna_handles[baseline[0]]
             antenna2_handle = antenna_handles[baseline[1]]
-            antenna1_handle.f1 = baseline_handle.f1
-            antenna2_handle.f1 = baseline_handle.f1
+            antenna1_handle.f1 = nearest_rinex_ant_code(baseline_handle.f1+16e6) # 16e6 -- rough bandwidth of GNSS signal
+            antenna2_handle.f1 = nearest_rinex_ant_code(baseline_handle.f1+16e6)
             _, ant1_idxs, _ = np.intersect1d(antenna1_handle.times_gps, \
                     baseline_handle.datetime_array, return_indices=True)
             _, ant2_idxs, _ = np.intersect1d(antenna2_handle.times_gps, \
@@ -1296,9 +1296,9 @@ def lstsq_estimation(sol_type, plot_intermediate_results, ref_antenna, store_han
         for antenna_handle in antenna_handles:
             antenna_handle.phase_clock_psd_rw = antenna_handle.clock_psd_rw
             antenna_handle.phase_clock_psd_irw = antenna_handle.clock_psd_irw
-    #elif store_handle.stochastic_clock:
-    #    # using group delay variation as a priori --> solve for phase phi_rw, phi_irw
-    #    fit_phase_clock_params_grdel(ls_grdel, clock_idxs, store_handle, ls_args, idx_start)
+    elif store_handle.stochastic_clock:
+        # using group delay variation as a priori --> solve for phase phi_rw, phi_irw
+        fit_phase_clock_params_grdel(ls_grdel, clock_idxs, store_handle, ls_args, idx_start)
 
     grdel_clock_idxs = clock_idxs
     for baseline_handle in baseline_handles:
@@ -2204,11 +2204,11 @@ if __name__ == '__main__':
             
             full_data[rinex_file] = rinex_data
             
-        # parse or generate key file
+        # parse or generate schedule
         if args.key_file is not None:
             datetime_array, source_array, point_ra_dec_array, dt_key, duration_key, source_key, point_key  \
                     = import_key_gnss(rinex_files, full_data, args.key_file)
-        if args.vex_file is not None:
+        elif args.vex_file is not None:
             datetime_array, source_array, point_ra_dec_array, dt_key, duration_key, source_key, point_key  \
                     = import_vex_gnss(rinex_files, full_data, args.vex_file)
         else:

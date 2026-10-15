@@ -107,6 +107,64 @@ mapping_dict = {
     'P2': ['C2S'],
     'L2': ['L2S']
 }
+
+# observation preference order by band (first available per epoch wins); the
+# trailing two-character names are the RINEX2-style merged variables from map_datasets()
+BAND_FREQ = {
+    'L1': 1575.42e6,
+    'L2': 1227.60e6,
+    'L5': 1176.45e6,
+    'E6': 1278.75e6,
+}
+CODE_PREF_ORDER = {
+    'L1': ['C1L', 'C1S', 'C1X', 'C1P', 'C1W', 'C1'],
+    'L2': ['C2L', 'C2S', 'C2X', 'C2P', 'C2W', 'C2', 'P2'],
+    'L5': ['C5Q', 'C5X', 'C5I', 'C5'],
+    'E6': ['C6C', 'C6X', 'C6Z', 'C6B', 'C6A', 'C6Q', 'C6I', 'C6'],
+}
+PHASE_PREF_ORDER = {
+    'L1': ['L1L', 'L1S', 'L1X', 'L1P', 'L1W', 'L1'],
+    'L2': ['L2L', 'L2S', 'L2X', 'L2P', 'L2W', 'L2'],
+    'L5': ['L5Q', 'L5X', 'L5I', 'L5'],
+    'E6': ['L6C', 'L6X', 'L6Z', 'L6B', 'L6A', 'L6Q', 'L6I', 'L6'],
+}
+
+# a priori thermal-noise model, sigma^2 = C * 10^(-C/N0 / 10)  [m^2], C in m^2-Hz -- order of magnitude only
+#   code:  C ~ (c/R_c)^2 * B_n * d / 2 (DLL), by band; 1e3 for C/A ~ d = 0.1 chip, B_n = 0.25 Hz, scaled by
+#          chip rate R_c (5.115 MHz E6, 10.23 MHz L5). Err low: q absorbs what the known term underpredicts.
+#   phase: C = (lambda/2pi)^2 * B_n  (PLL bandwidth B_n; open-loop/batch estimate over T: B_n = 1/(2T))
+CODE_NOISE_COEFF = {  # m^2-Hz
+    'L1': 1000.0,
+    'L2': 1000.0,
+    'L5': 10.0,
+    'E6': 40.0,
+}
+PHASE_NOISE_BW = 10.0       # Hz (reproduces the SIGMA-epsilon L1 value, ~2.2e-3 m^2-Hz)
+SNR_FILL_DBHZ = 45.0               # used only where no C/N0 is available at all
+DITHER_MAX_N = 4                   # integer cycles added/subtracted when dithering phase
+
+def snr_candidates(obs_name):
+    """ Signal-strength variables matching an observation name, most specific first
+        e.g. 'C1C' -> ['S1C'];  legacy 'C1' -> ['S1D', 'S1B', 'S1C', 'S1P', 'S1']
+    """
+    cands = []
+    if obs_name in mapping_dict:
+        cands += ['S' + rinex3[1:] for rinex3 in mapping_dict[obs_name]]
+    cands.append('S' + obs_name[1:])
+    return cands
+
+def thermal_variance(coeff, snr_dbhz):
+    """ sigma^2 = coeff * 10^(-C/N0/10) [m^2] for coeff in m^2-Hz and C/N0 in dB-Hz """
+    return coeff*10**(-snr_dbhz/10)
+
+def phase_noise_coeff(freq):
+    """ C = (lambda/2pi)^2 * B_n [m^2-Hz] for a carrier at freq [Hz] """
+    return (const.c/freq/(2*np.pi))**2*PHASE_NOISE_BW
+
+def iono_free_variance(var_1, var_2, f1, f2):
+    """ Variance of the ionosphere-free combination (f1^2 x1 - f2^2 x2)/(f1^2 - f2^2) """
+    return (f1**4*var_1 + f2**4*var_2)/(f1**2 - f2**2)**2
+
 planet_mu = {
     1: 2.20329e13, # mercury
     2: 3.248599e14, # venus
@@ -144,7 +202,6 @@ _TX_FREQ_HZ = {
     'S': {1575.42e6: 'S01', 1176.45e6: 'S05'},
 }
 
-
 def transmitter_antex_code(frequency_hz, system_char):
     """ ANTEX frequency code for a transmitting satellite antenna.
 
@@ -158,6 +215,25 @@ def transmitter_antex_code(frequency_hz, system_char):
             frequency code, e.g. 'E06'
     """
     return _TX_FREQ_HZ[str(system_char).upper()][float(frequency_hz)]
+
+_ANT_FREQS = np.array(sorted(FREQ_TO_RINEX_ANT))
+_ANT_CODES = [FREQ_TO_RINEX_ANT[freq] for freq in _ANT_FREQS]
+def nearest_rinex_ant_code(frequency_hz):
+    """ RINEX/ANTEX frequency code whose carrier is closest to frequency_hz.
+
+        A fudge for the VLBI case, where observing frequencies have nothing to do
+        with GNSS bands and no exact key exists.  Returns the nearest neighbor
+        unconditionally; the caller decides whether the match means anything, so
+        the signed offset is returned alongside it.
+
+        args:
+            frequency_hz: frequency in Hz
+        returns:
+            code: nearest frequency code, e.g. 'G02'
+            offset_hz: frequency_hz minus that code's carrier (signed)
+    """
+    index = int(np.argmin(np.abs(_ANT_FREQS - float(frequency_hz))))
+    return _ANT_FREQS[index]
 
 import matplotlib.font_manager as fm
 available_fonts = fm.findSystemFonts(fontpaths=None, fontext='ttf')
@@ -4371,6 +4447,7 @@ class AntennaInfo(object):
         self.l4r_name = None
         self.use_zwd_file = False
         self.f1 = None
+        self.f2 = None
 
         # currently hard-code a priori PSD scalings
         #if self.antenna_name == 'DBR205':
@@ -4403,62 +4480,91 @@ class AntennaInfo(object):
         else:
             self.domes_name = self.antenna_name.ljust(9)
 
+    def select_obs_with_snr(self, pref_order):
+        """Combine observations in preference order (first available per epoch) together with the
+           C/N0 of the signal chosen at each epoch. Returns (obs, snr) DataArrays on obs.time.
+        """
+        data = self.antenna_data
+        s_vars = [var for var in data.data_vars if var.startswith('S')]
+        obs, snr = None, None
+        for var in pref_order:
+            if var not in data:     # skip if not present
+                continue
+            valid = data[var].notnull() & (data[var] != 0)
+            da = data[var].where(valid).dropna(dim='time', how='all')
+            if da.size == 0:
+                continue
+            obs = da if obs is None else obs.combine_first(da)
+
+            snr_var = None
+            for s_name in snr_candidates(var):
+                if s_name in data:
+                    s_da = data[s_name].where(data[s_name] > 0)
+                    snr_var = s_da if snr_var is None else snr_var.combine_first(s_da)
+            if snr_var is None:
+                # no matching signal-strength observable: strongest signal on the same band
+                band_vars = [s_name for s_name in s_vars if len(s_name) > 1 and s_name[1] == var[1]]
+                if len(band_vars) > 0:
+                    snr_var = data[band_vars].to_array().max('variable', skipna=True)
+            if snr_var is not None:
+                snr_var = snr_var.where(valid)
+                snr = snr_var if snr is None else snr.combine_first(snr_var)
+
+        if obs is None:
+            raise ValueError(f'{self.antenna_name}: none of {pref_order} found in the observation data')
+        if snr is None:
+            snr = xr.full_like(obs, np.nan, dtype=float)
+        snr = snr.reindex(time=obs.time)
+
+        missing = np.isnan(snr.values)
+        if np.any(missing) and len(s_vars) > 0:
+            # last resort: strongest signal on any band (the previous behavior)
+            snr_any = data[s_vars].to_array().max('variable', skipna=True).reindex(time=obs.time)
+            snr = snr.fillna(snr_any)
+            missing = np.isnan(snr.values)
+        if np.any(missing):
+            fill = np.nanmedian(snr.values) if np.any(~missing) else SNR_FILL_DBHZ
+            print(f'warning: {self.antenna_name}: no C/N0 for {np.sum(missing)} epochs of {pref_order[0]}, '
+                  f'using {fill:.1f} dB-Hz')
+            snr = snr.fillna(fill)
+        return obs, snr
+
+    def dither_rng(self):
+        """ Reproducible per-antenna generator for integer-cycle phase dithering """
+        seed = int(sha256(self.antenna_name.encode('utf-8')).hexdigest(), 16) % (2**32)
+        return np.random.default_rng(seed=seed)
+
     def get_pr_data(self, freq_select = 'L1', iono_free = False, iono_freq = 'L2'):
-        """Generate the pseudorange data series to be used in the least-squares estimation"""
-        # currently hardcoding GPS freqs
+        """Generate the pseudorange data series to be used in the least-squares estimation.
+           A priori errors (pr_errors, 1-sigma in m): sigma^2 = CODE_NOISE_COEFF[band]*10^(-C/N0/10) with the
+           C/N0 of the signal selected at each epoch; propagated through the ionosphere-free combination.
+        """
+        self.f1 = BAND_FREQ[freq_select]
+        pr, snr = self.select_obs_with_snr(CODE_PREF_ORDER[freq_select])
         if iono_free is True:
-            self.f1 = 1575.42e6
-            pr_L1 = np.array(self.antenna_data.C1.values, dtype=float)
-            if iono_freq == 'L2':
-                self.f2 = 1227.60*1e6
-                pr_dual = np.array(self.antenna_data.P2.values, dtype=float)
-            elif iono_freq == 'L5':
-                self.f2 = 1176.45*1e6
-                pr_dual = np.array(self.antenna_data.C5.values, dtype=float)
-            elif iono_freq == 'E6':
-                self.f2 = 1176.45*1e6
-
-            gamma = f1**2 / f2**2
-            pr = (pr_dual - gamma*pr_L1)/(1 - gamma)
+            self.f2 = BAND_FREQ[iono_freq]
+            pr_dual, snr_dual = self.select_obs_with_snr(CODE_PREF_ORDER[iono_freq])
+            pr, pr_dual = xr.align(pr, pr_dual, join='inner')
+            snr, snr_dual = snr.sel(time=pr.time), snr_dual.sel(time=pr.time)
+            gamma = self.f1**2 / self.f2**2
+            pr = (pr_dual - gamma*pr)/(1 - gamma)
+            pr_var = iono_free_variance(thermal_variance(CODE_NOISE_COEFF[freq_select], snr.values),
+                                        thermal_variance(CODE_NOISE_COEFF[iono_freq], snr_dual.values),
+                                        self.f1, self.f2)
         else:
-            if freq_select == 'L1':
-                self.f1 = 1575.42e6
-                pref_order = ['C1L', 'C1S', 'C1X', 'C1P', 'C1W', 'C1']
-            elif freq_select == 'L2':
-                self.f1 = 1227.60e6
-                pref_order = ['C2L', 'C2S', 'C2X', 'C2P', 'C2W', 'C2']
-            elif freq_select == 'L5':
-                self.f1 = 1176.45e6
-                pref_order = ['C5Q', 'C5X', 'C5I', 'C5']
-            elif freq_select == 'E6':
-                self.f1 = 1278.75e6
-                pref_order = ['C6C', 'C6X', 'C6Z', 'C6B', 'C6A', 'C6Q', 'C6I', 'C6']
+            pr_var = thermal_variance(CODE_NOISE_COEFF[freq_select], snr.values)
 
-            pr = None
-            for var in pref_order:
-                if var in self.antenna_data:      # skip if not present
-                    da = self.antenna_data[var].where(self.antenna_data[var] != 0)
-                    da = da.dropna(dim='time', how='all')
-                    pr = da if pr is None else pr.combine_first(da)
+        times = pr.time.values
+        self.antenna_data = self.antenna_data.sel(time=times) # avoid nan epoch
+        self.antenna_data = self.antenna_data.assign({
+            'pr_data':  ('time', np.asarray(pr.values, dtype=float)),
+            'snr_pr':   ('time', np.asarray(snr.values, dtype=float)),
+            'pr_sigma': ('time', np.sqrt(pr_var)),
+        })
 
-            #pr_vars = [var for var in self.antenna_data.data_vars if var.startswith('C1')]
-            #pr_arrays = [self.antenna_data[pr_var] for pr_var in pr_vars]
-            #stacked_pr = np.stack(pr_arrays)
-            #pr = np.nanmax(stacked_pr, axis=0)
-        
-        pr_xarray = xr.DataArray(pr, coords={'time': pr.time.values}, dims='time')
-        self.antenna_data = self.antenna_data.assign({'pr_data': pr_xarray})
-        self.antenna_data = self.antenna_data.sel(time=pr.time.values) # avoid nan epoch
-        
-        # get formal errors
-        SNR_vars = [var for var in self.antenna_data.data_vars if var.startswith('S')]
-        SNR_arrays = [self.antenna_data[SNR_var] for SNR_var in SNR_vars]
-        stacked = np.stack(SNR_arrays)
-        # Use np.nanmax to pick the non-NaN values across the stacked arrays
-        self.SNR_array = np.nanmax(stacked, axis=0)
-        C_i = 1000 # m^2-Hz
-        #C_i = C_i*20 # empirical
-        self.pr_errors = C_i*10**(-self.SNR_array/10)
+        # formal errors, aligned with antenna_data.time
+        self.SNR_array = self.antenna_data.snr_pr.values
+        self.pr_errors = self.antenna_data.pr_sigma.values
 
     def set_sinex_names(self, sta_code, domes_name):
         """ Set SINEX information for write_SINEX()
@@ -4468,83 +4574,54 @@ class AntennaInfo(object):
         self.domes_name = domes_name
 
     def get_cp_data(self, freq_select = 'L1', iono_free = False, iono_freq = 'L2'):
-        """Generate the carrier phase data series to be used in the least-squares estimation"""
-
-        #if self.dither_phase is True:
-        #    # add randomized integer wavelengths to phase
-        #    SEED= int(sha256(self.antenna_name.encode('utf-8')).hexdigest(),16) % (2**32) # change this to change the random selection
-        #    rng = np.random.default_rng(seed=SEED)
-        #    MAX_N=4 # number of wavelengths that can be added or subtracted
-        #    rand_int = rng.integers(-MAX_N, MAX_N, size=len(self.antenna_data.L1.values))
-
-        # currently hardcoding GPS freqs
+        """Generate the carrier phase data series to be used in the least-squares estimation.
+           A priori errors (cp_errors, 1-sigma in m): sigma^2 = (lambda/2pi)^2*B_n*10^(-C/N0/10) with the
+           C/N0 of the signal selected at each epoch; for iono_free, the ionosphere-free combination error.
+           Epochs are reduced to those with phase, and pr_errors is re-aligned to them.
+        """
+        self.f1 = BAND_FREQ[freq_select]
+        wavelength_1 = const.c/self.f1
+        cp, snr = self.select_obs_with_snr(PHASE_PREF_ORDER[freq_select])
         if iono_free is True:
-            self.f1 = 1575.42*1e6
-            cp = self.antenna_data.L1.values
+            self.f2 = BAND_FREQ[iono_freq]
+            wavelength_2 = const.c/self.f2
+            cp_dual, snr_dual = self.select_obs_with_snr(PHASE_PREF_ORDER[iono_freq])
+            cp, cp_dual = xr.align(cp, cp_dual, join='inner')
+            snr, snr_dual = snr.sel(time=cp.time), snr_dual.sel(time=cp.time)
 
-            if iono_freq == 'L2':
-                self.f2 = 1227.60*1e6
-                cp_dual = self.antenna_data.L2.values
-            elif iono_freq == 'L5':
-                self.f2 = 1176.45*1e6
-                cp_dual = self.antenna_data.L5.values
-            elif iono_freq == 'E6':
-                self.f2 = 1176.45*1e6
-                cp_dual = self.antenna_data.L6C.values
+        cp_cycles = np.asarray(cp.values, dtype=float)
+        if iono_free is True:
+            cp_dual_cycles = np.asarray(cp_dual.values, dtype=float)
+        if self.dither_phase is True:
+            # add randomized integer wavelengths to phase
+            rng = self.dither_rng()
+            cp_cycles = cp_cycles + rng.integers(-DITHER_MAX_N, DITHER_MAX_N, size=len(cp_cycles))
+            if iono_free is True:
+                cp_dual_cycles = cp_dual_cycles + rng.integers(-DITHER_MAX_N, DITHER_MAX_N, size=len(cp_dual_cycles))
 
-            wavelength_1 = const.c/f1
-            wavelength_2 = const.c/f2
-
-            if self.dither_phase is True:
-                cp = cp + rand_int
-
-                # dual frequency dithering
-                if iono_freq == 'L2':
-                    rand_int_dual = rng.integers(-MAX_N, MAX_N, size=len(self.antenna_data.L2.values))
-                elif iono_freq == 'L5':
-                    rand_int_dual = rng.integers(-MAX_N, MAX_N, size=len(self.antenna_data.L5.values))
-                cp_dual = cp_dual + rand_int_dual
-
-            cp_xarray = xr.DataArray(cp*wavelength_1, coords={'time': self.antenna_data.time.values}, dims='time')
-            cp_dual_xarray = xr.DataArray(cp_dual*wavelength_2, coords={'time': self.antenna_data.time.values}, dims='time')
-            self.antenna_data = self.antenna_data.assign({'cp_dual': cp_dual_xarray})
+        var_1 = thermal_variance(phase_noise_coeff(self.f1), np.asarray(snr.values, dtype=float))
+        if iono_free is True:
+            var_2 = thermal_variance(phase_noise_coeff(self.f2), np.asarray(snr_dual.values, dtype=float))
+            cp_var = iono_free_variance(var_1, var_2, self.f1, self.f2)
         else:
-            if freq_select == 'L1':
-                self.f1 = 1575.42e6
-                pref_order = ['L1L', 'L1S', 'L1X', 'L1P', 'L1W', 'L1']
-            elif freq_select == 'L2':
-                self.f1 = 1227.60e6
-                pref_order = ['L2L', 'L2S', 'L2X', 'L2P', 'L2W', 'L2']
-            elif freq_select == 'L5':
-                self.f1 = 1176.45e6
-                pref_order = ['L5Q', 'L5X', 'L5I', 'L5']
-            elif freq_select == 'E6':
-                self.f1 = 1278.75e6
-                pref_order = ['L6C', 'L6X', 'L6Z', 'L6B', 'L6A', 'L6Q', 'L6I', 'L6']
-            wavelength = const.c/self.f1
+            cp_var = var_1
 
-            cp = None
-            for var in pref_order:
-                if var in self.antenna_data:                    # skip if not present
-                    da = self.antenna_data[var].where(self.antenna_data[var] != 0)
-                    da = da.dropna(dim='time', how='all')
-                    cp = da if cp is None else cp.combine_first(da)
+        times = cp.time.values
+        self.antenna_data = self.antenna_data.sel(time=times) # avoid nan epoch
+        new_vars = {
+            'cp_data':  ('time', cp_cycles*wavelength_1),
+            'snr_cp':   ('time', np.asarray(snr.values, dtype=float)),
+            'cp_sigma': ('time', np.sqrt(cp_var)),
+        }
+        if iono_free is True:
+            new_vars['cp_dual'] = ('time', cp_dual_cycles*wavelength_2)
+        self.antenna_data = self.antenna_data.assign(new_vars)
 
-            #cp_vars = [var for var in self.antenna_data.data_vars if var.startswith('L1')]
-            #cp_arrays = [self.antenna_data[cp_var] for cp_var in cp_vars]
-            #stacked_cp = np.stack(cp_arrays)
-            #cp = np.nanmax(stacked_cp, axis=0)
-            #cp = self.antenna_data.L1.values
-
-            if self.dither_phase is True:
-                cp = cp + rand_int
-            cp_xarray = xr.DataArray(cp*wavelength, coords={'time': cp.time.values}, dims='time')
-        
-        self.antenna_data = self.antenna_data.assign({'cp_data': cp_xarray})
-        self.antenna_data = self.antenna_data.sel(time=cp.time.values) # avoid nan epochd
-        C_i = 0.244 # m^2-Hz
-        C_i = C_i*100 # empirical
-        self.cp_errors = C_i*10**(-self.SNR_array/10)
+        # formal errors, aligned with antenna_data.time
+        if 'pr_sigma' in self.antenna_data:
+            self.pr_errors = self.antenna_data.pr_sigma.values
+            self.SNR_array = self.antenna_data.snr_pr.values
+        self.cp_errors = self.antenna_data.cp_sigma.values
         self.set_phase_clock()
 
     def set_phase_clock(self):
@@ -8130,7 +8207,7 @@ class GNSSTKStores(object):
         """ Compute an analytical Jacobian using nav ephemeris and analytical delay model.
         """
         isCOM = True
-        f1 = antenna_handle.f1
+        f1 = antenna1_handle.f1
         freq1_ant = FREQ_TO_RINEX_ANT[f1]
         if self.iono_free: # iono-free only for GPS, ref frequency for precise range
             f2 = antenna_handle.f2
@@ -10942,6 +11019,20 @@ def find_diff_meas(antenna1_handle, antenna2_handle, baseline_handle=None, store
 
     return residuals
 
+def get_snr_variance(store_handle, antenna1_handle, antenna2_handle, obs_type, use_idxs, baseline_handle):
+    """ A priori C/N0-dependent variance [m^2] of the single differences baseline_handle.datetime_array[use_idxs],
+        sigma_1^2 + sigma_2^2 from the antennas' pr_errors/cp_errors.
+        Same indexing as get_obs_weights(). Zero for VLBI solutions (handled through grdel_err/phdel_err).
+    """
+    if store_handle.sol_type != 'GNSS':
+        return np.zeros(len(use_idxs))
+    times = baseline_handle.datetime_array[use_idxs]
+    _, ant1_idxs, _ = np.intersect1d(antenna1_handle.times_gps, times, return_indices=True)
+    _, ant2_idxs, _ = np.intersect1d(antenna2_handle.times_gps, times, return_indices=True)
+    errors1 = antenna1_handle.pr_errors if obs_type == 'range' else antenna1_handle.cp_errors
+    errors2 = antenna2_handle.pr_errors if obs_type == 'range' else antenna2_handle.cp_errors
+    return errors1[ant1_idxs]**2 + errors2[ant2_idxs]**2
+
 def get_obs_weights(store_handle, antenna1_handle, antenna2_handle, obs_type='range', use_idxs=[], baseline_handle=None, use_phase_weights=False):
     """ Calculate weights for observations """
     if baseline_handle is not None:
@@ -10989,29 +11080,29 @@ def get_obs_weights(store_handle, antenna1_handle, antenna2_handle, obs_type='ra
                 cov = np.diag(var_diag)
 
         elif store_handle.sol_type == 'GNSS':
+            # a priori C/N0-dependent (thermal) variance of the single difference
+            errors1 = antenna1_handle.pr_errors if obs_type == 'range' else antenna1_handle.cp_errors
+            errors2 = antenna2_handle.pr_errors if obs_type == 'range' else antenna2_handle.cp_errors
+            var_snr = errors1[ant1_idxs]**2 + errors2[ant2_idxs]**2
             if baseline_handle is None:
-                if obs_type == 'range':
-                    #weights = 1/np.sqrt(antenna1_handle.pr_errors[ant1_idxs]**2+antenna2_handle.pr_errors[ant2_idxs]**2)
-                    var_diag = antenna1_handle.pr_errors[ant1_idxs]**2+antenna2_handle.pr_errors[ant2_idxs]**2
-                elif obs_type == 'phase':
-                    if use_phase_weights is False:
-                        var_diag = 100*np.mean(antenna1_handle.pr_errors[ant1_idxs]**2+antenna2_handle.pr_errors[ant2_idxs]**2)*np.ones(len(ant1_idxs))
-                    else:
-                        var_diag = antenna1_handle.cp_errors[ant1_idxs]**2+antenna2_handle.cp_errors[ant2_idxs]**2
+                if obs_type == 'phase' and use_phase_weights is False:
+                    var_diag = 100*np.mean(antenna1_handle.pr_errors[ant1_idxs]**2+antenna2_handle.pr_errors[ant2_idxs]**2)*np.ones(len(ant1_idxs))
+                else:
+                    var_diag = var_snr
                 cov = np.diag(var_diag)
             elif obs_type == 'range' and baseline_handle.q_range != 0 and baseline_handle.q_range_satellite != 0:
                 # Construct cofactor matrices Q1 and Q2
                 Q_eta = construct_Q_eta(store_handle, baseline_handle, use_idxs)
                 Q_epsilon = np.eye(Q_eta.shape[0])  # Identity matrix
-                cov = baseline_handle.q_range_satellite**2*Q_eta + baseline_handle.q_range**2*Q_epsilon
+                cov = baseline_handle.q_range_satellite**2*Q_eta + baseline_handle.q_range**2*Q_epsilon + np.diag(var_snr)
             elif obs_type == 'phase' and baseline_handle.q_phase != 0 and baseline_handle.q_phase_satellite != 0:
                 Q_eta = construct_Q_eta(store_handle, baseline_handle, use_idxs)
                 Q_epsilon = np.eye(Q_eta.shape[0])  # Identity matrix
-                cov = baseline_handle.q_phase_satellite**2*Q_eta + baseline_handle.q_phase**2*Q_epsilon
+                cov = baseline_handle.q_phase_satellite**2*Q_eta + baseline_handle.q_phase**2*Q_epsilon + np.diag(var_snr)
             elif obs_type == 'range':
-                cov = np.diag(antenna1_handle.pr_errors[ant1_idxs]**2 + antenna2_handle.pr_errors[ant2_idxs]**2 + baseline_handle.q_range**2)
+                cov = np.diag(var_snr + baseline_handle.q_range**2)
             elif obs_type == 'phase':
-                cov = np.diag(antenna1_handle.cp_errors[ant1_idxs]**2 + antenna2_handle.cp_errors[ant2_idxs]**2 + baseline_handle.q_phase**2)
+                cov = np.diag(var_snr + baseline_handle.q_phase**2)
 
     weight_mat = np.linalg.inv(cov)
     weight_chol = np.linalg.cholesky(weight_mat) # cholesky decomposition
@@ -14775,7 +14866,7 @@ def resolve_float_amb(store_handle, state_expanded, bounds, n_ao_state, n_grav_s
                             a_fixed = np.round(iZt.dot(full_z_vec))
                         else:
                             a_fixed = np.round(iZt.dot(z_fixed[:,jdx]))
-                            state_phfloat = np.concatenate((rxpos_ao_grav,trop_state,phase_clock))
+                            state_phfloat = np.concatenate((rxpos_ao_grav,trop_state,phase_disb_state,phase_clock))
                             store_handle.hold_state(state_phfloat+1e-9)
                             amb_state_idxs_eval = []
                             bound_low_reduced = bound_low_reduced[:len(state_phfloat)]
@@ -15331,7 +15422,7 @@ def iterative_weight_adjust_ls_vce(
     no_PSD=False,
 ):
     max_iter, tol_var = 30, 1e-4
-    FIT_IRW = True
+    FIT_IRW = False
 
     ref_antenna, baselines = ls_args[0], ls_args[1]
     antenna_handles, baseline_handles = ls_args[3], ls_args[9]
@@ -15339,6 +15430,7 @@ def iterative_weight_adjust_ls_vce(
         phase_delay, use_phase_weights = True, ls_args[14]
         phase_only = True
     else:
+        FIT_IRW = False
         phase_delay, use_phase_weights = False, None
         phase_only = False
 
@@ -15366,12 +15458,18 @@ def iterative_weight_adjust_ls_vce(
                 w_vec = np.diag(W) if W.ndim == 2 else np.asarray(W)
                 if sol_type == "VLBI":
                     var_apr[num_samples:num_samples+len(w_vec)] = bl.grdel_err[idxs] ** 2
+                elif sol_type == "GNSS":
+                    # known C/N0-dependent variance, so q estimates only what is left
+                    var_apr[num_samples:num_samples+len(w_vec)] = get_snr_variance(store_handle, ai, aj, "range", idxs, bl)
             else:
                 idxs = bl.phase_data_idxs
                 W = get_obs_weights(store_handle, ai, aj, "phase", idxs, bl, use_phase_weights)
                 w_vec = np.diag(W) if W.ndim == 2 else np.asarray(W)
                 if sol_type == "VLBI":
                     var_apr[num_samples:num_samples+len(w_vec)] = bl.phdel_err[idxs] ** 2
+                elif sol_type == "GNSS":
+                    # known C/N0-dependent variance, so q estimates only what is left
+                    var_apr[num_samples:num_samples+len(w_vec)] = get_snr_variance(store_handle, ai, aj, "phase", idxs, bl)
             w_diag[num_samples:num_samples+len(w_vec)] = w_vec
             num_samples += len(w_vec)
 
@@ -15495,7 +15593,8 @@ def iterative_weight_adjust_ls_vce(
         
         if cond_N_s <= C_target:
             # no ridge necessary
-            sig_hat_s = np.linalg.solve(N_s, L_s)
+            #sig_hat_s = np.linalg.solve(N_s, L_s)
+            sig_hat_s, _ = nnls(N_s, L_s)
             lam_s     = 0.0
         else:
             print('using ridge regression to stabilize LS-VCE')
@@ -15505,7 +15604,7 @@ def iterative_weight_adjust_ls_vce(
             s_min  = max(s_min, np.spacing(s_max))           # IEEE guard
             lam_s  = (s_max - C_target * s_min) / (C_target - 1.0)
         
-            sig_hat_s = np.linalg.solve(N_s + lam_s*np.eye(len(N_s)), L_s)
+            sig_hat_s, _ = nnls(N_s + lam_s*np.eye(len(N_s)), L_s)
         
         # 5.  Back-transform to physical units:  x = S · x_s
         sig_hat = S_inv * sig_hat_s        # element-wise
@@ -15539,9 +15638,10 @@ def iterative_weight_adjust_ls_vce(
 
 
         if sig_hat_prev is not None:
-            sig_hat[len(baseline_handles):] = np.exp(np.log(sig_hat_prev[len(baseline_handles):]) + \
-                    0.5*(np.log(sig_hat[len(baseline_handles):]) - np.log(sig_hat_prev[len(baseline_handles):]))) # damp solution to prevent ping-ponging
-
+            #sig_hat[len(baseline_handles):] = np.exp(np.log(sig_hat_prev[len(baseline_handles):]) + \
+            #        0.5*(np.log(sig_hat[len(baseline_handles):]) - np.log(sig_hat_prev[len(baseline_handles):]))) # damp solution to prevent ping-ponging
+            sig_hat = np.exp(np.log(sig_hat_prev) + \
+                    0.5*(np.log(sig_hat) - np.log(sig_hat_prev))) # damp solution to prevent ping-ponging
         # ---------------- Update handles + print -------------------------
         idx = 0
         for bl in baseline_handles:
@@ -15595,11 +15695,7 @@ def iterative_weight_adjust_ls_vce(
                 if ant.antenna_name == ref_antenna or not getattr(ant, "estimate_trop", False):
                     continue
                 print(f'for antenna {ant.antenna_name}:')
-                if True: #observable == 'range':
-                    if ant.ppp_clock_active: 
-                        ant.trop_psd_rw = min(max(sig_hat[idx], 1e-3), 10)
-                    else:
-                        ant.trop_psd_rw = min(max(sig_hat[idx], 1e-3), 30)
+                ant.trop_psd_rw = min(max(sig_hat[idx], 1e-3), 30)
                 print(f"trop psd rw: {ant.trop_psd_rw} ps^2/hr")
                 idx += 1
 
@@ -16094,62 +16190,58 @@ def iterative_weight_adjust_LS_VCE_full(store_handle, state_expanded, bounds, ls
 
             r = (np.linalg.inv(weight_mat)@residuals_baseline).reshape(-1, 1)
             W_full = weight_mat@weight_mat.T
-            P_A = np.eye(W_full.shape[0])-A_mat@np.linalg.inv(A_mat.T@W_full@A_mat)@A_mat.T@W_full
+            A_mat = np.linalg.inv(weight_mat)@A_mat  # jacobian rows are weighted -- projector needs the design matrix
+            # pinv: this baseline's rows have zero columns for parameters it doesn't observe
+            P_A = np.eye(W_full.shape[0])-A_mat@np.linalg.pinv(A_mat.T@W_full@A_mat)@A_mat.T@W_full
             K_full = W_full @ P_A 
 
             # Construct cofactor matrices Q1 and Q2
             Q_eta = construct_Q_eta(store_handle, baseline_handle, use_idxs)
             Q_epsilon = np.eye(Q_eta.shape[0])  # Identity matrix
+            single_component = np.all(Q_eta == Q_epsilon)
+            Qs = [Q_epsilon] if single_component else [Q_eta, Q_epsilon]
 
-            if np.all(Q_eta == Q_epsilon):
-                # Compute N_beta_gamma and s_beta
-                N = np.trace(K_full @ Q_epsilon @ K_full @ Q_epsilon)
-                s = r.T @ K_full @ Q_epsilon @ K_full @ r
+            # known a priori C/N0-dependent variance
+            Q_0 = np.diag(get_snr_variance(store_handle, antenna1_handle, antenna2_handle, observable, use_idxs,
+                                           baseline_handle))
 
-                # Solve for variance components
-                sigma_squared_baseline = s/N
-                sigma_epsilon_squared_new[jdx] = sigma_squared_baseline[0,0]
+            # LS-VCE normal equations: N_bg = tr(K Q_g K Q_b), s_b = r'K Q_b K r - tr(K Q_b K Q_0)
+            KQ = [K_full @ Q for Q in Qs]
+            n_comp = len(Qs)
+            N = np.zeros((n_comp, n_comp))
+            s = np.zeros((n_comp, 1))
+            for beta in range(n_comp):
+                for gamma in range(n_comp):
+                    N[beta, gamma] = np.trace(KQ[gamma] @ KQ[beta])
+                s[beta] = r.T @ KQ[beta] @ K_full @ r - np.trace(KQ[beta] @ K_full @ Q_0)
 
-                # Ensure variance is positive
-                sigma_epsilon_squared_new[jdx] = max(sigma_epsilon_squared_new[jdx], 1e-10)
+            # Solve for variance components
+            try:
+                sigma_squared_baseline = np.linalg.solve(N, s).ravel()
+            except np.linalg.LinAlgError:
+                sigma_squared_baseline = np.linalg.lstsq(N, s, rcond=None)[0].ravel()
 
-                if observable == 'range':
-                    baseline_handle.q_range = np.sqrt(sigma_squared_baseline[0,0])
-                elif observable == 'phase':
-                    baseline_handle.q_phase = np.sqrt(sigma_squared_baseline[0,0])
+            # Ensure variances are positive
+            k = 0
+            if not single_component:
+                sigma_eta_squared_new[jdx] = max(sigma_squared_baseline[k], 1e-10)
+                k += 1
+            sigma_epsilon_squared_new[jdx] = max(sigma_squared_baseline[k], 1e-10)
 
-                print('sigma_epsilon')
-                print(np.sqrt(sigma_epsilon_squared_new))
-            else:
-                # Compute N_beta_gamma and s_beta
-                Qs = [Q_eta, Q_epsilon]
-                N = np.zeros((2, 2))
-                s = np.zeros((2, 1))
-                for beta in range(2):
-                    for gamma in range(2):
-                        N[beta, gamma] = np.trace(K_full @ Qs[gamma] @ K_full @ Qs[beta])
-                    s[beta] = r.T @ K_full @ Qs[beta] @ K_full @ r
+            if observable == 'range':
+                if not single_component:
+                    baseline_handle.q_range_satellite = np.sqrt(sigma_eta_squared_new[jdx])
+                baseline_handle.q_range = np.sqrt(sigma_epsilon_squared_new[jdx])
+            elif observable == 'phase':
+                if not single_component:
+                    baseline_handle.q_phase_satellite = np.sqrt(sigma_eta_squared_new[jdx])
+                baseline_handle.q_phase = np.sqrt(sigma_epsilon_squared_new[jdx])
 
-                # Solve for variance components
-                sigma_squared_baseline = np.linalg.solve(N, s)
-                sigma_eta_squared_new[jdx] = sigma_squared_baseline[0, 0]
-                sigma_epsilon_squared_new[jdx] = sigma_squared_baseline[1, 0]
-
-                # Ensure variances are positive
-                sigma_eta_squared_new[jdx] = max(sigma_eta_squared_new[jdx], 1e-10)
-                sigma_epsilon_squared_new[jdx] = max(sigma_epsilon_squared_new[jdx], 1e-10)
-
-                if observable == 'range':
-                    baseline_handle.q_range_satellite = np.sqrt(sigma_squared_baseline[0, 0])
-                    baseline_handle.q_range = np.sqrt(sigma_squared_baseline[1, 0])
-                elif observable == 'phase':
-                    baseline_handle.q_phase_satellite = np.sqrt(sigma_squared_baseline[0, 0])
-                    baseline_handle.q_phase = np.sqrt(sigma_squared_baseline[1, 0])
-
+            if not single_component:
                 print('sigma_eta')
                 print(np.sqrt(sigma_eta_squared_new))
-                print('sigma_epsilon')
-                print(np.sqrt(sigma_epsilon_squared_new))
+            print('sigma_epsilon')
+            print(np.sqrt(sigma_epsilon_squared_new))
 
         # Check convergence
         rel_change_eta = np.abs(sigma_eta_squared_new - sigma_eta_squared) / sigma_eta_squared
