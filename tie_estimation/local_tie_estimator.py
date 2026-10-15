@@ -58,14 +58,14 @@ import matplotlib.dates as mdates
 from gnsstk import std_vector_string, Position, AntennaStore, AntexData, OceanLoadTides, PoleTides, \
                   AtmLoadTides, SolarSystem, GlobalTropModel, SaasTropModel, NeillTropModel
 
-from single_diff_tools import import_key_gnss, import_vex_gnss, import_data_vlbi, import_data_vlbi_farfield, import_data_vlbi_ngs, import_data_vlbi_vgosdb, \
-                  import_data_vlbi_vda, write_SINEX, datetime64_to_mjd, map_datasets, import_data_nc_sim,\
+from single_diff_tools import import_key_gnss, import_vex_gnss, import_data_vlbi, import_data_vlbi_farfield, import_data_vlbi_vgosdb, \
+                  import_data_vlbi_vda, import_data_ngs, write_SINEX, datetime64_to_mjd, map_datasets, import_data_nc_sim,\
                   find_common_epochs, BaselineInfo, AntennaInfo, GNSSTKStores, ECEF2ECI, slip_detect_MW, slip_detect_single_freq,\
                   slip_detect_phase_delay, sample_poly_at_interval, trim_amb_Zdom, trim_amb_state, gen_phase_clock_state, adjust_stoch_params, thin_data,\
                   analyze_ls_solution, resolve_float_amb, construct_float_amb, remove_outliers, iterative_remove_outliers, calc_residuals, \
                   calc_jac, plot_time_units, read_src, date_to_common, date_to_mjd, detect_unresolved_amb_vlbi, \
                   detect_unresolved_amb_gnss, set_bounds_phase_clock, union_of_slices, get_residuals, iterative_weight_adjust, iterative_weight_adjust_ls_vce, \
-                  iterative_weight_adjust_LS_VCE_full, sample_global_poly_at_interval, gen_key, VMF3Model, get_spanning_tree, \
+                  iterative_weight_adjust_LS_VCE_full, sample_global_poly_at_interval, gen_key, VMF3Model, TropTestModel, get_spanning_tree, \
                   read_thermal_deformation_coeffs, get_obs_weights, find_cont_penalty, mcmc_correlation, ls_correlation, load_kernel_parameters, vlbi_transform_data,\
                   write_vda_phase, NavStore, fit_phase_clock_params_grdel, nearest_rinex_ant_code
 
@@ -260,6 +260,9 @@ def add_args_to_parser(parser_in):
     parser.add_argument("--ell_file",
                          help="Usage: --ell_file {FILE_NAME}. Give a VMF3 station position file for the VMF3 trop function",
                          type=str)
+    parser.add_argument("--gpt3_grid_file",
+                         help="Usage: --gpt3_grid_file {FILE_NAME}. Give a GPT3 grid file for the TropTestModel class",
+                         type=str)
     parser.add_argument("--weather_cal_antennas",
                          help="Usage: --weather_cal_antennas {ANTENNA_NAME}. Designate that an antenna has a weather calibration file that will be supplied with --cable_cal_files",
                          default=[], 
@@ -348,6 +351,16 @@ def add_args_to_parser(parser_in):
                          action="store_true",
                          default=False,
                          help="Do tropospheric delay modeling with V3GR (VMF3 GRID) model. Need --v3gr_files and --orog_file for this model.",
+                         )
+    parser.add_argument("--o_c_only",
+                         action="store_true",
+                         default=False,
+                         help="Plot group delay O-C only then exit, no estimation.",
+                         )
+    parser.add_argument("--trop_gpt3_test",
+                         action="store_true",
+                         default=False,
+                         help="Do tropospheric delay modeling with VieVS GPT3/pressure model.",
                          )
     parser.add_argument("--igs_data",
                          action="store_true",
@@ -1218,6 +1231,17 @@ def lstsq_estimation(sol_type, plot_intermediate_results, ref_antenna, store_han
     print('Executing initial range-based solution:')
     ls_args = (ref_antenna, baselines, store_handle, antenna_handles, clock_idxs, clock_poly_length, \
                    trop_idxs, trop_poly_length, disb_idxs, baseline_handles)
+    if o_c_only: 
+        sol_name='grdel'
+        bound_low = state-1e-8
+        bound_high = state+1e-8
+        bounds = (bound_low, bound_high)
+        ls_grdel = least_squares(calc_residuals, state, jac=jac, method='trf', x_scale='jac',\
+                max_nfev=100, bounds=bounds, verbose=2, xtol=1e-15, args=ls_args)
+        analyze_ls_solution(sol_type, plot_intermediate_results, ref_antenna, clock_idxs, trop_idxs, disb_idxs, ls_grdel, store_handle, antenna_handles, \
+                sol_name, baselines, n_ao_state, baseline_handles)
+        os._exit(0)
+
     bounds = (bound_low, bound_high)
     ls_grdel = least_squares(calc_residuals, state, jac=jac, method='trf', x_scale='jac',\
             max_nfev=100, bounds=bounds, verbose=2, xtol=1e-15, args=ls_args)
@@ -2068,7 +2092,11 @@ if __name__ == '__main__':
         else:
             raise InsufficientDataError("Invalid run configuration: No ephemeris files specified")
         # initialize Nav Store
-        nav_store = NavStore(eph_files)
+        from gnsstk import SP3NavDataFactory
+        ndf = SP3NavDataFactory()
+        ndf.rejectBadClocks(False)
+        nav_store = NavStore(eph_files, nav_factory=ndf)
+        #nav_store = NavStore(eph_files)
         
         ## temp
         #clk_file = eph_files[1]
@@ -2114,7 +2142,7 @@ if __name__ == '__main__':
 
     antenna_names = [antenna_name for antenna_name in args.antenna_names]
     antenna_types = [antenna_type for antenna_type in args.antenna_types]
-    if args.trop_vmf3 == True:
+    if args.trop_vmf3 == True or args.trop_gpt3_test == True:
         vmf3_stations = [vmf3_station for vmf3_station in args.vmf3_stations]
     if sol_type == 'VLBI' or args.rxpos is not None:
         if args.rxpos is None and args.vgosDB is None and args.vda_file is None:
@@ -2251,14 +2279,17 @@ if __name__ == '__main__':
             elif args.nc_sim_file is not None:
                 baseline_handles, datetime_array, source_array, point_ra_dec_array, dt_ant = import_data_nc_sim(args.nc_sim_file, \
                          antenna_names, baselines, args.key_file)
+            elif args.ngs_file is not None:
+                if args.utc2gps is None:
+                    raise ValueError('UTC2GPS cannot be none when reading NGS file')
+                baseline_handles, baselines, datetime_array, source_array, point_ra_dec_array, dt_ant, duration_dict = import_data_ngs(args.ngs_file, antenna_names, baselines, args.utc2gps)
         elif args.src_type == 'VLBI':
             if args.fringe_file is not None:
                 baseline_handles, datetime_array, source_array, point_ra_dec_array, dt_ant, duration_dict = import_data_vlbi_farfield(args.fringe_file, antenna_names, baselines, src_dict)
             elif args.ngs_file is not None:
                 if args.utc2gps is None:
                     raise ValueError('UTC2GPS cannot be none when reading NGS file')
-                # DEPRECATED
-                baseline_handles, datetime_array, source_array, point_ra_dec_array, dt_ant, duration_dict = import_data_vlbi_ngs(args.ngs_file, antenna_names, baselines, args.utc2gps)
+                baseline_handles, baselines, datetime_array, source_array, point_ra_dec_array, dt_ant, duration_dict = import_data_ngs(args.ngs_file, antenna_names, baselines, args.utc2gps)
             elif args.vda_file is not None:
                 if args.band is None:
                     raise ValueError('Must select a band when reading vgosDA')
@@ -2348,7 +2379,7 @@ if __name__ == '__main__':
             antenna_position = rxpos_all[antenna_idx]
         bulk_clock = args.bulk_clocks[antenna_idx][0]
 
-        if args.trop_vmf3 or args.trop_global or args.trop_saas or args.trop_neill:
+        if args.trop_vmf3 or args.trop_global or args.trop_saas or args.trop_neill or args.trop_gpt3_test:
             tk_pos = Position(antenna_position[0], antenna_position[1], antenna_position[2])
             if args.trop_vmf3:
                 vmf3_station = vmf3_stations[antenna_idx]
@@ -2383,6 +2414,9 @@ if __name__ == '__main__':
                 #elev = 60 
                 #Gn_h, Ge_h, Gn_w, Ge_w = tropModel.interpolate_grad(lat, lon, MJD)
                 #mfh, mfw, zhd, zwd = tropModel.interpolate_vmf3(lat, lon, ht_el, MJD, elev)
+            elif args.trop_gpt3_test:
+                vmf3_station = vmf3_stations[antenna_idx]
+                tropModel = TropTestModel(args.gpt3_grid_file, vmf3_station)
 
             elif args.trop_global:
                 tropModel = GlobalTropModel(tk_pos, time_beg)

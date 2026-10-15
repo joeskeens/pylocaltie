@@ -79,7 +79,7 @@ FACTOR_RW=1e24/const.c**2*3600 # ps^2/hr --> m^2/s
 FACTOR_IRW=1e24/const.c**2*3600**3 # ps^2/hr^3 --> m^2/s
 ALPHA_IONO=1.345e9
 #WEIGHT_RANGE = 1 
-#WEIGHT_PHASE = 10
+WEIGHT_PHASE = 10
 ELEV_WEIGHT=False
 MJD_EPOCH_IN_DT = datetime.datetime(1858, 11, 17)
 USE_SUN=False
@@ -1565,6 +1565,7 @@ def parse_ngs_file(filepath, antenna_names):
             source_positions[source] = (ra_degrees, dec_degrees)
 
     # Parse Auxiliary Parameters for frequency
+    frequency = None
     while not lines[i].startswith('$END'):
         line = lines[i]
         i += 1
@@ -1575,10 +1576,16 @@ def parse_ngs_file(filepath, antenna_names):
     i += 1  # Skip past $END of Auxiliary Parameters
 
     # Parse Data Cards
+    df_num = 1
     while i < len(lines):
         line = lines[i].strip()
         site1 = line[0:8].strip()
         site2 = line[10:18].strip()
+        df_seek = int(str(df_num) + '01')
+        df_at = int(lines[i][74:80])
+        if df_seek != df_at:
+            i+=1
+            continue
         if site1 in antenna_names and site2 in antenna_names:
             baseline_key = f'{site1}_{site2}'
             source = line[20:28].strip()
@@ -1593,6 +1600,9 @@ def parse_ngs_file(filepath, antenna_names):
             delay_err = float(lines[i+1][20:31].strip())
             quality_flag = float(lines[i+1][60:62].strip())
             fringe_phase = float(lines[i+2][40:60].strip())
+            pressure_1 = float(lines[i+5][20:29].strip())
+            pressure_2 = float(lines[i+5][30:39].strip())
+
             if quality_flag <= 0:
                 observation = {
                     'datetime': obs_datetime,
@@ -1601,15 +1611,17 @@ def parse_ngs_file(filepath, antenna_names):
                     'delay_err': delay_err,
                     'fringe_phase': fringe_phase,
                     'frequency': frequency,
+                    'pressure_1': pressure_1,
+                    'pressure_2': pressure_2,
                 }
                 if baseline_key not in baseline_observations:
                     baseline_observations[baseline_key] = []
                 baseline_observations[baseline_key].append(observation)
-        i += 8  # Skip to the next set of data cards
-
+        df_num += 1
+        i += 1
     return source_positions, baseline_observations
 
-def import_data_vlbi_ngs(ngs_file, antennas, baselines, utc2gps):
+def import_data_ngs(ngs_file, antennas, baselines, utc2gps):
     """
     Read key file and fringe file, output good data
     """
@@ -1623,6 +1635,7 @@ def import_data_vlbi_ngs(ngs_file, antennas, baselines, utc2gps):
     datetime_array_srt = np.array([],dtype=np.datetime64)
     src_time_dict = {}
     baseline_handles = []
+    baselines_final = []
     for baseline in baselines:
         antenna1 = antennas[baseline[0]]
         antenna2 = antennas[baseline[1]]
@@ -1631,7 +1644,8 @@ def import_data_vlbi_ngs(ngs_file, antennas, baselines, utc2gps):
             if antenna1 in b_key and antenna2 in b_key:
                 baseline_use = b_key
         if baseline_use is None:
-            raise ValueError('baseline ' + antenna1 +' — ' + antenna2 +' not found in fringe data')
+            print('baseline ' + antenna1 +' — ' + antenna2 +' not found in fringe data, skipping.')
+            continue
 
         data = baseline_observations[baseline_use]
         dt_utc = []
@@ -1640,6 +1654,8 @@ def import_data_vlbi_ngs(ngs_file, antennas, baselines, utc2gps):
         grdel_err = []
         phase_delays = []
         frequencies = []
+        pressure_1 = []
+        pressure_2 = []
         for obs in data:
             dt_utc.append(obs['datetime'])
             sources.append(obs['source'])
@@ -1647,9 +1663,14 @@ def import_data_vlbi_ngs(ngs_file, antennas, baselines, utc2gps):
             grdel_err.append(obs['delay_err'])
             phase_delays.append(obs['fringe_phase'])
             frequencies.append(obs['frequency'])
+            pressure_1.append(obs['pressure_1'])
+            pressure_2.append(obs['pressure_2'])
+            
         dt_utc = np.array(dt_utc)
         sources = np.array(sources)
         group_delays = np.array(group_delays)
+        pressure_1 = np.array(pressure_1)
+        pressure_2 = np.array(pressure_2)
         grdel_err = np.array(grdel_err)*const.c/1e9
         phdel_err = grdel_err/WEIGHT_PHASE # what goes here???
         
@@ -1664,23 +1685,34 @@ def import_data_vlbi_ngs(ngs_file, antennas, baselines, utc2gps):
         datetime_array = np.array(dt_gps, dtype='datetime64[ns]')
         
         for idx, source in enumerate(sources):
-            src_time_dict[datetime_array[idx]] = source
+            if datetime_array[idx] in src_time_dict and src_time_dict[datetime_array[idx]] != source:
+                src_time_dict[datetime_array[idx]] = [source, src_time_dict[datetime_array[idx]]]
+            else:
+                src_time_dict[datetime_array[idx]] = source
 
         # check if baselines match baselines array
         if baseline_use.split('_')[0] != antennas[baseline[0]]:
             # need to change the sign of the measurements
             group_delays = -group_delays
             phase_delays = -phase_delays
+            pressure_1_hold = pressure_1
+            pressure_1 = pressure_2.copy()
+            pressure_2 = pressure_1_hold.copy()
             
         group_delays = group_delays*(const.c/1e9) # group delay in meters
         # get correlation between ambiguities by adding nearest integer from group delay -- this will cause linked measurements hopefully
-        wavelength = const.c/frq
-        amb_int = np.rint(group_delays/wavelength)
+        if None not in frq:
+            wavelength = const.c/frq
+            amb_int = np.rint(group_delays/wavelength)
 
-        phase_delays = (phase_delays/(2*np.pi) + amb_int) * wavelength
+            phase_delays = (phase_delays/(2*np.pi) + amb_int) * wavelength
+        else:
+            phase_delays = group_delays
+            frq = np.ones(len(frq))
         # use frq[0] assuming frq is all the same frequency; could be broken in the future
         baseline_handle = BaselineInfo(datetime_array, frq[0])
         baseline_handle.prepare_vlbi(group_delays, phase_delays, grdel_err, phdel_err)
+        baseline_handle.hold_atm_params(pressure_1, pressure_2)
         #baseline_handle.prepare_vlbi(group_delays, phase_delays, group_delays_dual, phase_delays_dual)
         baseline_handles.append(baseline_handle)
 
@@ -1688,17 +1720,27 @@ def import_data_vlbi_ngs(ngs_file, antennas, baselines, utc2gps):
         dt_ant[antenna1] = np.union1d(dt_ant[antenna1], datetime_array)
         dt_ant[antenna2] = np.union1d(dt_ant[antenna2], datetime_array)
         datetime_array_srt = np.union1d(datetime_array_srt, datetime_array)
+        baselines_final.append(baseline)
 
     datetime_array_srt = np.array(datetime_array_srt, dtype='datetime64[ns]')
     point_ra_dec_full = []
     source_array_full = []
+    duration_dict = {}
+
     for time in datetime_array_srt: 
         source = src_time_dict[time]
-        ra, dec = src_dict[source.strip()]
-        source_array_full.append(source)
-        point_ra_dec_full.append((ra,dec))
+        # GENESIS HACK
+        if source != 'GEN-01':
+            ra, dec = src_dict[source.strip()]
+            point_ra_dec_full.append((ra,dec))
+            source_array_full.append(source)
+        else:
+            source_array_full.append('L01')
+        duration_dict[time] = 100 # often no card 7
+    if 'GEN-01' in src_dict: 
+        point_ra_dec_full = None
     print('Number of scans: ' + str(len(datetime_array_srt)))
-    return baseline_handles, datetime_array_srt, source_array_full, point_ra_dec_full, dt_ant
+    return baseline_handles, baselines_final, datetime_array_srt, source_array_full, point_ra_dec_full, dt_ant, duration_dict
 
 from collections import defaultdict
 def parse_vda_file(file_path, desired_band, antenna_names):
@@ -4296,6 +4338,10 @@ class BaselineInfo(object):
         self.cpw_2 = np.array(cpw2_arr)
         self.cpw_diff = self.cpw_2-self.cpw_1
 
+    def hold_atm_params(self, pressure_1, pressure_2):
+        self.pressure_1 = pressure_1
+        self.pressure_2 = pressure_2
+
     def combination_measurement(self, combination_type='WL'):
         """Prepare a combination carrier phase measurement, options are WL -- wide-lane, IF -- ionosphere-free
         """
@@ -5494,8 +5540,8 @@ class GNSSTKStores(object):
         if self.src_type == 'GNSS' or antenna_handle.point_ra_dec_dict is None: 
             for idx, common_time in enumerate(times_common):
                 sat_id = self.source_time_dict[times_gps[idx]]
-                RSID = RinexSatID(str(sat_id))
                 rxpos = antenna_handle.pos_series[idx,:]
+                RSID = RinexSatID(str(sat_id))
                 sat_xvt = self.nav_store.get_xvt(RSID, common_time)
                 rxpos_gnsstk = Position(rxpos[0], rxpos[1], rxpos[2])
                 sat_pos_gnsstk = Position(sat_xvt.x[0], sat_xvt.x[1], sat_xvt.x[2])
@@ -5636,9 +5682,12 @@ class GNSSTKStores(object):
                 PCV_L1 = antennaPCOData.getPhaseCenterVariation(freq1_ant, azimuth, elevation)
                 rxpos_L1 = rxpos + ROT@offset_f1 - PCV_L1*1e-3*rx2sat
  
-            sat_pos_L1 = self.sat_adj_PC(freq1, sat_antenna, times_gps[idx], eph_time, sat_xvt.x, rx2sat)
-            if self.iono_free:
-                sat_pos_dual = self.sat_adj_PC(freq2, sat_antenna, times_gps[idx], eph_time, sat_xvt.x, rx2sat)
+            if sat_id[0] != 'L':
+                sat_pos_L1 = self.sat_adj_PC(freq1, sat_antenna, times_gps[idx], eph_time, sat_xvt.x, rx2sat)
+                if self.iono_free:
+                    sat_pos_dual = self.sat_adj_PC(freq2, sat_antenna, times_gps[idx], eph_time, sat_xvt.x, rx2sat)
+            else:
+                sat_pos_L1 = sat_pos
 
             pr_model, sat_xvt_corr = self.get_pr_model(RSID, common_time, times_gps[idx], \
                     sat_antenna, rxpos_L1, freq1, sat_pos_L1, sat_vel)
@@ -6367,10 +6416,12 @@ class GNSSTKStores(object):
                 if self.iono_free:
                     PCV_dual = antennaPCOData2.getPhaseCenterVariation(freq2_ant, azimuth, elevation)
                     rxpos2_dual = rxpos2 + ROT@(offset2_dual) - PCV_dual*1e-3*rx2sat2
-           
-            sat_pos_L1 = self.sat_adj_PC(freq1, sat_antenna, times_gps[idx], eph_time, sat_xvt.x, 0, noPCV=True)
-            if self.iono_free:
-                sat_pos_dual = self.sat_adj_PC(freq2, sat_antenna, times_gps[idx], eph_time, sat_xvt.x, 0, noPCV=True)
+            if sat_id[0] != 'L': # LEO
+                sat_pos_L1 = self.sat_adj_PC(freq1, sat_antenna, times_gps[idx], eph_time, sat_xvt.x, 0, noPCV=True)
+                if self.iono_free:
+                    sat_pos_dual = self.sat_adj_PC(freq2, sat_antenna, times_gps[idx], eph_time, sat_xvt.x, 0, noPCV=True)
+            else:
+                sat_pos_L1 = sat_pos
 
             if self.analyticalDelay is True:
                 delay, sat_xvt_corr = self.get_delay_model(RSID, common_time, times_gps[idx], \
@@ -6389,11 +6440,18 @@ class GNSSTKStores(object):
             rx2sat1 /= np.linalg.norm(rx2sat1) # normalize vector
             rx2sat2 = sat_pos - rxpos2
             rx2sat2 /= np.linalg.norm(rx2sat2) # normalize vector
-            PCV_delay1 = self.sat_PCV_delay(freq1, sat_antenna, times_gps[idx], eph_time, sat_xvt_corr.x, rx2sat1)
-            PCV_delay2 = self.sat_PCV_delay(freq1, sat_antenna, times_gps[idx], eph_time, sat_xvt_corr.x, rx2sat2)
-            if self.iono_free:
-                PCV_dual_delay1 = self.sat_PCV_delay(freq2, sat_antenna, time_gps[idx], eph_time, sat_xvt_dual.x, rx2sat1)
-                PCV_dual_delay2 = self.sat_PCV_delay(freq2, sat_antenna, time_gps[idx], eph_time, sat_xvt_dual.x, rx2sat2)
+            if sat_id[0] != 'L': # LEO
+                PCV_delay1 = self.sat_PCV_delay(freq1, sat_antenna, times_gps[idx], eph_time, sat_xvt_corr.x, rx2sat1)
+                PCV_delay2 = self.sat_PCV_delay(freq1, sat_antenna, times_gps[idx], eph_time, sat_xvt_corr.x, rx2sat2)
+                if self.iono_free:
+                    PCV_dual_delay1 = self.sat_PCV_delay(freq2, sat_antenna, time_gps[idx], eph_time, sat_xvt_dual.x, rx2sat1)
+                    PCV_dual_delay2 = self.sat_PCV_delay(freq2, sat_antenna, time_gps[idx], eph_time, sat_xvt_dual.x, rx2sat2)
+            else:
+                PCV_delay1 = 0 
+                PCV_delay2 = 0
+                if self.iono_free:
+                    PCV_dual_delay1 = 0
+                    PCV_dual_delay2 = 0
 
             rxpos1_gnsstk = Position(rxpos1_L1[0], rxpos1_L1[1], rxpos1_L1[2])
             rxpos2_gnsstk = Position(rxpos2_L1[0], rxpos2_L1[1], rxpos2_L1[2])
@@ -6417,6 +6475,9 @@ class GNSSTKStores(object):
                     T, P, H = antenna2_handle.interpolate_weather(times_gps[idx])
                     antenna2_handle.tropModel.setWeather(T, P, H)
                     antenna2_handle.tropModel.setHumidity(H)
+                elif getattr(antenna1_handle.tropModel, 'test_trop', False) is not None:
+                    antenna1_handle.tropModel.P_insitu = baseline_handle.pressure_1[idx]
+                    antenna2_handle.tropModel.P_insitu = baseline_handle.pressure_2[idx]
 
                 try: trop_delay1 = antenna1_handle.tropModel.correction(rxpos1_gnsstk, sat_pos_gnsstk, common_time)
                 except:
@@ -6441,7 +6502,6 @@ class GNSSTKStores(object):
             else:
                 trop_delay1 = 0
                 trop_delay2 = 0
-
             if antenna1_handle.estimate_grav_def is True:
                 #grav_delay1 = antenna1_handle.grav_def_model[0]*np.sin(np.deg2rad(elevation1)) + antenna1_handle.grav_def_model[1]*np.cos(np.deg2rad(elevation1))
                 grav_delay1 = antenna1_handle.grav_def_model[0]*np.deg2rad(elevation1) + antenna1_handle.grav_def_model[1]*np.deg2rad(elevation1)**2
@@ -7608,7 +7668,8 @@ class GNSSTKStores(object):
         common_time.addSeconds(delta_1) # reset common time to epoch
         sat_pos_mdt1 = np.array([sat_xvt_mdt1.x[0],sat_xvt_mdt1.x[1],sat_xvt_mdt1.x[2]])
         sat_vel_mdt1 = np.array([sat_xvt_mdt1.v[0],sat_xvt_mdt1.v[1],sat_xvt_mdt1.v[2]])
-        sat_pos_mdt1 = self.sat_adj_PC(freq, sat_antenna, time_gps, eph_time, sat_xvt_mdt1.x, 0, noPCV=True)
+        if RSID.toString()[0] != 'L':
+            sat_pos_mdt1 = self.sat_adj_PC(freq, sat_antenna, time_gps, eph_time, sat_xvt_mdt1.x, 0, noPCV=True)
 
         # adjust new satellite position for PCO/PCV
         x0_dt1, v0_dt1 = ECEF2ECI(-delta_1, sat_pos_mdt1, sat_vel_mdt1)
@@ -7648,7 +7709,10 @@ class GNSSTKStores(object):
             # correct for LOS change due to Earth rotation -- this is where the rx 'sees' the satellite
             # NB: neglecting change in rx2sat vector 
             eph_time.addSeconds(dt_0)
-            sat_pos_final = self.sat_adj_PC(freq, sat_antenna, time_gps, eph_time, sat_xvt_corr.x, 0, noPCV=True)
+            if RSID.toString()[0] != 'L':
+                sat_pos_final = self.sat_adj_PC(freq, sat_antenna, time_gps, eph_time, sat_xvt_corr.x, 0, noPCV=True)
+            else:
+                sat_pos_final = np.array([sat_xvt_corr.x[0], sat_xvt_corr.x[1], sat_xvt_corr.x[2]])
             sat_vel_final = np.array([sat_xvt_corr.v[0],sat_xvt_corr.v[1],sat_xvt_corr.v[2]])
             x0_final, v0_final = ECEF2ECI(dt_0, sat_pos_mdt1, sat_vel_mdt1, no_velcorr=True)
             for idx in range(3):
@@ -7793,7 +7857,10 @@ class GNSSTKStores(object):
         sat_vel_mt0 = np.array([sat_xvt_mt0.v[0],sat_xvt_mt0.v[1],sat_xvt_mt0.v[2]])
         time_mt0 = time_gps - np.timedelta64(int(t0*1e9),'ns')
         eph_time.addSeconds(-t0)
-        sat_pos_mt0 = self.sat_adj_PC(freq, sat_antenna, time_mt0, eph_time, sat_xvt_mt0.x, 0, noPCV=True)
+        if RSID.toString()[0] != 'L':
+            sat_pos_mt0 = self.sat_adj_PC(freq, sat_antenna, time_mt0, eph_time, sat_xvt_mt0.x, 0, noPCV=True)
+        else:
+            sat_pos_mt0 = np.array([sat_xvt_mt0.x[0],sat_xvt_mt0.x[1],sat_xvt_mt0.x[2]])
         satpos_gcrf, satvel_gcrf = self.get_gcrf_posvel(sat_pos_mt0, sat_vel_mt0, eph_time)
         #satpos_gcrf, satvel_gcrf = ECEF2ECI(-t0, sat_pos_mt0, sat_vel_mt0)
 
@@ -7967,7 +8034,10 @@ class GNSSTKStores(object):
             time_t0 = time_gps - np.timedelta64(int(t0*1e9),'ns')
             rx2sat_mt0 = sat_x_mt0 - rxpos
             rx2sat_mt0 /= np.linalg.norm(rx2sat_mt0) # normalize vector
-            sat_pos_itrf = self.sat_adj_PC(freq, sat_antenna, time_t0, eph_time, sat_xvt_mt0.x, rx2sat_mt0)
+            if RSID.toString()[0] != 'L':
+                sat_pos_itrf = self.sat_adj_PC(freq, sat_antenna, time_t0, eph_time, sat_xvt_mt0.x, rx2sat_mt0)
+            else:
+                sat_pos_itrf = np.array([sat_xvt_mt0.x[0],sat_xvt_mt0.x[1],sat_xvt_mt0.x[2]])
             sat_vel_itrf = np.array([sat_xvt_mt0.v[0],sat_xvt_mt0.v[1],sat_xvt_mt0.v[2]])
 
             # transform to GCRF
@@ -8360,10 +8430,13 @@ class GNSSTKStores(object):
                 if self.iono_free:
                     PCV_dual = antennaPCOData1.getPhaseCenterVariation(freq2_ant, azimuth2, elevation2)
                     rxpos2_dual = rxpos2 + ROT@(offset2_dual) - PCV_dual*1e-3*rx2sat2
-
-            sat_pos_L1 = self.sat_adj_PC(freq1, sat_antenna, times_gps[idx], eph_time, sat_xvt.x, 0, noPCV=True)
-            if self.iono_free:
-                sat_pos_dual = self.sat_adj_PC(freq2, sat_antenna, times_gps[idx], eph_time, sat_xvt.x, 0, noPCV=True)
+            
+            if sat_id[0] != 'L':
+                sat_pos_L1 = self.sat_adj_PC(freq1, sat_antenna, times_gps[idx], eph_time, sat_xvt.x, 0, noPCV=True)
+                if self.iono_free:
+                    sat_pos_dual = self.sat_adj_PC(freq2, sat_antenna, times_gps[idx], eph_time, sat_xvt.x, 0, noPCV=True)
+            else:
+                sat_pos_L1 = sat_pos
             
             if ant_deriv == 1:
                 dtau_dx1 = self.get_delay_model(RSID, common_time, times_gps[idx], \
@@ -8924,7 +8997,6 @@ def _norm_lon_deg(lon_deg: float) -> float:
     if x == 360.0:
         x = 0.0
     return x
-
 
 class VMF3Model:
     """
@@ -9705,6 +9777,367 @@ class VMF3Model:
         Gn_w = vmf3_grad_epoch[2]
         Ge_w = vmf3_grad_epoch[3]
         return Gn_h, Ge_h, Gn_w, Ge_w
+
+DAO_GRADIENTS = {
+    'AIRA':      (    -0.56,    -0.025),
+    'ALGOPARK':  (    -0.46,    -0.015),
+    'AUSTINTX':  (    -0.25,     0.046),
+    'AZORES':    (    -0.11,    -0.071),
+    'BADARY':    (    -0.26,    -0.058),
+    'BERMUDA':   (    -0.26,    0.0042),
+    'BLKBUTTE':  (    -0.14,     0.082),
+    'BLOOMIND':  (     -0.4,   -0.0002),
+    'BR-VLBA':   (    -0.17,     0.031),
+    'BREST':     (    -0.27,   -0.0055),
+    'CARNUSTY':  (    -0.35,     0.017),
+    'CARROLGA':  (    -0.28,     0.021),
+    'CHICHI10':  (    -0.25,     -0.24),
+    'CHLBOLTN':  (    -0.28,   -0.0034),
+    'CRIMEA':    (    -0.16,   0.00058),
+    'CTVASBAY':  (    -0.49,     0.073),
+    'CTVASTJ':   (    -0.46,      0.12),
+    'DAITO':     (    -0.18,    -0.021),
+    'DEADMANL':  (   -0.088,     0.077),
+    'DSS13':     (   -0.086,     0.067),
+    'DSS15':     (   -0.086,     0.067),
+    'DSS45':     (     0.24,    0.0073),
+    'DSS65':     (    -0.14,    0.0041),
+    'DSS65A':    (    -0.14,    0.0041),
+    'EFLSBERG':  (     -0.3,      0.01),
+    'ELY':       (    -0.16,     0.015),
+    'FD-VLBA':   (    -0.24,    -0.019),
+    'FLAGSTAF':  (    -0.15,      0.07),
+    'FORT ORD':  (    -0.11,     0.042),
+    'FORTLEZA':  (    0.018,    -0.047),
+    'FORTORDS':  (    -0.11,      0.04),
+    'FTD 7900':  (    -0.24,    -0.019),
+    'GBT-VLBA':  (    -0.42,    -0.021),
+    'GGAO7108':  (     -0.4,    -0.036),
+    'GIFU11':    (     -0.5,     0.032),
+    'GIFU3':     (     -0.5,     0.032),
+    'GILCREEK':  (    -0.18,     0.034),
+    'GOLDECHO':  (    -0.23,      0.14),
+    'GOLDMARS':  (   -0.086,     0.067),
+    'GOLDVENU':  (   -0.086,     0.068),
+    'GORF7102':  (     -0.4,    -0.036),
+    'GRASSE':    (    -0.08,    -0.032),
+    'HALEAKAL':  (    -0.13,    -0.079),
+    'HART15M':   (      0.1,   -0.0011),
+    'HARTRAO':   (      0.1,   -0.0011),
+    'HATCREEK':  (    -0.13,     0.066),
+    'HAYSTACK':  (    -0.43,    -0.024),
+    'HN-VLBA':   (    -0.43,    -0.022),
+    'HOBART12':  (     0.29,    0.0081),
+    'HOBART26':  (     0.29,    0.0081),
+    'HOFN':      (    -0.25,     0.034),
+    'HOHENFRG':  (    -0.31,    -0.026),
+    'HOHNBERG':  (    -0.19,    -0.028),
+    'HRAS 085':  (    -0.24,    -0.019),
+    'JPL MV1':   (   -0.095,     0.054),
+    'KAINAN':    (    -0.57,      0.18),
+    'KANOZAN':   (    -0.64,     -0.14),
+    'KARLBURG':  (     -0.3,    -0.028),
+    'KASHIM11':  (     -0.5,     0.032),
+    'KASHIM34':  (     -0.5,     0.032),
+    'KASHIMA':   (     -0.5,     0.032),
+    'KATH12M':   (     0.29,    -0.022),
+    'KAUAI':     (    -0.19,    -0.022),
+    'KIRSBERG':  (    -0.29,    -0.036),
+    'KODIAK':    (    -0.16,     0.047),
+    'KOGANEI':   (    -0.43,     -0.18),
+    'KOGANEI3':  (    -0.43,     -0.18),
+    'KOKEE':     (    -0.19,    -0.022),
+    'KP-VLBA':   (    -0.19,      0.13),
+    'KUNMING':   (    -0.61,     -0.11),
+    'KWAJAL26':  (    -0.29,    -0.091),
+    'LA-VLBA':   (    -0.17,     0.013),
+    'LEONRDOK':  (    -0.31,     0.028),
+    'MADRID64':  (    -0.14,    0.0041),
+    'MAMMOTHL':  (   -0.084,     0.066),
+    'MARCUS':    (    -0.15,    0.0012),
+    'MARPOINT':  (     -0.4,    -0.044),
+    'MATERA':    (    -0.11,    -0.034),
+    'MCD 7850':  (    -0.24,    -0.018),
+    'MEDICINA':  (   -0.093,    -0.032),
+    'METSAHOV':  (    -0.29,    -0.005),
+    'METSHOVI':  (    -0.29,    -0.005),
+    'MIAMI20':   (    -0.18,     0.025),
+    'MILESMON':  (    -0.32,    -0.081),
+    'MIURA':     (    -0.65,     -0.12),
+    'MIYAZAKI':  (    -0.53,     0.021),
+    'MIZNAO10':  (    -0.49,    -0.092),
+    'MIZUSGSI':  (    -0.49,    -0.092),
+    'MK-VLBA':   (   -0.084,    -0.088),
+    'MOJ 7288':  (   -0.086,     0.067),
+    'MOJAVE12':  (   -0.086,     0.067),
+    'MON PEAK':  (    -0.14,     0.089),
+    'MV2ONSLA':  (    -0.29,    -0.013),
+    'NL-VLBA':   (    -0.37,    -0.035),
+    'NOBEY 6M':  (    -0.51,     0.063),
+    'NOBEYAMA':  (    -0.51,     0.063),
+    'NOME':      (    -0.11,     0.037),
+    'NOTO':      (    -0.15,    -0.083),
+    'NRAO 140':  (    -0.42,    -0.021),
+    'NRAO20':    (    -0.42,    -0.021),
+    'NRAO85 1':  (    -0.42,    -0.021),
+    'NRAO85 3':  (    -0.42,    -0.022),
+    'NYALES20':  (    -0.19,    0.0022),
+    'OCOTILLO':  (    -0.14,      0.09),
+    'OHIGGINS':  (     0.42,     -0.03),
+    'ONSALA60':  (    -0.29,    -0.013),
+    'ONSALA85':  (    -0.29,    -0.013),
+    'OV-VLBA':   (    -0.09,      0.07),
+    'OVR 7853':  (    -0.09,      0.07),
+    'OVRO 130':  (    -0.09,      0.07),
+    'PARKES':    (     0.25,     0.014),
+    'PBLOSSOM':  (   -0.091,     0.059),
+    'PENTICTN':  (    -0.17,     0.027),
+    'PIETOWN':   (    -0.18,     0.049),
+    'PINFLATS':  (    -0.14,     0.083),
+    'PLATTVIL':  (    -0.24,    -0.044),
+    'PRESIDIO':  (    -0.12,     0.064),
+    'PT REYES':  (   -0.099,    -0.015),
+    'PVERDES':   (    -0.15,     0.048),
+    'QUINCY':    (   -0.095,     0.073),
+    'RAEGYEB':   (    -0.15,     0.004),
+    'RICHMOND':  (    -0.18,     0.025),
+    'ROBLED32':  (    -0.14,    0.0041),
+    'SAGARA':    (    -0.51,     0.048),
+    'SANPAULA':  (    -0.11,     0.057),
+    'SANTIA12':  (     0.24,      0.19),
+    'SC-VLBA':   (   -0.089,     -0.12),
+    'SEATTLE1':  (    -0.24,     0.035),
+    'SEJONG':    (    -0.53,     0.021),
+    'SESHAN25':  (    -0.61,     -0.11),
+    'SEST':      (     0.14,      0.14),
+    'SHANGHAI':  (    -0.62,     -0.11),
+    'SINTOTU':   (    -0.43,     0.023),
+    'SINTOTU3':  (    -0.43,     0.023),
+    'SNDPOINT':  (    -0.22,     0.061),
+    'SOURDOGH':  (    -0.14,      0.05),
+    'SUWON':     (    -0.59,     0.079),
+    'SVETLOE':   (    -0.29,    0.0055),
+    'SYOWA':     (        0,         0),
+    'TATEYAMA':  (    -0.64,     -0.14),
+    'TIANMA65':  (    -0.61,     -0.11),
+    'TIDBIN64':  (     0.26,     0.083),
+    'TIGOCONC':  (     0.14,      0.23),
+    'TIGOWTZL':  (    -0.26,    -0.044),
+    'TITIJIMA':  (    -0.23,   -0.0014),
+    'TOMAKO11':  (    -0.41,      -0.1),
+    'TOULOUSE':  (    -0.17,     -0.04),
+    'TROMSONO':  (     -0.3,    0.0051),
+    'TRYSILNO':  (    -0.24,   -0.0073),
+    'TSUKU3':    (    -0.55,     0.032),
+    'TSUKUB32':  (    -0.55,     0.032),
+    'TSUKUBA':   (    -0.55,     0.032),
+    'UCHINOUR':  (    -0.49,    -0.092),
+    'URUMQI':    (    -0.26,    -0.058),
+    'USSURISK':  (    -0.37,    -0.053),
+    'USUDA64':   (    -0.55,     0.065),
+    'VERAIRIK':  (    -0.57,     0.025),
+    'VERAISGK':  (    -0.57,     0.025),
+    'VERAMZSW':  (    -0.57,     0.025),
+    'VERAOGSW':  (    -0.57,     0.025),
+    'VERNAL':    (     -0.2,     0.022),
+    'VICTORIA':  (    -0.18,     0.036),
+    'VLA':       (    -0.18,      0.05),
+    'VLA-N8':    (    -0.18,      0.05),
+    'VNDNBERG':  (    -0.14,     0.004),
+    'WARK12M':   (     0.42,     0.071),
+    'WESTFORD':  (    -0.43,    -0.024),
+    'WETTZ13N':  (    -0.26,    -0.044),
+    'WETTZ13S':  (    -0.26,    -0.044),
+    'WETTZELL':  (    -0.26,    -0.044),
+    'WHTHORSE':  (    -0.15,      0.04),
+    'YAKATAGA':  (   -0.086,     0.072),
+    'YARRA12M':  (     0.45,      0.13),
+    'YEBES':     (    -0.15,     0.004),
+    'YEBES40M':  (    -0.15,     0.004),
+    'YELLOWKN':  (    -0.29,    -0.068),
+    'YLOW7296':  (    -0.29,    -0.068),
+    'YUMA':      (    -0.18,     0.078),
+    'ZELENCHK':  (    -0.16,   0.00058),
+    'KVNPC':     (    -0.53,     0.021),
+    'KVNTN':     (    -0.53,     0.021),
+    'KVNUS':     (    -0.53,     0.021),
+    'KVNYS':     (    -0.53,     0.021),
+    'MOPRA':     (     0.25,     0.014),
+}
+GM_GPT3 = 9.80665
+DMTR_GPT3 = 28.965e-3
+RG_GPT3 = 8.3143
+ 
+class TropTestModel(VMF3Model):
+    def __init__(self, gpt3_grid_file, station, grid_res=5):
+        super().__init__('station', station=station)
+        self.vmf3_type = 'GPT3'          # forces the correction_azel() branch
+        self.load_gpt3_grid(gpt3_grid_file, grid_res)
+        self.test_trop = True
+ 
+        self.P_insitu = None             # hPa
+        self.T_insitu = None             # deg C
+        self.elev = None
+        self.mfh = self.mfw = None
+        self.zhd = None
+        self.zwd = 0.0
+ 
+        # DAO mean site gradients [mm], constant per station.
+        # dao.m returns zero for unlisted stations with no warning; matched here.
+        key = station.ljust(8)[:8].rstrip()
+        self.Gn, self.Ge = DAO_GRADIENTS.get(key, (0.0, 0.0))
+        self.dao_found = key in DAO_GRADIENTS
+ 
+    # ------------------------------------------------------------- grid input
+    def load_gpt3_grid(self, grid_file, grid_res=5):
+        """gpt3_5.grd / gpt3_1.grd, 64 columns:
+        lat lon p(5) T(5) Q(5) dT(5) undu Hs ah(5) aw(5) la(5) Tm(5)
+        Gn_h(5) Ge_h(5) Gn_w(5) Ge_w(5),  each (5) = A0 A1 B1 A2 B2.
+        Rows: lat descending from 90-res/2, lon ascending from res/2.
+        Pressure is in Pa, temperature in K."""
+        d = np.loadtxt(grid_file, comments='%')
+        self.grid_res = grid_res
+        self._gpt3 = {'p':  d[:,  2:7],           # Pa
+                      'T':  d[:,  7:12],          # K
+                      'Q':  d[:, 12:17] * 1e-3,   # g/kg -> kg/kg
+                      'dT': d[:, 17:22] * 1e-3,   # K/km -> K/m
+                      'ah': d[:, 24:29] * 1e-3,   # grid stores a_h x 1000
+                      'aw': d[:, 29:34] * 1e-3}   # grid stores a_w x 1000
+        self._gpt3_undu = d[:, 22]
+        self._gpt3_Hs = d[:, 23]
+ 
+        self.lat_all = np.arange(90 - grid_res/2, -90 - 1e-9, -grid_res)
+        self.lon_all = np.arange(grid_res/2, 360 + 1e-9, grid_res)
+        self.nlat, self.nlon = len(self.lat_all), len(self.lon_all)
+        self.N = self.nlat * self.nlon
+        if d.shape[0] != self.N:
+            raise ValueError('GPT3 grid has {} rows, expected {} for {} deg'
+                             .format(d.shape[0], self.N, grid_res))
+        if d.shape[1] != 64:
+            raise ValueError('GPT3 grid has {} columns, expected 64'.format(d.shape[1]))
+ 
+    @staticmethod
+    def _seasonal(coefs, doy):
+        """coefs: (...,5) = A0 A1 B1 A2 B2."""
+        w = 2.0 * np.pi * doy / 365.25
+        return (coefs[..., 0] + coefs[..., 1]*np.cos(w) + coefs[..., 2]*np.sin(w)
+                + coefs[..., 3]*np.cos(2*w) + coefs[..., 4]*np.sin(2*w))
+ 
+    # ------------------------------------------------------- b/c at a point
+    def _vmf3_bc(self, lat_deg, lon_deg, doy):
+        """Empirical b_h, b_w, c_h, c_w at one location. Same evaluation as
+        interpolate_station_vmf3(), factored out."""
+        nmax = 12
+        polDist = np.pi/2.0 - np.deg2rad(lat_deg)
+        x = np.sin(polDist) * np.cos(np.deg2rad(lon_deg))
+        y = np.sin(polDist) * np.sin(np.deg2rad(lon_deg))
+        z = np.cos(polDist)
+        V, W = self._compute_VW(x, y, z, nmax=nmax)
+        pairs = [(n, m) for n in range(nmax + 1) for m in range(n + 1)]
+        Vnm = np.array([V[n, m] for (n, m) in pairs])
+        Wnm = np.array([W[n, m] for (n, m) in pairs])
+ 
+        w1 = 2.0 * np.pi * doy / 365.25
+        seas = np.array([1.0, np.cos(w1), np.sin(w1), np.cos(2*w1), np.sin(2*w1)])
+ 
+        def val(anm, bnm):
+            cols = np.sum(np.asarray(anm)*Vnm[:, None]
+                          + np.asarray(bnm)*Wnm[:, None], axis=0)
+            return float(cols @ seas)
+ 
+        return (val(self.anm_bh, self.bnm_bh), val(self.anm_bw, self.bnm_bw),
+                val(self.anm_ch, self.bnm_ch), val(self.anm_cw, self.bnm_cw))
+ 
+    @staticmethod
+    def _mapping_from_abc(a, b, c, el_rad):
+        se = np.sin(el_rad)
+        return ((1 + a/(1 + b/(1 + c)))
+                / (se + a/(se + b/(se + c))))
+ 
+    # --------------------------------------------------------- GPT3 products
+    def interpolate_gpt3(self, lat_deg, lon_deg, h_ell, mjd, el_deg):
+        """Returns (mfh, mfw). a_h/a_w bilinear from the grid, b/c at station,
+        Niell hydrostatic height correction with absolute h_ell (vmf3_ht.m)."""
+        doy = self._mjd_to_doy(mjd)
+        idx4, lat4, lon4 = self._surrounding_indices(lat_deg, lon_deg)
+ 
+        a_h = self._bilinear_vmf3(lat4, lon4, lat_deg, lon_deg,
+                                  self._seasonal(self._gpt3['ah'][idx4], doy))
+        a_w = self._bilinear_vmf3(lat4, lon4, lat_deg, lon_deg,
+                                  self._seasonal(self._gpt3['aw'][idx4], doy))
+ 
+        b_h, b_w, c_h, c_w = self._vmf3_bc(lat_deg, lon_deg, doy)
+        el = np.deg2rad(el_deg)
+        mfh = self._mapping_from_abc(a_h, b_h, c_h, el)
+        mfw = self._mapping_from_abc(a_w, b_w, c_w, el)
+ 
+        a_ht, b_ht, c_ht = 2.53e-5, 5.49e-3, 1.14e-3
+        se = np.sin(el)
+        ht_corr_coef = (1/se - (1 + a_ht/(1 + b_ht/(1 + c_ht)))
+                        / (se + a_ht/(se + b_ht/(se + c_ht))))
+        mfh = mfh + ht_corr_coef * h_ell/1000.0
+        return float(mfh), float(mfw)
+ 
+    def interpolate_gpt3_pressure(self, lat_deg, lon_deg, h_ell, mjd):
+        """Fallback when no in-situ met: GPT3 pressure [hPa] reduced from grid
+        height to station height (gpt3_5.m). Grid p is Pa, T is K."""
+        doy = self._mjd_to_doy(mjd)
+        idx4, lat4, lon4 = self._surrounding_indices(lat_deg, lon_deg)
+        p0 = self._seasonal(self._gpt3['p'][idx4], doy)          # Pa
+        T0 = self._seasonal(self._gpt3['T'][idx4], doy)          # K
+        Q0 = self._seasonal(self._gpt3['Q'][idx4], doy)          # kg/kg
+        H_grid = self._gpt3_Hs[idx4] + self._gpt3_undu[idx4]     # -> ellipsoidal
+        Tv = T0 * (1 + 0.6077 * Q0)
+        cc = GM_GPT3 * DMTR_GPT3 / (RG_GPT3 * Tv)
+        p4 = p0 * np.exp(-cc * (h_ell - H_grid)) / 100.0         # hPa
+        return self._bilinear_vmf3(lat4, lon4, lat_deg, lon_deg, p4)
+ 
+    # -------------------------------------------------------------- weather
+    def setWeather(self, T, P, H):
+        """Not a no-op, unlike VMF3Model: 'p(in situ)' drives the ZHD."""
+        self.T_insitu = T
+        self.P_insitu = P
+ 
+    def setHumidity(self, H):
+        return
+ 
+    # ------------------------------------------------------------ correction
+    @staticmethod
+    def _zhd_saastamoinen(p_hpa, lat_deg, h_ell):
+        return 0.0022768 * p_hpa / (1 - 0.00266*np.cos(2*np.deg2rad(lat_deg))
+                                    - 0.28e-6*h_ell)
+ 
+    def correction_azel(self, rx_gnsstk, azim, elev, common_time):
+        geo_pos = rx_gnsstk.asGeodetic(WGS84Ellipsoid())
+        lat, lon, h_ell = geo_pos[0], geo_pos[1], geo_pos[2]
+        MJD = common_time.getDays() - 2400001.0 + GPS2UTC/SECONDS_PER_DAY
+ 
+        mfh, mfw = self.interpolate_gpt3(lat, lon, h_ell, MJD, elev)
+        p = (self.P_insitu if self.P_insitu is not None
+             else self.interpolate_gpt3_pressure(lat, lon, h_ell, MJD))
+        zhd = self._zhd_saastamoinen(p, lat, h_ell)
+ 
+        a_rad, e_rad = np.deg2rad(azim), np.deg2rad(elev)
+        # DAO: one total gradient pair, C = 0.0032 (dao.m). NOT the
+        # 0.0031/0.0007 hydrostatic/wet split used with VMF3/GRAD gradients.
+        mfg = 1.0 / (np.sin(e_rad)*np.tan(e_rad) + 0.0032)
+        trop_delay = mfh*zhd + mfg*(self.Gn*np.cos(a_rad)
+                                    + self.Ge*np.sin(a_rad)) * 1e-3
+ 
+        self.elev, self.mfh, self.mfw = elev, mfh, mfw
+        self.zhd, self.zwd = zhd, 0.0
+        return trop_delay
+ 
+    def correction(self, rx_gnsstk, tx_gnsstk, common_time):
+        return self.correction_azel(rx_gnsstk,
+                                    rx_gnsstk.azimuthGeodetic(tx_gnsstk),
+                                    rx_gnsstk.elevationGeodetic(tx_gnsstk),
+                                    common_time)
+ 
+    # mfw stays a real GPT3 wet mapping function -- it is the ZWD partial.
+    # Only the a priori ZWD is zero.
+    def wet_zenith_delay(self):
+        return 0.0
 
 
 def mapping_from_abc(a: float, b: float, c: float, el_rad: float) -> float:
@@ -11190,7 +11623,10 @@ def iterative_remove_outliers(store_handle, ls_sol, bounds, ls_args, res_fcn, ja
         for jdx, baseline_handle in enumerate(baseline_handles): # generate differential measurements on the baselines
             T_medfilt = 1800 # s
             t_delta = np.mean(np.diff((baseline_handle.datetime_array-baseline_handle.datetime_array[0])/np.timedelta64(1, 's')))
-            N_window = int(np.round(T_medfilt/t_delta))
+            if len(baseline_handle.datetime_array) > 1:
+                N_window = int(np.round(T_medfilt/t_delta))
+            else: 
+                N_window = 1
             if N_window % 2 == 0:
                 N_window += 1 # must be odd
             if phase_only is False:
@@ -12378,7 +12814,8 @@ def analyze_ls_solution(sol_type, plot_results, ref_antenna, clock_idxs, trop_id
         
         time_deltas_full = (times_gps - times_gps[0])/np.timedelta64(1, 's')
         full_time_hr = np.round(time_deltas_full[-1]/3600) 
-        interval_hr = int(np.ceil(full_time_hr/8))       
+        interval_hr = int(np.ceil(full_time_hr/8))      
+        if interval_hr ==0: interval_hr = 1 
         
         # print baseline-specific quantities
         #if baseline[0] < ref_idx:
@@ -12466,11 +12903,12 @@ def analyze_ls_solution(sol_type, plot_results, ref_antenna, clock_idxs, trop_id
             # Formatting the date on the x-axis
             plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d %H:%M'))
             plt.gca().xaxis.set_major_locator(mdates.HourLocator(interval=interval_hr))  # Adjust interval as needed
-            plt.gcf().autofmt_xdate()  # Auto-rotate date labels
+            #plt.gcf().autofmt_xdate()  # Auto-rotate date labels
             
             plt.title('final '+label1+' residuals (' + antenna2_handle.antenna_name + '—' + antenna1_handle.antenna_name + ')')
             plt.ylabel('meas. residuals (m)')
             plt.grid(True)
+
             if iono_free is True:
                 plt.savefig(sol_type+'_'+sol_name+'_meas_residuals_'+antenna2_handle.antenna_name+'_' + antenna1_handle.antenna_name + 'ionofree.png')
             else:
@@ -16907,7 +17345,6 @@ def calc_residuals(state, ref_antenna, baselines, store_handle, antenna_handles,
         antenna2_handle = antenna_handles[2]
         times, ant1_idxs, ant2_idxs = np.intersect1d(antenna1_handle.times_gps, antenna2_handle.times_gps, return_indices=True)
         source_array = np.array([store_handle.source_time_dict[time] for time in times])
-        breakpoint()
         print(residuals[residuals>1e5])
         print(source_array[residuals>1e5])
         print(times[residuals>1e5])

@@ -1,6 +1,7 @@
 name: pylocaltie
 channels:
   - conda-forge
+  - nodefaults
 dependencies:
   - pip
   - scipy

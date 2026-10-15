@@ -28,6 +28,12 @@
    ```
    ./build.sh -e -i $CONDA_PREFIX -j $(nproc) -- -DCMAKE_BUILD_TYPE=release
    ```
+   NB: this may be fixed, but the last time I built I had to do,
+   ```
+   sed -i 's/-std=c++11/-std=c++17/' BuildSetup.cmake
+   CXXFLAGS="-include cstdint -Wno-deprecated" \
+   ./build.sh -e -i $CONDA_PREFIX -j $(nproc) -- -DCMAKE_BUILD_TYPE=release
+   ```
    You also may need to install swig, cmake, etc. into your conda environment if they aren't already on your machine:
    ```
    conda install -c conda-forge cmake "swig<4.3" compilers make
