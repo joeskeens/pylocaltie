@@ -833,7 +833,10 @@ def find_clock_trop_params(sol_type, antenna_handles, store_handle, trop_poly_le
                 ref_handle = antenna_handle
             if store_handle.stochastic_clock:
                 antenna_handle.clock_times = antenna_handle.times_gps
-            if store_handle.stochastic_trop: 
+                # phase clock starts on the range clock epochs (needed by adj_clock_ns in the far-field
+                # prefit); redefined by adjust_stoch_params(phase=True)
+                antenna_handle.phase_clock_times = antenna_handle.times_gps
+            if store_handle.stochastic_trop:
                 antenna_handle.trop_times = antenna_handle.times_gps
     else:
         for idx, antenna_handle in enumerate(antenna_handles):
