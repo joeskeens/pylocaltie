@@ -5593,10 +5593,13 @@ class GNSSTKStores(object):
     def merge_mixed_model(self, baseline_handle, attr, model_idxs, values, n_obs):
         """ --src_type mixed: insert the values modeled for the observations model_idxs into the
             full-length baseline array attr (the other observations are filled by the other model) """
-        if self.src_type != 'mixed' or len(values) == 0:
+        if self.src_type != 'mixed':
             return values
         full_values = getattr(baseline_handle, attr, None)
-        if full_values is None or len(full_values) != n_obs:
+        full_length = full_values is not None and len(full_values) == n_obs
+        if len(values) == 0 and (len(model_idxs) > 0 or not full_length):
+            return values # quantity not modeled in this call (e.g. group delay with phase_only)
+        if not full_length:
             full_values = np.full(n_obs, np.nan)
         else:
             full_values = np.array(full_values, dtype=float) # copy
