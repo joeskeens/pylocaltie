@@ -2265,10 +2265,10 @@ if __name__ == '__main__':
             full_data[rinex_file] = rinex_data
             
         # parse or generate schedule
-        antennas_array = None # participating antennas at each epoch of a sub-arrayed schedule (vex only)
+        antennas_array = None # participating antennas at each epoch of a sub-arrayed schedule (key/vex)
         if args.key_file is not None:
-            datetime_array, source_array, point_ra_dec_array, dt_key, duration_key, source_key, point_key  \
-                    = import_key_gnss(rinex_files, full_data, args.key_file)
+            datetime_array, source_array, point_ra_dec_array, dt_key, duration_key, source_key, point_key, antennas_array \
+                    = import_key_gnss(rinex_files, full_data, args.key_file, antenna_names=antenna_names)
         elif args.vex_file is not None:
             datetime_array, source_array, point_ra_dec_array, dt_key, duration_key, source_key, point_key, antennas_array \
                     = import_vex_gnss(rinex_files, full_data, args.vex_file, antenna_names=antenna_names)

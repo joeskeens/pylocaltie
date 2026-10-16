@@ -729,10 +729,7 @@ def read_vex(vex_file, stations=None, sat_only=True, return_stations=False):
  
 # ----------------------------------------------------------------------------
 # shared expansion of a schedule into per-epoch arrays
-# (body lifted verbatim from import_key_gnss -- that function can now be:
-#      def import_key_gnss(rinex_files, full_data, key_file, sim_data_rate=1):
-#          return _expand_schedule_gnss(rinex_files, full_data, sim_data_rate,
-#                                       *read_key(key_file))
+# (used by import_key_gnss and import_vex_gnss)
 # ----------------------------------------------------------------------------
  
 def _expand_schedule_gnss(rinex_files, full_data, sim_data_rate, sources_ra_dec,
@@ -801,11 +798,14 @@ def _expand_schedule_gnss(rinex_files, full_data, sim_data_rate, sources_ra_dec,
         full_source = full_source_names[time_idx]
         if len(sources_ra_dec) > 0:
             source_idx = np.argwhere(sources_ra_dec == full_source)
-            if len(source_idx) == 0 and len(ra_array) > 0:
+            if len(source_idx) == 0 and len(ra_array) > 0 and SV_PATTERN.match(src) is None:
                 raise Exception('Source ' + full_source + ' in schedule has no dish pointing angle')
         if len(ra_array) > 0:
-            ra = ra_array[source_idx[0][0]]
-            dec = dec_array[source_idx[0][0]]
+            if len(source_idx) > 0:
+                ra = ra_array[source_idx[0][0]]
+                dec = dec_array[source_idx[0][0]]
+            else: # satellite listed without coordinates (e.g. satname/TLE block of the key file)
+                ra, dec = None, None
             point_ra_dec.append((ra, dec))
  
         if len(times_arr) > 0:
@@ -818,7 +818,7 @@ def _expand_schedule_gnss(rinex_files, full_data, sim_data_rate, sources_ra_dec,
             if sub_array:
                 antennas_full.append(scan_antennas)
     print('Number of scans: ' + str(nscans))
-    if len(point_ra_dec_full) == 0:
+    if len(point_ra_dec_full) == 0 or all(point[0] is None for point in point_ra_dec_full):
         point_ra_dec_full = None
  
     if scan_stations is not None:
@@ -846,76 +846,18 @@ def import_vex_gnss(rinex_files, full_data, vex_file, sim_data_rate=1,
                                  *read_vex(vex_file, stations=stations, sat_only=sat_only, return_stations=True),
                                  antenna_names=antenna_names)
 
-def import_key_gnss(rinex_files, full_data, key_file, sim_data_rate=1):
+def import_key_gnss(rinex_files, full_data, key_file, sim_data_rate=1, antenna_names=None):
     """
     Read key file and output source arrays corresponding to good data.
+    If antenna_names (order of rinex_files) is given, the schedule is treated as sub-arrayed
+    (STATIONS= before each scan): an extra output gives the participating antenna names at
+    each epoch (see thin_data).
     NB: currently supports only single-frequency
     """
-    sources_ra_dec, full_source_names, duration_array, source_array, ra_array, dec_array, datetime_array, scan_nums = read_key(key_file)
-
-    # find all data within duration and with relevant quantities
-    source_array_full = []
-    datetime_array_full = []
-    point_ra_dec_full = []
-    point_ra_dec = []
-    nscans=0
-    for time_idx, time_obs in enumerate(datetime_array):
-        times_arr = []
-        src = source_array[time_idx]
-        if len(rinex_files)>0:
-            for ant_idx, rinex_file in enumerate(rinex_files):
-                rinex_obs = full_data[rinex_file]
-                beg_time = time_obs 
-                end_time = time_obs + to_timedelta(duration_array[time_idx], unit='s')
-                try: 
-                    obs_sv = rinex_obs.sel(sv=src).dropna(dim='time',how='all')
-                    obs_time = obs_sv.sel(time=slice(beg_time,end_time))
-                except: # no observations of the satellite at this epoch
-                    times_arr = []
-                    break
-                # check that data is good
-                SNR_vars = [var for var in obs_time.data_vars if var.startswith('S')]
-                idxs_good = np.zeros(len(obs_time.time.values), dtype=bool)
-                for SNR_var in SNR_vars:
-                    idxs_good = np.bitwise_or(idxs_good, ~np.isnan(obs_time[str(SNR_var)].values))
-                    
-                #idxs_good = np.bitwise_and(~np.isnan(obs_time.C1.values), ~np.isnan(obs_time.S1C.values))
-                if ant_idx == 0: 
-                    times_arr = np.array(obs_time.time)
-                else:
-                    times_arr = np.union1d(times_arr, np.array(obs_time.time[idxs_good]))
-        else:
-            if sim_data_rate != 0: 
-                duration = duration_array[time_idx]
-                time_dt = np.datetime64(time_obs, 'ns')
-                end_time = time_dt  + np.timedelta64(int(duration*1e9), 'ns')
-                times_arr = np.arange(time_dt, end_time + np.timedelta64(int(sim_data_rate*1e9), 'ns'), np.timedelta64(int(sim_data_rate*1e9), 'ns'))
-            else:
-                times_arr = [np.datetime64(time_obs, 'ns')]
-
-        full_source = full_source_names[time_idx]
-        if len(sources_ra_dec)>0:
-            source_idx = np.argwhere(sources_ra_dec==full_source)
-            if len(source_idx) == 0 and len(ra_array) > 0:
-                raise Exception('Source ' + full_source + ' in key file has no dish pointing angle')
-        if len(ra_array) > 0:
-            ra = ra_array[source_idx[0][0]]
-            dec = dec_array[source_idx[0][0]]
-            point_ra_dec.append((ra,dec))
-
-        if len(times_arr)>0:
-            # we have observations of this source
-            nscans+=1
-        for time in times_arr:
-            datetime_array_full.append(time)
-            source_array_full.append(src)
-            if len(ra_array) > 0:
-                point_ra_dec_full.append((ra, dec))
-    print('Number of scans: ' + str(nscans))
-    if len(point_ra_dec_full) == 0:
-        point_ra_dec_full = None
-
-    return datetime_array_full, source_array_full, point_ra_dec_full, datetime_array, duration_array, source_array, point_ra_dec
+    if antenna_names is None:
+        return _expand_schedule_gnss(rinex_files, full_data, sim_data_rate, *read_key(key_file))
+    return _expand_schedule_gnss(rinex_files, full_data, sim_data_rate,
+                                 *read_key(key_file, return_stations=True), antenna_names=antenna_names)
 
 
 def read_thermal_deformation_coeffs(ant_info_file, antenna_handles):
@@ -1073,9 +1015,11 @@ def read_src(filename):
             src_dict[ivs_name] = (ra,dec)
     return src_dict
 
-def read_key(key_file):
+def read_key(key_file, return_stations=False):
     """
     Read key file and output source arrays corresponding to good data.
+    return_stations: also return, for each scan, the set of participating station
+                     names (upper case, from STATIONS=) for sub-arrayed schedules.
     """
     # Regular expressions
     year_pattern = re.compile(r'year=\s*(\d{4})')
@@ -1094,24 +1038,28 @@ def read_key(key_file):
     dec_array = []
     sources_ra_dec = []
     scan_nums = []
+    scan_stations = []
+    stations_current = set()
     UTC2GPS = 0
     # Reading the key file
     with open(key_file, 'r') as f:
         lines = f.readlines()
     
         for line in lines:
+            if line.strip().upper().startswith('STATIONS'):
+                # stations of the following scans (sub-arrays change this between scans)
+                stations_current = {station.strip().upper() for station in line.split('=', 1)[1].split(',') if station.strip()}
+                continue
             # Extracting year, day and start
             test_year = year_pattern.search(line)
             if test_year is None and not line.startswith("source"): 
                 continue # header line -- skip
             elif line.startswith("source"):
-                # source right ascension and declination 
-                parts = line.split()
-                source = parts[1].strip("'")
-                hms_split = parts[2].split('=')
-                hms = hms_split[1]
-                dms_split = parts[3].split('=')
-                dms = dms_split[1]
+                # source right ascension and declination, e.g. source='3C144   '  RA=05:34:31.9700  DEC=+22:00:52.100
+                source_match = re.search(r"source\s*=?\s*'\s*([^']*?)\s*'", line)
+                source = source_match.group(1) if source_match is not None else line.split()[1].strip("'")
+                hms = re.search(r'RA\s*=\s*(\S+)', line).group(1)
+                dms = re.search(r'DEC\s*=\s*(\S+)', line).group(1)
                 ra = hms_to_deg(hms)
                 dec = dms_to_deg(dms)
            
@@ -1127,6 +1075,7 @@ def read_key(key_file):
 
                 parts = line.split()
                 scan_nums.append(parts[13])
+                scan_stations.append(stations_current)
                 
                 # Using datetime to combine the information
                 dt = datetime.datetime(year, 1, 1) + datetime.timedelta(days=day-1, hours=hour, minutes=minute, seconds=second)
@@ -1141,9 +1090,12 @@ def read_key(key_file):
                 # Extracting source
                 source = source_pattern.search(line).group(1)
                 full_source_names.append(source)
-                if len(source) > 3:
+                if len(source) > 3 and SV_PATTERN.match(source[0] + source[2] + source[3]) is not None:
                     # E01523203
                     source_array.append(source[0] + source[2] + source[3])
+                elif len(source) > 3:
+                    # natural radio source, e.g. 3C144
+                    source_array.append(source)
                 else:
                     # E15
                     source_array.append(source[0:3])
@@ -1155,6 +1107,8 @@ def read_key(key_file):
     
     sources_ra_dec = np.array(sources_ra_dec)
 
+    if return_stations:
+        return sources_ra_dec, full_source_names, duration_array, source_array, ra_array, dec_array, datetime_array, scan_nums, scan_stations
     return sources_ra_dec, full_source_names, duration_array, source_array, ra_array, dec_array, datetime_array, scan_nums 
 
 def read_psolve_file(psolve_file):
