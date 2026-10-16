@@ -485,7 +485,16 @@ def dms_to_deg(dms):
 
 # RINEX3 satellite ID, e.g. E25, G07, C13
 SV_PATTERN = re.compile(r'^[GREJCIS]\d{2}$')
- 
+# near-field (ephemeris) source ID for --src_type mixed: GNSS or LEO (e.g. L01)
+NEAR_FIELD_PATTERN = re.compile(r'^[GREJCISL]\d{2}$')
+
+def source_map(handle, store_handle):
+    """ Epoch->source map of an antenna or baseline handle. Sub-arrays observe different sources
+        at the same epoch, so the map belongs to the handle; falls back to the experiment-wide map. """
+    if getattr(handle, 'source_time_dict', None) is not None:
+        return handle.source_time_dict
+    return store_handle.source_time_dict
+
 # ----------------------------------------------------------------------------
 # low-level VEX parsing helpers
 # ----------------------------------------------------------------------------
@@ -565,7 +574,7 @@ def _vex_seconds(field):
 # VEX equivalent of read_key()
 # ----------------------------------------------------------------------------
  
-def read_vex(vex_file, stations=None, sat_only=True):
+def read_vex(vex_file, stations=None, sat_only=True, return_stations=False):
     """
     Read a VEX schedule file and output the same arrays as read_key().
  
@@ -578,24 +587,32 @@ def read_vex(vex_file, stations=None, sat_only=True):
                          from these stations only.  Default (None) uses every station in the scan.
         sat_only (bool): keep only scans whose source maps to a RINEX satellite ID
                          (drops fringe-check/calibrator scans on natural sources).
+        return_stations (bool): also return, for each scan, the set of participating
+                         station IDs and site names (upper case) for sub-arrayed schedules.
  
     Returns:
         sources_ra_dec, full_source_names, duration_array, source_array,
-        ra_array, dec_array, datetime_array, scan_nums
+        ra_array, dec_array, datetime_array, scan_nums[, scan_stations]
     """
     blocks = _vex_blocks(vex_file)
  
     # --- station ID <-> site name map (from $SITE, cross-checked with $STATION) ---
     id_of = {}
+    names_of_id = {} # station ID -> {ID, site def name, site_name} (upper case)
     for site_name, stmts in _vex_defs(blocks.get('SITE', [])).items():
         site_id = site_name
+        site_names = {site_name.upper()}
         for stmt in stmts:
             if stmt.lower().startswith('site_id'):
                 site_id = _vex_value(stmt)
+            elif stmt.lower().startswith('site_name'):
+                site_names.add(_vex_value(stmt).upper())
         id_of[site_id.upper()] = site_id
         id_of[site_name.upper()] = site_id
+        names_of_id.setdefault(site_id, {site_id.upper()}).update(site_names)
     for station_id in _vex_defs(blocks.get('STATION', [])):
         id_of.setdefault(station_id.upper(), station_id)
+        names_of_id.setdefault(station_id, {station_id.upper()})
  
     if stations is not None:
         stations_use = []
@@ -634,16 +651,18 @@ def read_vex(vex_file, stations=None, sat_only=True):
     full_source_names = []
     duration_array = []
     scan_nums = []
+    scan_stations = []
     UTC2GPS = 0
  
     scan_num = None
     start_dt = None
     source = None
     offsets = []
+    scan_station_ids = []
     for stmt in blocks.get('SCHED', []):
         low = stmt.lower()
         if low.startswith('scan '):
-            scan_num, start_dt, source, offsets = stmt[5:].strip(), None, None, []
+            scan_num, start_dt, source, offsets, scan_station_ids = stmt[5:].strip(), None, None, [], []
         elif low.startswith('start'):
             start_dt = _vex_epoch(_vex_value(stmt))
         elif low.startswith('source'):
@@ -654,6 +673,7 @@ def read_vex(vex_file, stations=None, sat_only=True):
             if stations_use is not None and station_id not in stations_use:
                 continue
             offsets.append((_vex_seconds(fields[1]), _vex_seconds(fields[2])))
+            scan_station_ids.append(station_id)
         elif low.startswith('endscan'):
             if start_dt is None or source is None or len(offsets) == 0:
                 continue
@@ -684,6 +704,7 @@ def read_vex(vex_file, stations=None, sat_only=True):
             full_source_names.append(source)
             source_array.append(src_id)
             duration_array.append(end - beg)
+            scan_stations.append(set().union(*[names_of_id.get(sid, {sid.upper()}) for sid in scan_station_ids]))
  
     # --- pointing directions: only useful if every scheduled source has real coordinates.
     # Satellite sources are usually placeholders (00h00m00s / +00d00'00") in a VEX file.
@@ -699,6 +720,9 @@ def read_vex(vex_file, stations=None, sat_only=True):
             dec_array.append(src_coords[src][1])
     sources_ra_dec = np.array(sources_ra_dec)
  
+    if return_stations:
+        return sources_ra_dec, full_source_names, duration_array, source_array, \
+               ra_array, dec_array, datetime_array, scan_nums, scan_stations
     return sources_ra_dec, full_source_names, duration_array, source_array, \
            ra_array, dec_array, datetime_array, scan_nums
  
@@ -713,18 +737,35 @@ def read_vex(vex_file, stations=None, sat_only=True):
  
 def _expand_schedule_gnss(rinex_files, full_data, sim_data_rate, sources_ra_dec,
                           full_source_names, duration_array, source_array,
-                          ra_array, dec_array, datetime_array, scan_nums):
-    """ Expand a scan schedule to per-epoch arrays, keeping only good data """
+                          ra_array, dec_array, datetime_array, scan_nums,
+                          scan_stations=None, antenna_names=None):
+    """ Expand a scan schedule to per-epoch arrays, keeping only good data.
+        With scan_stations (per-scan station names) and antenna_names (order of rinex_files),
+        each scan uses only the antennas of its sub-array, and the participating antenna names
+        of each epoch are returned as an extra output (None if not sub-arrayed). """
     source_array_full = []
     datetime_array_full = []
     point_ra_dec_full = []
     point_ra_dec = []
+    antennas_full = []
     nscans = 0
+    sub_array = scan_stations is not None and antenna_names is not None
+    if sub_array:
+        schedule_names = set().union(*scan_stations)
+        missing = [name for name in antenna_names if name.upper() not in schedule_names]
+        if len(missing) > 0:
+            print('Antenna(s) ' + ', '.join(missing) + ' not in schedule stations -- ignoring sub-arrays')
+            sub_array = False
     for time_idx, time_obs in enumerate(datetime_array):
         times_arr = []
         src = source_array[time_idx]
-        if len(rinex_files) > 0:
+        if sub_array:
+            scan_antennas = {name for name in antenna_names if name.upper() in scan_stations[time_idx]}
+        if len(rinex_files) > 0 and (not sub_array or len(scan_antennas) >= 2):
+            first_antenna = True
             for ant_idx, rinex_file in enumerate(rinex_files):
+                if sub_array and antenna_names[ant_idx] not in scan_antennas:
+                    continue # antenna is in another sub-array during this scan
                 rinex_obs = full_data[rinex_file]
                 beg_time = time_obs
                 end_time = time_obs + to_timedelta(duration_array[time_idx], unit='s')
@@ -740,10 +781,13 @@ def _expand_schedule_gnss(rinex_files, full_data, sim_data_rate, sources_ra_dec,
                 for SNR_var in SNR_vars:
                     idxs_good = np.bitwise_or(idxs_good, ~np.isnan(obs_time[str(SNR_var)].values))
  
-                if ant_idx == 0:
+                if first_antenna:
                     times_arr = np.array(obs_time.time)
+                    first_antenna = False
                 else:
                     times_arr = np.union1d(times_arr, np.array(obs_time.time[idxs_good]))
+        elif len(rinex_files) > 0:
+            times_arr = [] # fewer than 2 antennas in this scan's sub-array
         else:
             if sim_data_rate != 0:
                 duration = duration_array[time_idx]
@@ -771,24 +815,36 @@ def _expand_schedule_gnss(rinex_files, full_data, sim_data_rate, sources_ra_dec,
             source_array_full.append(src)
             if len(ra_array) > 0:
                 point_ra_dec_full.append((ra, dec))
+            if sub_array:
+                antennas_full.append(scan_antennas)
     print('Number of scans: ' + str(nscans))
     if len(point_ra_dec_full) == 0:
         point_ra_dec_full = None
  
+    if scan_stations is not None:
+        return datetime_array_full, source_array_full, point_ra_dec_full, \
+               datetime_array, duration_array, source_array, point_ra_dec, \
+               (antennas_full if sub_array else None)
     return datetime_array_full, source_array_full, point_ra_dec_full, \
            datetime_array, duration_array, source_array, point_ra_dec
  
  
 def import_vex_gnss(rinex_files, full_data, vex_file, sim_data_rate=1,
-                    stations=None, sat_only=True):
+                    stations=None, sat_only=True, antenna_names=None):
     """
     Read a VEX schedule file and output source arrays corresponding to good data.
     Drop-in replacement for import_key_gnss() with a VEX file in place of the key file.
+    If antenna_names (order of rinex_files) is given, the schedule is treated as sub-arrayed:
+    an extra output gives the participating antenna names at each epoch (see thin_data).
  
     NB: currently supports only single-frequency
     """
+    if antenna_names is None:
+        return _expand_schedule_gnss(rinex_files, full_data, sim_data_rate,
+                                     *read_vex(vex_file, stations=stations, sat_only=sat_only))
     return _expand_schedule_gnss(rinex_files, full_data, sim_data_rate,
-                                 *read_vex(vex_file, stations=stations, sat_only=sat_only))
+                                 *read_vex(vex_file, stations=stations, sat_only=sat_only, return_stations=True),
+                                 antenna_names=antenna_names)
 
 def import_key_gnss(rinex_files, full_data, key_file, sim_data_rate=1):
     """
@@ -1167,6 +1223,7 @@ def import_data_vlbi(fringe_file, antennas, baselines, rinex_sats, key_file=None
 
     duration_dict = {}
     sources_dict = {}
+    obs_pairs = set() # (epoch, source) -- sub-arrays observe different sources at the same epoch
     
     if False: # key_file is not None:
         datetime_array_srt = np.array(deepcopy(datetime_array_full))
@@ -1273,6 +1330,7 @@ def import_data_vlbi(fringe_file, antennas, baselines, rinex_sats, key_file=None
 
             for idx, time in enumerate(dt_psolve):
                 sources_dict[time] = sources[idx].strip()
+            obs_pairs.update(zip(dt_psolve, [source.strip() for source in sources]))
 
         for idx, time in enumerate(np.array(dt_psolve, dtype='datetime64[ns]')):
             duration_dict[time] = dur[idx]
@@ -1294,6 +1352,7 @@ def import_data_vlbi(fringe_file, antennas, baselines, rinex_sats, key_file=None
         # use frq[0] assuming frq is all the same frequency; could be broken in the future
         baseline_handle = BaselineInfo(datetime_array, frq[0])
         baseline_handle.prepare_vlbi(group_delays, phase_delays, grdel_err, phdel_err)
+        baseline_handle.hold_sources([source.strip() for source in sources])
         #baseline_handle.prepare_vlbi(group_delays, phase_delays, grdel_err, phdel_err, group_delays_dual, phase_delays_dual)
         baseline_handles.append(baseline_handle)
         baselines_final.append(baseline)
@@ -1312,7 +1371,10 @@ def import_data_vlbi(fringe_file, antennas, baselines, rinex_sats, key_file=None
         source_array_full = np.array(source_array_key)[idxs_full]
     else:
         point_ra_dec_full = []
-        source_array_full = [sources_dict[time] for time in datetime_array_srt]
+        # one entry per (epoch, source): an epoch repeats if sub-arrays observe different sources
+        obs_pairs = sorted(obs_pairs)
+        datetime_array_srt = [pair[0] for pair in obs_pairs]
+        source_array_full = [pair[1] for pair in obs_pairs]
     
     datetime_array_srt = np.array(datetime_array_srt, dtype='datetime64[ns]')
     print('Number of scans: ' + str(len(datetime_array_srt)))
@@ -1429,6 +1491,7 @@ def import_data_nc_sim(nc_file, antennas, baselines, key_file=None):
         # get correlation between ambiguities by adding nearest integer from group delay -- this will cause linked measurements hopefully
         baseline_handle = BaselineInfo(datetime_array, freq)
         baseline_handle.prepare_vlbi(group_delays, phase_delays, grdel_err, phdel_err)
+        baseline_handle.hold_sources(source_array_full)
         #baseline_handle.prepare_vlbi(group_delays, phase_delays, grdel_err, phdel_err, group_delays_dual, phase_delays_dual)
         baseline_handles.append(baseline_handle)
         baselines_final.append(baseline)
@@ -1454,8 +1517,7 @@ def import_data_vlbi_farfield(fringe_file, antennas, baselines, src_dict):
 
     duration_dict = {}
 
-    datetime_array_srt = np.array([],dtype=np.datetime64)
-    src_time_dict = {}
+    obs_pairs = set() # (epoch, source) -- sub-arrays observe different sources at the same epoch
     baseline_handles = []
     baselines_final = []
     for baseline in baselines:
@@ -1499,9 +1561,8 @@ def import_data_vlbi_farfield(fringe_file, antennas, baselines, src_dict):
             dt_psolve[idx] = dt_psolve[idx] + datetime.timedelta(seconds=TAI2GPS)
  
         datetime_array = np.array(dt_psolve, dtype='datetime64[ns]')
-        
-        for idx, source in enumerate(sources):
-            src_time_dict[datetime_array[idx]] = source
+
+        obs_pairs.update(zip(datetime_array, sources))
 
         # check if psolve baselines match baselines array
         #if baseline_use.split()[0] != antennas[baseline[0]]:
@@ -1520,6 +1581,7 @@ def import_data_vlbi_farfield(fringe_file, antennas, baselines, src_dict):
         # use frq[0] assuming frq is all the same frequency; could be broken in the future
         baseline_handle = BaselineInfo(datetime_array, frq[0])
         baseline_handle.prepare_vlbi(group_delays, phase_delays, grdel_err, phdel_err)
+        baseline_handle.hold_sources(sources)
         #baseline_handle.prepare_vlbi(group_delays, phase_delays, grdel_err, phdel_err, group_delays_dual, phase_delays_dual)
         baseline_handles.append(baseline_handle)
         baselines_final.append(baseline)
@@ -1530,16 +1592,15 @@ def import_data_vlbi_farfield(fringe_file, antennas, baselines, src_dict):
         # add observed epochs to datetimes for each antenna
         dt_ant[antenna1] = np.union1d(dt_ant[antenna1], datetime_array)
         dt_ant[antenna2] = np.union1d(dt_ant[antenna2], datetime_array)
-        datetime_array_srt = np.union1d(datetime_array_srt, datetime_array)
 
-    datetime_array_srt = np.array(datetime_array_srt, dtype='datetime64[ns]')
+    # one entry per (epoch, source): an epoch repeats if sub-arrays observe different sources
+    obs_pairs = sorted(obs_pairs)
+    datetime_array_srt = np.array([pair[0] for pair in obs_pairs], dtype='datetime64[ns]')
     point_ra_dec_full = []
     source_array_full = []
-    for time in datetime_array_srt: 
-        source = src_time_dict[time]
-        ra, dec = src_dict[source.strip()]
+    for time, source in obs_pairs:
         source_array_full.append(source)
-        point_ra_dec_full.append((ra,dec))
+        point_ra_dec_full.append(src_dict.get(source.strip())) # None for satellites not in the source file
     print('Number of scans: ' + str(len(datetime_array_srt)))
     return baseline_handles, baselines_final, datetime_array_srt, source_array_full, point_ra_dec_full, dt_ant, duration_dict
 
@@ -1610,7 +1671,7 @@ def parse_ngs_file(filepath, antenna_names):
         site1 = line[0:8].strip()
         site2 = line[10:18].strip()
         df_seek = int(str(df_num) + '01')
-        df_at = int(lines[i][74:80])
+        df_at = int(lines[i].split()[-1]) # card number overflows cols 75-80 past 9999 observations
         if df_seek != df_at:
             i+=1
             continue
@@ -1660,8 +1721,7 @@ def import_data_ngs(ngs_file, antennas, baselines, utc2gps):
     for ant in antennas:
         dt_ant[ant] = np.array([],dtype=np.datetime64)
 
-    datetime_array_srt = np.array([],dtype=np.datetime64)
-    src_time_dict = {}
+    obs_pairs = set() # (epoch, source) -- sub-arrays observe different sources at the same epoch
     baseline_handles = []
     baselines_final = []
     for baseline in baselines:
@@ -1711,12 +1771,10 @@ def import_data_ngs(ngs_file, antennas, baselines, utc2gps):
             dt_gps[idx] = dt_utc[idx] + datetime.timedelta(seconds=utc2gps)
  
         datetime_array = np.array(dt_gps, dtype='datetime64[ns]')
-        
-        for idx, source in enumerate(sources):
-            if datetime_array[idx] in src_time_dict and src_time_dict[datetime_array[idx]] != source:
-                src_time_dict[datetime_array[idx]] = [source, src_time_dict[datetime_array[idx]]]
-            else:
-                src_time_dict[datetime_array[idx]] = source
+
+        # GENESIS HACK: satellite GEN-01 is RINEX ID L01
+        sources = np.array(['L01' if source == 'GEN-01' else source for source in sources])
+        obs_pairs.update(zip(datetime_array, sources))
 
         # check if baselines match baselines array
         if baseline_use.split('_')[0] != antennas[baseline[0]]:
@@ -1737,31 +1795,27 @@ def import_data_ngs(ngs_file, antennas, baselines, utc2gps):
         baseline_handle = BaselineInfo(datetime_array, frq[0])
         baseline_handle.prepare_vlbi(group_delays, phase_delays, grdel_err, phdel_err)
         baseline_handle.hold_atm_params(pressure_1, pressure_2)
+        baseline_handle.hold_sources(sources)
         #baseline_handle.prepare_vlbi(group_delays, phase_delays, group_delays_dual, phase_delays_dual)
         baseline_handles.append(baseline_handle)
 
         # add observed epochs to datetimes for each antenna
         dt_ant[antenna1] = np.union1d(dt_ant[antenna1], datetime_array)
         dt_ant[antenna2] = np.union1d(dt_ant[antenna2], datetime_array)
-        datetime_array_srt = np.union1d(datetime_array_srt, datetime_array)
         baselines_final.append(baseline)
 
-    datetime_array_srt = np.array(datetime_array_srt, dtype='datetime64[ns]')
+    # one entry per (epoch, source): an epoch repeats if sub-arrays observe different sources
+    obs_pairs = sorted(obs_pairs)
+    datetime_array_srt = np.array([pair[0] for pair in obs_pairs], dtype='datetime64[ns]')
     point_ra_dec_full = []
     source_array_full = []
     duration_dict = {}
 
-    for time in datetime_array_srt: 
-        source = src_time_dict[time]
-        # GENESIS HACK
-        if source != 'GEN-01':
-            ra, dec = src_dict[source.strip()]
-            point_ra_dec_full.append((ra,dec))
-            source_array_full.append(source)
-        else:
-            source_array_full.append('L01')
+    for time, source in obs_pairs:
+        point_ra_dec_full.append(src_dict.get(source.strip())) # None for satellites without a source card
+        source_array_full.append(source)
         duration_dict[time] = 100 # often no card 7
-    if 'GEN-01' in src_dict: 
+    if all(point is None for point in point_ra_dec_full):
         point_ra_dec_full = None
     print('Number of scans: ' + str(len(datetime_array_srt)))
     return baseline_handles, baselines_final, datetime_array_srt, source_array_full, point_ra_dec_full, dt_ant, duration_dict
@@ -2293,8 +2347,7 @@ def import_data_vlbi_vda(vda_file, antennas, baselines, band):
     for ant in antennas:
         dt_ant[ant] = np.array([],dtype=np.datetime64)
 
-    datetime_array_srt = np.array([],dtype=np.datetime64)
-    src_time_dict = {}
+    obs_pairs = set() # (epoch, source) -- sub-arrays observe different sources at the same epoch
     duration_dict = {}
     baseline_handles = []
     baselines_final = []
@@ -2342,9 +2395,8 @@ def import_data_vlbi_vda(vda_file, antennas, baselines, band):
             dt_gps[idx] = dt_tai[idx] + datetime.timedelta(seconds=TAI2GPS)
  
         datetime_array = np.array(dt_gps, dtype='datetime64[ns]')
-        
-        for idx, source in enumerate(sources):
-            src_time_dict[datetime_array[idx]] = source
+
+        obs_pairs.update(zip(datetime_array, sources))
 
         # check if baselines match baselines array
         #if baseline_use.split('_')[0] != antennas[baseline[0]]:
@@ -2367,6 +2419,7 @@ def import_data_vlbi_vda(vda_file, antennas, baselines, band):
         # use frq[0] assuming frq is all the same frequency; could be broken in the future
         baseline_handle = BaselineInfo(datetime_array, frq[0])
         baseline_handle.prepare_vlbi(group_delays, phase_delays, grdel_err, phdel_err)
+        baseline_handle.hold_sources(sources)
         #baseline_handle.prepare_vlbi(group_delays, phase_delays, group_delays_dual, phase_delays_dual)
         baseline_handles.append(baseline_handle)
         baselines_final.append(baseline)
@@ -2377,16 +2430,15 @@ def import_data_vlbi_vda(vda_file, antennas, baselines, band):
         # add observed epochs to datetimes for each antenna
         dt_ant[antenna1] = np.union1d(dt_ant[antenna1], datetime_array)
         dt_ant[antenna2] = np.union1d(dt_ant[antenna2], datetime_array)
-        datetime_array_srt = np.union1d(datetime_array_srt, datetime_array)
 
-    datetime_array_srt = np.array(datetime_array_srt, dtype='datetime64[ns]')
+    # one entry per (epoch, source): an epoch repeats if sub-arrays observe different sources
+    obs_pairs = sorted(obs_pairs)
+    datetime_array_srt = np.array([pair[0] for pair in obs_pairs], dtype='datetime64[ns]')
     point_ra_dec_full = []
     source_array_full = []
-    for time in datetime_array_srt: 
-        source = src_time_dict[time]
-        ra, dec = src_dict[source.strip()]
+    for time, source in obs_pairs:
         source_array_full.append(source)
-        point_ra_dec_full.append((ra,dec))
+        point_ra_dec_full.append(src_dict.get(source.strip())) # None for satellites without coordinates
     print('Number of scans: ' + str(len(datetime_array_srt)))
     return baseline_handles, baselines_final, datetime_array_srt, source_array_full, point_ra_dec_full, dt_ant, rxpos_all, duration_dict, baseline_observations
 
@@ -2517,8 +2569,7 @@ def import_data_vlbi_vgosdb(db_loc, antennas, baselines, band):
     for ant in antennas:
         dt_ant[ant] = np.array([],dtype=np.datetime64)
 
-    datetime_array_srt = np.array([],dtype=np.datetime64)
-    src_time_dict = {}
+    obs_pairs = set() # (epoch, source) -- sub-arrays observe different sources at the same epoch
     duration_dict = {}
     baseline_handles = []
     baselines_final = []
@@ -2578,7 +2629,7 @@ def import_data_vlbi_vgosdb(db_loc, antennas, baselines, band):
         #    idx_break = None
 
         frq = np.array(freq.RefFreq.values)*1e6 # MHz --> Hz
-        sources = np.array(sources)[idxs_use]
+        sources_bl = np.array(sources)[idxs_use] # keep the full source list for the next baseline
         group_delays = np.array(grdel[idxs_use])
         grdel_errors_bl = np.array(grdel_errors[idxs_use])
         phase_delays = np.array(phase.Phase.values[idxs_use])
@@ -2593,8 +2644,8 @@ def import_data_vlbi_vgosdb(db_loc, antennas, baselines, band):
 
         datetime_array = np.array(dt_gps, dtype='datetime64[ns]')
         
-        for idx, source in enumerate(sources):
-            src_time_dict[datetime_array[idx]] = source
+        obs_pairs.update(zip(datetime_array, sources_bl))
+        for idx, source in enumerate(sources_bl):
             duration_dict[datetime_array[idx]] = duration_arr[idx]
 
         # check if baselines match baselines array
@@ -2683,6 +2734,7 @@ def import_data_vlbi_vgosdb(db_loc, antennas, baselines, band):
         baseline_handle.prepare_vlbi(group_delays, phase_delays, grdel_errors_bl, phase_errors_bl)
         #baseline_handle.prepare_vlbi(group_delays, phase_delays, grdel_errors_bl, phase_errors_bl, group_delays_dual, phase_delays_dual)
         baseline_handle.save_weather(met_1_P, met_1_H, met_1_T, met_2_P, met_2_H, met_2_T)
+        baseline_handle.hold_sources(sources_bl)
         print('using vgosDB meteorological data -- command line inputs will not be used')
         baseline_handles.append(baseline_handle)
         baselines_final.append(baseline)
@@ -2690,16 +2742,15 @@ def import_data_vlbi_vgosdb(db_loc, antennas, baselines, band):
         # add observed epochs to datetimes for each antenna
         dt_ant[antenna1] = np.union1d(dt_ant[antenna1], datetime_array)
         dt_ant[antenna2] = np.union1d(dt_ant[antenna2], datetime_array)
-        datetime_array_srt = np.union1d(datetime_array_srt, datetime_array)
 
-    datetime_array_srt = np.array(datetime_array_srt, dtype='datetime64[ns]')
+    # one entry per (epoch, source): an epoch repeats if sub-arrays observe different sources
+    obs_pairs = sorted(obs_pairs)
+    datetime_array_srt = np.array([pair[0] for pair in obs_pairs], dtype='datetime64[ns]')
     point_ra_dec_full = []
     source_array_full = []
-    for time in datetime_array_srt: 
-        source = src_time_dict[time]
-        ra, dec = src_dict[source.strip()]
+    for time, source in obs_pairs: 
         source_array_full.append(source)
-        point_ra_dec_full.append((ra,dec))
+        point_ra_dec_full.append(src_dict.get(source.strip())) # None for satellites without coordinates
     print('Number of scans: ' + str(len(datetime_array_srt)))
     return baseline_handles, baselines_final, datetime_array_srt, source_array_full, point_ra_dec_full, dt_ant, rxpos_all, duration_arr
 
@@ -2761,17 +2812,21 @@ def gen_key(rinex_files, full_data, start_date, end_date, eph_sats, iono_free, i
 
     return datetime_array, source_array 
 
-def thin_data(antenna_names, rinex_files, full_data, datetime_array, source_array):
+def thin_data(antenna_names, rinex_files, full_data, datetime_array, source_array, antennas_array=None):
     """
-    Thin the RINEX data to 1 satellite at a time
+    Thin the RINEX data to 1 satellite at a time.
+    antennas_array (optional, from import_vex_gnss with antenna_names): participating antenna
+    names at each epoch of a sub-arrayed schedule -- an antenna keeps only its own sub-array's source.
     """
     thinned_data = {}
     for ant_idx, rinex_file in enumerate(rinex_files):
         rinex_obs = full_data[rinex_file]
         antenna_name = antenna_names[ant_idx]
-        data_antenna = [] 
+        data_antenna = []
 
         for src_idx, time_beg in enumerate(datetime_array):
+            if antennas_array is not None and antenna_name not in antennas_array[src_idx]:
+                continue # antenna observes another source (sub-array) at this epoch
             src_name = source_array[src_idx][0:3] # Rinex source is 1 letter, 2 numbers
             try:
                 obs_sv = rinex_obs.sel(sv=src_name).dropna(dim='time',how='all')
@@ -2928,14 +2983,18 @@ def vlbi_transform_data(store_handle, antenna_handles, igs_data=False, dt_vlbi=N
     """
     Use VLBI-like processing to transform 1 Hz RINEX data to 1 point per scan
     """
-    # get all observation times in the experiment
-    for idx, antenna_handle in enumerate(antenna_handles):
-        if idx == 0:
-            datetime_array = antenna_handle.times_gps
-        else:
-            datetime_array = np.union1d(datetime_array, antenna_handle.times_gps)
-
-    source_array = np.array([store_handle.source_time_dict[time] for time in datetime_array])
+    # get all (epoch, source) observations in the experiment
+    obs_pairs = set()
+    for antenna_handle in antenna_handles:
+        src_dict = source_map(antenna_handle, store_handle)
+        obs_pairs.update((time, src_dict[time]) for time in antenna_handle.times_gps)
+    if len({pair[0] for pair in obs_pairs}) < len(obs_pairs):
+        # sub-arrays observe different sources at the same epoch: group by source so scans don't interleave
+        obs_pairs = sorted(obs_pairs, key=lambda pair: (pair[1], pair[0]))
+    else:
+        obs_pairs = sorted(obs_pairs)
+    datetime_array = np.array([pair[0] for pair in obs_pairs], dtype='datetime64[ns]')
+    source_array = np.array([pair[1] for pair in obs_pairs])
 
     # find array of common reference times
     src_last = source_array[0] 
@@ -2989,6 +3048,13 @@ def vlbi_transform_data(store_handle, antenna_handles, igs_data=False, dt_vlbi=N
             source_ref.append(src_last)
             time_src = [datetime_array[idx]]
         src_last = src
+
+    # time order the scans (they are grouped by source if sub-arrayed)
+    scan_order = np.argsort(np.array(datetime_ref, dtype='datetime64[ns]'), kind='stable')
+    datetime_ref = [datetime_ref[idx] for idx in scan_order]
+    source_ref = [source_ref[idx] for idx in scan_order]
+    scan_beg = [scan_beg[idx] for idx in scan_order]
+    scan_end = [scan_end[idx] for idx in scan_order]
 
     wavelength = const.c/antenna_handle.f1
     plot = False
@@ -3167,10 +3233,11 @@ def vlbi_transform_obs(store_handle, antenna_handle, freq, nsec_out):
     plot = False
     obs_data = antenna_handle.antenna_data
     obs_full = []
-    if len(set(store_handle.source_time_dict.values())) == 1:
-        source_ref = set(store_handle.source_time_dict.values()).pop()
+    src_dict = source_map(antenna_handle, store_handle)
+    if len(set(src_dict.values())) == 1:
+        source_ref = set(src_dict.values()).pop()
     else:
-        source_ref = np.array([store_handle.source_time_dict[time] for time in datetime_ref])
+        source_ref = np.array([src_dict[time] for time in datetime_ref])
 
     for idx, time in enumerate(datetime_ref):
         if len(source_ref)>3:
@@ -4473,6 +4540,8 @@ class BaselineInfo(object):
         self.datetime_array = datetime_array
         self.f1 = f1
         self.wavelength = const.c/f1
+        self.source_time_dict = None # epoch->source on this baseline, see hold_sources
+        self.pr_diff = None # GNSS differenced data, defined after the group delay solution
         self.iono_free = False
         self.weather_data = False
         self.use_cov_kernel_range = False
@@ -4493,6 +4562,11 @@ class BaselineInfo(object):
         if len(group_delays_dual)>0 and len(phase_delays_dual)>0:
             self.group_delays_dual = group_delays_dual
             self.phase_delays_dual = phase_delays_dual
+
+    def hold_sources(self, source_array):
+        """ Hold the source observed at each epoch of datetime_array (sub-arrays observe
+            different sources at the same epoch, so this is baseline-specific) """
+        self.source_time_dict = dict(zip(self.datetime_array, source_array))
 
     def prepare_l1_frequency(self, pr_diff, cp_diff):
         """Set up the L1 frequency observables
@@ -4700,6 +4774,7 @@ class AntennaInfo(object):
         self.use_zwd_file = False
         self.f1 = None
         self.f2 = None
+        self.source_time_dict = None # epoch->source observed by this antenna, see hold_sources
 
         # currently hard-code a priori PSD scalings
         #if self.antenna_name == 'DBR205':
@@ -5420,6 +5495,11 @@ class AntennaInfo(object):
         """ Directly set the relevant times (mostly useful for VLBI) """
         self.times_gps = times_gps
 
+    def hold_sources(self, datetime_array, source_array):
+        """ Hold the source observed by this antenna at each epoch (an antenna observes
+            one source at a time, even when sub-arrayed) """
+        self.source_time_dict = dict(zip(datetime_array, source_array))
+
     def hold_trop(self, trop_samples):
         """ Hold the sampled wet troposphere delays """
         self.trop_samples = trop_samples
@@ -5548,6 +5628,35 @@ class GNSSTKStores(object):
                 self.estimate_phase_disb
             else:
                 self.disb_systems = self.systems[self.systems!=self.ref_system]
+
+    def is_near_field(self, source):
+        """ True if source is modeled from ephemeris (model_group_phase_vlbi), False if it is a
+            natural radio source (model_group_phase_farfield). Only --src_type mixed has both. """
+        if self.src_type == 'mixed':
+            return NEAR_FIELD_PATTERN.match(str(source).strip()) is not None
+        return self.src_type == 'GNSS'
+
+    def merge_mixed_model(self, baseline_handle, attr, model_idxs, values, n_obs):
+        """ --src_type mixed: insert the values modeled for the observations model_idxs into the
+            full-length baseline array attr (the other observations are filled by the other model) """
+        if self.src_type != 'mixed' or len(values) == 0:
+            return values
+        full_values = getattr(baseline_handle, attr, None)
+        if full_values is None or len(full_values) != n_obs:
+            full_values = np.full(n_obs, np.nan)
+        else:
+            full_values = np.array(full_values, dtype=float) # copy
+        full_values[model_idxs] = values
+        return full_values
+
+    def compute_analytical_jac_baseline(self, *args, **kwargs):
+        """ Baseline Jacobian for the source type. With mixed sources each model fills only the
+            rows of its own observations (the rest are zero), so the two Jacobians are summed. """
+        if self.src_type == 'GNSS':
+            return self.compute_analytical_jac_vlbi(*args, **kwargs)
+        elif self.src_type == 'VLBI':
+            return self.compute_analytical_jac_farfield(*args, **kwargs)
+        return self.compute_analytical_jac_vlbi(*args, **kwargs) + self.compute_analytical_jac_farfield(*args, **kwargs)
 
     def build_ionex_store(self, ionex_file):
         """ Use an ionex file to compensate for ionospheric delay"""
@@ -5743,9 +5852,10 @@ class GNSSTKStores(object):
         azim_arr = []
         elev_arr = []
         times_common = date_to_common(times_gps, 'GPS')
-        if self.src_type == 'GNSS' or antenna_handle.point_ra_dec_dict is None: 
-            for idx, common_time in enumerate(times_common):
-                sat_id = self.source_time_dict[times_gps[idx]]
+        src_dict = source_map(antenna_handle, self)
+        for idx, common_time in enumerate(times_common):
+            sat_id = src_dict[times_gps[idx]]
+            if self.is_near_field(sat_id) or antenna_handle.point_ra_dec_dict is None:
                 rxpos = antenna_handle.pos_series[idx,:]
                 RSID = RinexSatID(str(sat_id))
                 sat_xvt = self.nav_store.get_xvt(RSID, common_time)
@@ -5755,8 +5865,7 @@ class GNSSTKStores(object):
                 azimuth = rxpos_gnsstk.azimuth(sat_pos_gnsstk)
                 elev_arr.append(elevation)
                 azim_arr.append(azimuth)
-        elif self.src_type == 'VLBI':
-            for idx, common_time in enumerate(times_common):
+            else:
                 eph_time = EphTime(common_time)
                 eph_time.setTimeSystem(TimeSystem.UTC)
                 ra, dec = antenna_handle.point_ra_dec_dict[times_gps[idx]]
@@ -5849,7 +5958,7 @@ class GNSSTKStores(object):
         for idx, common_time in enumerate(times_common):
             eph_time = EphTime(common_time)
             eph_time.setTimeSystem(TimeSystem.UTC)
-            sat_id = self.source_time_dict[times_gps[idx]]
+            sat_id = source_map(antenna_handle, self)[times_gps[idx]]
             sat_antenna = self.antenna_map[str(sat_id)]  
             RSID = RinexSatID(str(sat_id))
             rxpos = antenna_handle.pos_series[idx,:]
@@ -6110,7 +6219,7 @@ class GNSSTKStores(object):
             common_time.addSeconds(full_offset[idx])
             eph_time = EphTime(common_time)
             eph_time.setTimeSystem(TimeSystem.UTC)
-            sat_id = self.source_time_dict[times_gps[idx]]
+            sat_id = source_map(antenna_handle, self)[times_gps[idx]]
             sat_antenna = self.antenna_map[str(sat_id)]  
             RSID = RinexSatID(str(sat_id))
             rxpos = antenna_handle.pos_series[idx,:].copy()
@@ -6527,21 +6636,26 @@ class GNSSTKStores(object):
         if antenna2_handle.is_VLBI is True:
             a_vec2 = antenna2_handle.calc_VLBI_mount_vec()
 
+        src_dict = source_map(baseline_handle, self)
         if self.iono_comp_l4r:
-            source_array = np.array([self.source_time_dict[time] for time in times_gps])
-            idxs_bl = self.find_l4r_interpable(times_gps, source_array, antenna1_handle.l4r_name, antenna2_handle.l4r_name) 
+            source_array = np.array([src_dict[time] for time in times_gps])
+            idxs_bl = self.find_l4r_interpable(times_gps, source_array, antenna1_handle.l4r_name, antenna2_handle.l4r_name)
             stec_vals = self.interp_l4r(times_gps[idxs_bl], source_array[idxs_bl], antenna1_handle.l4r_name, antenna2_handle.l4r_name)
-        
+
         iono_model = []
+        model_idxs = [] # observations modeled here (all, unless --src_type mixed)
         times_common = date_to_common(times_gps, 'GPS')
         # pos_series is sampled on each antenna's epochs; map baseline epochs into them
         pos_idxs1 = map_epochs(antenna1_handle.times_gps, times_gps)
         pos_idxs2 = map_epochs(antenna2_handle.times_gps, times_gps)
         for idx, common_time in enumerate(times_common):
+            sat_id = src_dict[times_gps[idx]]
+            if not self.is_near_field(sat_id):
+                continue # natural radio source (mixed), see model_group_phase_farfield
+            model_idxs.append(idx)
             eph_time = EphTime(common_time)
             eph_time.setTimeSystem(TimeSystem.UTC)
-            sat_id = self.source_time_dict[times_gps[idx]]
-            sat_antenna = self.antenna_map[str(sat_id)]  
+            sat_antenna = self.antenna_map[str(sat_id)]
             RSID = RinexSatID(str(sat_id))
             rxpos1 = antenna1_handle.pos_series[pos_idxs1[idx],:]
             rxpos2 = antenna2_handle.pos_series[pos_idxs2[idx],:]
@@ -6884,6 +6998,16 @@ class GNSSTKStores(object):
                             + (PCV_dual_delay2-PCV_dual_delay1) - (dt_therm2-dt_therm1) + (grav_delay2-grav_delay1) + (cc_delay2-cc_delay1)
                     phase_model_dual_arr.append(phase_model_dual)
 
+        if self.src_type == 'mixed':
+            # far-field observations are filled in by model_group_phase_farfield
+            n_obs = len(times_gps)
+            group_model_arr = self.merge_mixed_model(baseline_handle, 'group_delay_model', model_idxs, group_model_arr, n_obs)
+            phase_model_arr = self.merge_mixed_model(baseline_handle, 'phase_delay_model', model_idxs, phase_model_arr, n_obs)
+            if self.iono_free is True and phase is True:
+                phase_model_dual_arr = self.merge_mixed_model(baseline_handle, 'phase_delay_model_dual', model_idxs, phase_model_dual_arr, n_obs)
+            cpw1_arr = self.merge_mixed_model(baseline_handle, 'cpw_1', model_idxs, cpw1_arr, n_obs)
+            cpw2_arr = self.merge_mixed_model(baseline_handle, 'cpw_2', model_idxs, cpw2_arr, n_obs)
+
         if phase is True:
             baseline_handle.save_cpw(cpw1_arr, cpw2_arr)
             baseline_handle.cpw_rx = np.array(cpw2_arr_rx)-np.array(cpw1_arr_rx)
@@ -6981,8 +7105,13 @@ class GNSSTKStores(object):
         # pos_series and times_adj are sampled on each antenna's epochs; map baseline epochs into them
         pos_idxs1 = map_epochs(antenna1_handle.times_gps, times_gps)
         pos_idxs2 = map_epochs(antenna2_handle.times_gps, times_gps)
+        src_dict = source_map(baseline_handle, self)
+        model_idxs = [] # observations modeled here (all, unless --src_type mixed)
         for idx, time in enumerate(times_gps):
-            source = self.source_time_dict[time]
+            source = src_dict[time]
+            if self.is_near_field(source):
+                continue # satellite (mixed), see model_group_phase_vlbi
+            model_idxs.append(idx)
             eph_time = EphTime(times_common[pos_idxs1[idx]])
             eph_time.setTimeSystem(TimeSystem.UTC)
             rxpos1 = antenna1_handle.pos_series[pos_idxs1[idx],:]
@@ -7292,6 +7421,16 @@ class GNSSTKStores(object):
                             - (dt_therm2-dt_therm1) + (grav_delay2-grav_delay1) + (cc_delay2-cc_delay1)
                     phase_model_dual_arr.append(phase_model_dual)
 
+        if self.src_type == 'mixed':
+            # near-field observations are filled in by model_group_phase_vlbi
+            n_obs = len(times_gps)
+            group_model_arr = self.merge_mixed_model(baseline_handle, 'group_delay_model', model_idxs, group_model_arr, n_obs)
+            phase_model_arr = self.merge_mixed_model(baseline_handle, 'phase_delay_model', model_idxs, phase_model_arr, n_obs)
+            if self.iono_free is True and phase is True:
+                phase_model_dual_arr = self.merge_mixed_model(baseline_handle, 'phase_delay_model_dual', model_idxs, phase_model_dual_arr, n_obs)
+            cpw1_arr = self.merge_mixed_model(baseline_handle, 'cpw_1', model_idxs, cpw1_arr, n_obs)
+            cpw2_arr = self.merge_mixed_model(baseline_handle, 'cpw_2', model_idxs, cpw2_arr, n_obs)
+
         if phase is True:
             if self.iono_free is True:
                 baseline_handle.save_vlbi_model(group_model_arr, phase_model_arr, phase_model_dual_arr)
@@ -7375,7 +7514,7 @@ class GNSSTKStores(object):
             if len(source_array) > 0:
                 sat_id = source_array[idx]
             else:
-                sat_id = self.source_time_dict[times_gps[idx]]
+                sat_id = source_map(antenna_handle, self)[times_gps[idx]]
             sat_antenna = self.antenna_map[str(sat_id)]  
             RSID = RinexSatID(str(sat_id))
             rxpos = antenna_handle.pos_series[idx,:]
@@ -7551,7 +7690,7 @@ class GNSSTKStores(object):
             
             # Assign values to the source satellite at each epoch
             for jdx in range(len(times_gps)):
-                sv_index = satellites.index(self.source_time_dict[times_gps[jdx]])
+                sv_index = satellites.index(source_map(antenna_handle, self)[times_gps[jdx]])
                 pr_2d[jdx, sv_index] = pr_model_arr[jdx]
                 cp_2d[jdx, sv_index] = cp_model_arr[jdx]
                 if self.iono_free is True:
@@ -7595,7 +7734,7 @@ class GNSSTKStores(object):
             if len(source_array) > 0:
                 sat_id = source_array[idx]
             else:
-                sat_id = self.source_time_dict[times_gps[idx]]
+                sat_id = source_map(antenna_handle, self)[times_gps[idx]]
             RSID = RinexSatID(str(sat_id))
             rxpos = antenna_handle.ref_pos
             current_pos = Position(rxpos[0], rxpos[1], rxpos[2]) 
@@ -8413,7 +8552,7 @@ class GNSSTKStores(object):
         for idx, common_time in enumerate(times_common):
             eph_time = EphTime(common_time)
             eph_time.setTimeSystem(TimeSystem.UTC)
-            sat_id = self.source_time_dict[times_gps[idx]]
+            sat_id = source_map(antenna_handle, self)[times_gps[idx]]
             sat_antenna = self.antenna_map[str(sat_id)]  
             RSID = RinexSatID(str(sat_id))
             rxpos = antenna_handle.pos_series[idx,:]
@@ -8629,11 +8768,14 @@ class GNSSTKStores(object):
         # pos_series is sampled on each antenna's epochs; map baseline epochs into them
         pos_idxs1 = map_epochs(antenna1_handle.times_gps, times_gps)
         pos_idxs2 = map_epochs(antenna2_handle.times_gps, times_gps)
+        src_dict = source_map(baseline_handle, self)
         for idx, common_time in enumerate(times_common):
+            sat_id = src_dict[times_gps[idx]]
+            if not self.is_near_field(sat_id):
+                continue # natural radio source (mixed): row filled by compute_analytical_jac_farfield
             eph_time = EphTime(common_time)
             eph_time.setTimeSystem(TimeSystem.UTC)
-            sat_id = self.source_time_dict[times_gps[idx]]
-            sat_antenna = self.antenna_map[str(sat_id)]  
+            sat_antenna = self.antenna_map[str(sat_id)]
             RSID = RinexSatID(str(sat_id))
             rxpos1 = antenna1_handle.pos_series[pos_idxs1[idx],:]
             rxpos2 = antenna2_handle.pos_series[pos_idxs2[idx],:]
@@ -8951,10 +9093,13 @@ class GNSSTKStores(object):
         # pos_series is sampled on each antenna's epochs; map baseline epochs into them
         pos_idxs1 = map_epochs(antenna1_handle.times_gps, times_gps)
         pos_idxs2 = map_epochs(antenna2_handle.times_gps, times_gps)
+        src_dict = source_map(baseline_handle, self)
         for idx, time in enumerate(times_gps):
+            source = src_dict[time]
+            if self.is_near_field(source):
+                continue # satellite (mixed): row filled by compute_analytical_jac_vlbi
             eph_time = EphTime(times_common[idx])
             eph_time.setTimeSystem(TimeSystem.UTC)
-            source = self.source_time_dict[time]
             rxpos1 = antenna1_handle.pos_series[pos_idxs1[idx],:]
             rxpos2 = antenna2_handle.pos_series[pos_idxs2[idx],:]
 
@@ -9104,7 +9249,7 @@ class GNSSTKStores(object):
                 analytical_jacobian[idx, 3+len(clock_state)+len_ao+1] = np.deg2rad(elevation2)**2
 
             if len(trop_state)>0:
-                if self.src_type == 'VLBI' and getattr(antenna1_handle.tropModel, 'vmf3_type', None) is not None:
+                if self.src_type in ('VLBI', 'mixed') and getattr(antenna1_handle.tropModel, 'vmf3_type', None) is not None:
                     vmf3_type = True
                     # VMF3 trop needs azimuth and time
                     rxpos1_gnsstk = Position(rxpos1[0], rxpos1[1], rxpos1[2])
@@ -11405,7 +11550,7 @@ def find_diff_meas_phase(antenna1_handle, antenna2_handle, baseline_handle, \
     residuals_phase = residuals_phase[baseline_handle.phase_data_idxs]
 
     if store_handle.iono_comp_l4r and not store_handle.iono_free:
-        source_array = [store_handle.source_time_dict[time] for time in baseline_handle.datetime_array[baseline_handle.phase_data_idxs]]
+        source_array = [source_map(baseline_handle, store_handle)[time] for time in baseline_handle.datetime_array[baseline_handle.phase_data_idxs]]
         stec_vals = store_handle.interp_l4r(baseline_handle.datetime_array[baseline_handle.phase_data_idxs], source_array, antenna1_handle.l4r_name, antenna2_handle.l4r_name)
         residuals_phase -= ALPHA_IONO/baseline_handle.f1**2*const.c*stec_vals
 
@@ -11642,24 +11787,31 @@ def find_diff_meas(antenna1_handle, antenna2_handle, baseline_handle=None, store
     data_ant1 = antenna1_handle.antenna_data
     data_ant2 = antenna2_handle.antenna_data
 
-    if baseline_handle is not None:
+    if baseline_handle is not None and baseline_handle.pr_diff is not None:
         _, ant1_idxs, _ = np.intersect1d(antenna1_handle.times_gps, baseline_handle.datetime_array[baseline_handle.range_data_idxs], return_indices=True)
         _, ant2_idxs, _ = np.intersect1d(antenna2_handle.times_gps, baseline_handle.datetime_array[baseline_handle.range_data_idxs], return_indices=True)
         diff_pr_data = baseline_handle.pr_diff[baseline_handle.range_data_idxs]
     else:
-        times, ant1_idxs, ant2_idxs = np.intersect1d(antenna1_handle.times_gps, antenna2_handle.times_gps, return_indices=True)
+        if baseline_handle is not None:
+            # GNSS group delay solution: baseline epochs (common source if sub-arrayed) known, data not yet differenced
+            times = baseline_handle.datetime_array
+            _, ant1_idxs, _ = np.intersect1d(antenna1_handle.times_gps, times, return_indices=True)
+            _, ant2_idxs, _ = np.intersect1d(antenna2_handle.times_gps, times, return_indices=True)
+        else:
+            times, ant1_idxs, ant2_idxs = np.intersect1d(antenna1_handle.times_gps, antenna2_handle.times_gps, return_indices=True)
         diff_pr_data = data_ant2.pr_data.values[ant2_idxs] - data_ant1.pr_data.values[ant1_idxs]
 
-    diff_pr_model = data_ant2.pr_model.values[ant2_idxs] - data_ant1.pr_model.values[ant1_idxs] 
+    diff_pr_model = data_ant2.pr_model.values[ant2_idxs] - data_ant1.pr_model.values[ant1_idxs]
     residuals = diff_pr_data - diff_pr_model
 
     if store_handle.iono_comp_l4r and not store_handle.iono_free:
-        if baseline_handle is not None:
-            source_array = [store_handle.source_time_dict[time] for time in baseline_handle.datetime_array[baseline_handle.range_data_idxs]]
+        if baseline_handle is not None and baseline_handle.pr_diff is not None:
+            source_array = [source_map(baseline_handle, store_handle)[time] for time in baseline_handle.datetime_array[baseline_handle.range_data_idxs]]
             stec_vals = store_handle.interp_l4r(baseline_handle.datetime_array[baseline_handle.range_data_idxs], source_array, antenna1_handle.l4r_name, antenna2_handle.l4r_name)
             residuals += ALPHA_IONO/baseline_handle.f1**2*const.c*stec_vals
         else:
-            source_array = np.array([store_handle.source_time_dict[time] for time in times])
+            src_dict = source_map(antenna1_handle if baseline_handle is None else baseline_handle, store_handle)
+            source_array = np.array([src_dict[time] for time in times])
             idxs_bl = store_handle.find_l4r_interpable(times, source_array, antenna1_handle.l4r_name, antenna2_handle.l4r_name) 
             stec_vals = store_handle.interp_l4r(times[idxs_bl], source_array[idxs_bl], antenna1_handle.l4r_name, antenna2_handle.l4r_name)
             #mask = np.ones(times.shape[0], dtype=bool)
@@ -11794,7 +11946,7 @@ def get_obs_weights(store_handle, antenna1_handle, antenna2_handle, obs_type='ra
             errors1 = antenna1_handle.pr_errors if obs_type == 'range' else antenna1_handle.cp_errors
             errors2 = antenna2_handle.pr_errors if obs_type == 'range' else antenna2_handle.cp_errors
             var_snr = errors1[ant1_idxs]**2 + errors2[ant2_idxs]**2
-            if baseline_handle is None:
+            if baseline_handle is None or baseline_handle.pr_diff is None: # no differenced data yet (group delay solution)
                 if obs_type == 'phase' and use_phase_weights is False:
                     var_diag = 100*np.mean(antenna1_handle.pr_errors[ant1_idxs]**2+antenna2_handle.pr_errors[ant2_idxs]**2)*np.ones(len(ant1_idxs))
                 else:
@@ -13146,7 +13298,8 @@ def analyze_ls_solution(sol_type, plot_results, ref_antenna, clock_idxs, trop_id
         #print('formal baseline errors (NEU, m): sigma_NN: ' + str(np.round(sigmas_NEU[0],6)) +  \
         #            ' sigma_EE: ' + str(np.round(sigmas_b_NEU[1],6)) +  ' sigma_UU: ' + str(np.round(sigmas_b_NEU[2],6)))
         
-        source_array = np.array([store_handle.source_time_dict[time] for time in times_gps])
+        src_dict = source_map(baseline_handle if len(baseline_handles)>0 else antenna1_handle, store_handle)
+        source_array = np.array([src_dict[time] for time in times_gps])
         if phase_only is False:
             # Create a DataFrame
             data = DataFrame({
@@ -13263,7 +13416,7 @@ def analyze_ls_solution(sol_type, plot_results, ref_antenna, clock_idxs, trop_id
                 # get epochs of source
                 idxs_src = []
                 for idx, time in enumerate(times_gps):
-                    if src == store_handle.source_time_dict[time]:
+                    if src == src_dict[time]:
                         idxs_src.append(idx)
                 idx_src = np.array(idxs_src)
                 if phase_delay is True:
@@ -13749,7 +13902,7 @@ def analyze_ls_solution(sol_type, plot_results, ref_antenna, clock_idxs, trop_id
                     # get epochs of source
                     idxs_src = []
                     for idx, time in enumerate(times_gps):
-                        if src == store_handle.source_time_dict[time]:
+                        if src == src_dict[time]:
                             idxs_src.append(idx)
                     idx_src = np.array(idxs_src)
                     _, _, phase_idxs = np.intersect1d(idxs_src, baseline_handle.phase_data_idxs, return_indices=True)
@@ -13783,7 +13936,7 @@ def analyze_ls_solution(sol_type, plot_results, ref_antenna, clock_idxs, trop_id
                 # get epochs of source
                 idxs_src = []
                 for idx, time in enumerate(times_gps):
-                    if src == store_handle.source_time_dict[time]:
+                    if src == src_dict[time]:
                         idxs_src.append(idx)
                 idx_src = np.array(idxs_src)
                 _, _, phase_idxs = np.intersect1d(idxs_src, baseline_handle.phase_data_idxs, return_indices=True)
@@ -15386,7 +15539,7 @@ def detect_unresolved_amb_gnss(store_handle, amb_state, antenna_handles, baselin
         diff_cp_model = data_ant2.cp_model.values[ant2_idxs] - data_ant1.cp_model.values[ant1_idxs]
 
         if store_handle.iono_comp_l4r and not store_handle.iono_free:
-            source_array = [store_handle.source_time_dict[time] for time in baseline_handle.datetime_array]
+            source_array = [source_map(baseline_handle, store_handle)[time] for time in baseline_handle.datetime_array]
             stec_vals = store_handle.interp_l4r(baseline_handle.datetime_array, source_array, antenna1_handle.l4r_name, antenna2_handle.l4r_name)
             diff_cp_model += ALPHA_IONO/baseline_handle.f1**2*const.c*stec_vals
    
@@ -17199,7 +17352,7 @@ def construct_Q_eta(store_handle, baseline_handle, use_idxs):
 
     source_time = []
     for time in times:
-        source_time.append(store_handle.source_time_dict[time])
+        source_time.append(source_map(baseline_handle, store_handle)[time])
     source_time = np.array(source_time)
 
     Q_eta = np.zeros((len(use_idxs),len(use_idxs)))
@@ -17480,7 +17633,7 @@ def calc_residuals(state, ref_antenna, baselines, store_handle, antenna_handles,
                 trop_samples1 = []
                 trop_samples2 = []
 
-            if store_handle.src_type == 'GNSS':
+            if store_handle.src_type in ('GNSS', 'mixed'):
                 if phase_delay is True:
                     store_handle.model_group_phase_vlbi(antenna1_handle, antenna2_handle, baseline_handle, \
                             baseline_handle.datetime_array, clock_samples, trop_samples1, trop_samples2,\
@@ -17488,7 +17641,7 @@ def calc_residuals(state, ref_antenna, baselines, store_handle, antenna_handles,
                 else:
                     store_handle.model_group_phase_vlbi(antenna1_handle, antenna2_handle, baseline_handle, \
                             baseline_handle.datetime_array, clock_samples, trop_samples1, trop_samples2)
-            elif store_handle.src_type == 'VLBI':
+            if store_handle.src_type in ('VLBI', 'mixed'):
                 if phase_delay is True:
                     store_handle.model_group_phase_farfield(antenna1_handle, antenna2_handle, baseline_handle, \
                             baseline_handle.datetime_array, clock_samples, trop_samples1, trop_samples2,\
@@ -17836,21 +17989,12 @@ def calc_jac(state, ref_antenna, baselines, store_handle, antenna_handles, \
                     ao_ant2 = ao_state_ant[baseline[1]]
                     if phase_delay is True and (antenna_handle.antenna_name != ref_antenna or \
                             (antenna_handle.estimate_ao is True or antenna_handle.estimate_grav_def is True)):
-                        if store_handle.src_type == 'GNSS':
-                            antenna_jac = store_handle.compute_analytical_jac_vlbi(antenna_handles[baseline[0]], antenna_handles[baseline[1]], baseline_handle,\
-                                    ant_deriv, datetime_array, clock_state, clock_poly_length, trop_state, trop_poly_length, ao_ant1, ao_ant2, phase_delay, \
-                                    phase_clock_state, phase_only)
-                        elif store_handle.src_type == 'VLBI':
-                            antenna_jac = store_handle.compute_analytical_jac_farfield(antenna_handles[baseline[0]], antenna_handles[baseline[1]], baseline_handle,\
-                                    ant_deriv, datetime_array, clock_state, clock_poly_length, trop_state, trop_poly_length, ao_ant1, ao_ant2, phase_delay, \
-                                    phase_clock_state, phase_only)
+                        antenna_jac = store_handle.compute_analytical_jac_baseline(antenna_handles[baseline[0]], antenna_handles[baseline[1]], baseline_handle,\
+                                ant_deriv, datetime_array, clock_state, clock_poly_length, trop_state, trop_poly_length, ao_ant1, ao_ant2, phase_delay, \
+                                phase_clock_state, phase_only)
                     elif antenna_handle.antenna_name != ref_antenna or (antenna_handle.estimate_ao is True or antenna_handle.estimate_grav_def is True):
-                        if store_handle.src_type == 'GNSS':
-                            antenna_jac = store_handle.compute_analytical_jac_vlbi(antenna_handles[baseline[0]], antenna_handles[baseline[1]], baseline_handle,\
-                                    ant_deriv, datetime_array, clock_state, clock_poly_length, trop_state, trop_poly_length, ao_ant1, ao_ant2)
-                        elif store_handle.src_type == 'VLBI':
-                            antenna_jac = store_handle.compute_analytical_jac_farfield(antenna_handles[baseline[0]], antenna_handles[baseline[1]], baseline_handle,\
-                                    ant_deriv, datetime_array, clock_state, clock_poly_length, trop_state, trop_poly_length, ao_ant1, ao_ant2)
+                        antenna_jac = store_handle.compute_analytical_jac_baseline(antenna_handles[baseline[0]], antenna_handles[baseline[1]], baseline_handle,\
+                                ant_deriv, datetime_array, clock_state, clock_poly_length, trop_state, trop_poly_length, ao_ant1, ao_ant2)
 
                 if phase_delay is True:
                     if antenna_handle.estimate_ao is True:
