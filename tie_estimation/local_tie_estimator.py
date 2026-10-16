@@ -59,7 +59,7 @@ from gnsstk import std_vector_string, Position, AntennaStore, AntexData, OceanLo
                   AtmLoadTides, SolarSystem, GlobalTropModel, SaasTropModel, NeillTropModel
 
 from single_diff_tools import import_key_gnss, import_vex_gnss, import_data_vlbi, import_data_vlbi_farfield, import_data_vlbi_vgosdb, \
-                  import_data_vlbi_vda, import_data_ngs, write_SINEX, datetime64_to_mjd, map_datasets, import_data_nc_sim,\
+                  import_data_vlbi_vda, import_data_ngs, apriori_positions_from_superstation, write_SINEX, datetime64_to_mjd, map_datasets, import_data_nc_sim,\
                   find_common_epochs, BaselineInfo, AntennaInfo, GNSSTKStores, ECEF2ECI, slip_detect_MW, slip_detect_single_freq,\
                   slip_detect_phase_delay, sample_poly_at_interval, trim_amb_Zdom, trim_amb_state, gen_phase_clock_state, adjust_stoch_params, thin_data,\
                   analyze_ls_solution, resolve_float_amb, construct_float_amb, remove_outliers, iterative_remove_outliers, calc_residuals, \
@@ -138,6 +138,13 @@ def add_args_to_parser(parser_in):
                          )
     parser.add_argument("--ngs_file", default=None,
                          help="NGS data file to read. Antenna names supplied with --antenna_name must match those in file"
+                         )
+    parser.add_argument("--superstation_file", default=None,
+                         help="VieVS superstation .mat file; a priori positions are propagated from it to the session epoch "
+                              "(velocity, post-seismic deformation, eccentricity) and replace --rxpos"
+                         )
+    parser.add_argument("--trf_name", default='itrf2020_u2024',
+                         help="TRF field in the superstation file (default itrf2020_u2024)"
                          )
     parser.add_argument("--vda_file", default=None,
                          help="vgosda data file to read. antenna names supplied with --antenna_name must match those in file"
@@ -2145,7 +2152,7 @@ if __name__ == '__main__':
     if args.trop_vmf3 == True or args.trop_gpt3_test == True:
         vmf3_stations = [vmf3_station for vmf3_station in args.vmf3_stations]
     if sol_type == 'VLBI' or args.rxpos is not None:
-        if args.rxpos is None and args.vgosDB is None and args.vda_file is None:
+        if args.rxpos is None and args.vgosDB is None and args.vda_file is None and args.superstation_file is None:
             raise ValueError('Must supply receiver positions for VLBI solution (--rxpos)')
         if args.rxpos is not None:
             rxpos_all = []
@@ -2308,6 +2315,11 @@ if __name__ == '__main__':
             elif args.nc_sim_file is not None:
                 baseline_handles, baselines, datetime_array, source_array, point_ra_dec_array, dt_ant = import_data_nc_sim(args.nc_sim_file, \
                         antenna_names, baselines, args.key_file)
+
+    if args.superstation_file is not None:
+        rxpos_given = rxpos_all if args.rxpos is not None else None
+        rxpos_all = apriori_positions_from_superstation(args.superstation_file, args.trf_name, \
+                antenna_names, datetime_array, rxpos_given)
 
     # get antenna data from antex file
     antenna_store = AntennaStore()

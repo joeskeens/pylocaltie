@@ -73,6 +73,7 @@ GPS2UTC = -18
 MIN_SLICE = 1
 MU_EARTH = 3.9860044188e14
 MU_SUN=1.327124400189e20
+MU_MOON = 4.902800066e12
 L_G = 6.969290134e-10
 SECONDS_PER_DAY=86400
 FACTOR_RW=1e24/const.c**2*3600 # ps^2/hr --> m^2/s
@@ -316,6 +317,17 @@ def standardize_dates(date_time):
                 date_time = np.array(list(map(lambda x: Timestamp(x), date_time)))
 
     return date_time
+
+def map_epochs(ant_times, times):
+    """Return indices into the sorted array ant_times for each epoch in times.
+    Every epoch in times must be present in ant_times."""
+    ant_times = np.asarray(ant_times, dtype='datetime64[ns]')
+    times = np.asarray(times, dtype='datetime64[ns]')
+    idxs = np.clip(np.searchsorted(ant_times, times), 0, len(ant_times)-1)
+    if np.any(ant_times[idxs] != times):
+        raise ValueError('epoch(s) not found in antenna time series')
+    return idxs
+
 
 def date_to_common(date_time, system='Any'):
     """
@@ -1616,8 +1628,8 @@ def parse_ngs_file(filepath, antenna_names):
             delay_err = float(lines[i+1][20:31].strip())
             quality_flag = float(lines[i+1][60:62].strip())
             fringe_phase = float(lines[i+2][40:60].strip())
-            pressure_1 = float(lines[i+5][20:29].strip())
-            pressure_2 = float(lines[i+5][30:39].strip())
+            pressure_1 = float(lines[i+5][20:30].strip())
+            pressure_2 = float(lines[i+5][30:40].strip())
 
             if quality_flag <= 0:
                 observation = {
@@ -1753,6 +1765,176 @@ def import_data_ngs(ngs_file, antennas, baselines, utc2gps):
         point_ra_dec_full = None
     print('Number of scans: ' + str(len(datetime_array_srt)))
     return baseline_handles, baselines_final, datetime_array_srt, source_array_full, point_ra_dec_full, dt_ant, duration_dict
+
+# ---------------------------------------------------------------------------
+# A priori station positions from a VieVS superstation file
+# Mirrors VieVS: read_ngs.m (break selection, eccentricity), corr_ant.m (ecc,
+# psd source), cPostSeismDeform.m (psd), antennaCorrections.m (velocity).
+# NGS headers written by VieVS (scan2ngs.m) carry break.x/y/z unpropagated.
+# ---------------------------------------------------------------------------
+MJD_ZERO = np.datetime64('1858-11-17T00:00:00', 'ns')
+
+
+def datetime64_to_mjd_float(times):
+    """ Convert datetime64 (scalar or array) to fractional MJD """
+    return (np.asarray(times, dtype='datetime64[ns]') - MJD_ZERO) / np.timedelta64(1, 'D')
+
+
+def load_superstation(superstation_file):
+    """ Load a VieVS superstation .mat file (MATLAB v7) into a dict keyed by station name """
+    from scipy.io import loadmat
+    try:
+        mat_contents = loadmat(superstation_file, squeeze_me=True, struct_as_record=False)
+    except NotImplementedError:
+        raise ValueError('superstation file is MATLAB v7.3; re-save in MATLAB with '
+                         "save(file, 'superstations', '-v7')")
+    var_names = [key for key in mat_contents if not key.startswith('__')]
+    stations = np.atleast_1d(mat_contents[var_names[0]])
+    return {str(station.name).strip().upper(): station for station in stations}
+
+
+def _vievs_ren2xyz(d_up, d_east, d_north, lat, lon):
+    """ VieVS ren2xyz.m: local (up, east, north) offsets to ECEF """
+    cos_lat, sin_lat = np.cos(lat), np.sin(lat)
+    cos_lon, sin_lon = np.cos(lon), np.sin(lon)
+    return np.array([cos_lat*cos_lon*d_up - sin_lon*d_east - sin_lat*cos_lon*d_north,
+                     cos_lat*sin_lon*d_up + cos_lon*d_east - sin_lat*sin_lon*d_north,
+                     sin_lat*d_up + cos_lat*d_north])
+
+
+def _vievs_cart2phigd(xyz):
+    """ VieVS cart2phigd.m (used for the psd rotation; note its f = 1/300) """
+    radius_eq = 6378136.55
+    flattening = 1/300
+    ecc_sq1 = 2*flattening - flattening**2
+    ecc_sq2 = ecc_sq1/(1 - ecc_sq1)
+    rho = np.hypot(xyz[0], xyz[1])
+    theta = np.arctan2(xyz[2], rho*(1 - flattening))
+    return np.arctan2(xyz[2] + ecc_sq2*radius_eq*np.sin(theta)**3*(1 - flattening),
+                      rho - ecc_sq1*radius_eq*np.cos(theta)**3)
+
+
+def _vievs_xyz2ell_lat(xyz):
+    """ VieVS xyz2ell.m latitude (used for NEU eccentricities) """
+    semi_major = 6378136.6
+    flattening = 1/298.25642
+    ecc_sq = 2*flattening - flattening**2
+    rho = np.hypot(xyz[0], xyz[1])
+    lat = np.arctan2(xyz[2], rho)
+    for iteration in range(6):
+        n_radius = semi_major/np.sqrt(1 - ecc_sq*np.sin(lat)**2)
+        height = rho/np.cos(lat) - n_radius
+        lat = np.arctan2(xyz[2]*(n_radius + height), rho*((1 - ecc_sq)*n_radius + height))
+    return lat
+
+
+def _psd_mm(dt_years, coeffs):
+    """ VieVS psdCalc: ITRF psd model, coeffs = [model, A1, tau1, (A2, tau2)], A in mm, tau in yr """
+    coeffs = np.atleast_1d(coeffs).astype(float)
+    model = int(coeffs[0]) if coeffs.size else 0
+    log_term = lambda amp, tau: amp*np.log(1 + dt_years/tau)
+    exp_term = lambda amp, tau: amp*(1 - np.exp(-dt_years/tau))
+    if model == 1:
+        return log_term(coeffs[1], coeffs[2])
+    if model == 2:
+        return exp_term(coeffs[1], coeffs[2])
+    if model == 3:
+        return log_term(coeffs[1], coeffs[2]) + exp_term(coeffs[3], coeffs[4])
+    if model == 4:
+        return exp_term(coeffs[1], coeffs[2]) + exp_term(coeffs[3], coeffs[4])
+    if model == 5:
+        return log_term(coeffs[1], coeffs[2]) + log_term(coeffs[3], coeffs[4])
+    return 0.0
+
+
+def _ecc_string_to_mjd(date_str):
+    """ VieVS ecc break strings 'YYYY:MM:DD:HH:MI' (positions 1:4, 6:7, 9:10, 12:13, 15:16) """
+    date_str = str(date_str)
+    stamp = np.datetime64(f'{date_str[0:4]}-{date_str[5:7]}-{date_str[8:10]}T{date_str[11:13]}:{date_str[14:16]}', 'ns')
+    return float(datetime64_to_mjd_float(stamp))
+
+
+def superstation_apriori_pos(station, trf_name, mjd_first, mjd_eval):
+    """ A priori ECEF position as VieVS forms it: break position + velocity + psd + eccentricity.
+        mjd_first: first observation (selects TRF and eccentricity breaks, as in read_ngs.m)
+        mjd_eval:  epoch to propagate to
+        Returns (pos_apriori, pos_break) where pos_break is what VieVS writes to the NGS header.
+    """
+    trf = getattr(station, trf_name, None)
+    if trf is None or isinstance(trf, np.ndarray):
+        raise ValueError(f'{station.name}: no {trf_name} entry in superstation file')
+
+    # break selection: start/end default to 0/99999, first matching break wins
+    breaks = np.atleast_1d(getattr(trf, 'break'))
+    def break_bound(value, default):
+        value = np.atleast_1d(value)
+        return float(value[0]) if value.size else default
+    starts = [break_bound(getattr(brk, 'start', []), 0.0) for brk in breaks]
+    ends = [break_bound(getattr(brk, 'end', []), 99999.0) for brk in breaks]
+    matches = [idx for idx in range(len(breaks)) if starts[idx] <= mjd_first <= ends[idx]]
+    if len(matches) == 0:
+        raise ValueError(f'{station.name}: no {trf_name} break covers MJD {mjd_first:.3f}')
+    brk = breaks[matches[0]]
+    pos_break = np.array([brk.x, brk.y, brk.z], dtype=float)
+    vel = np.array([brk.vx, brk.vy, brk.vz], dtype=float)
+
+    # linear motion (antennaCorrections.m)
+    pos = pos_break + vel*(mjd_eval - float(brk.epoch))/365.25
+
+    # post-seismic deformation (cPostSeismDeform.m); VieVS rotates with break(1)
+    psd_entries = getattr(trf, 'psd', None)
+    if psd_entries is not None and not (isinstance(psd_entries, np.ndarray) and psd_entries.size == 0):
+        pos_rot = np.array([breaks[0].x, breaks[0].y, breaks[0].z], dtype=float)
+        lat_gd = _vievs_cart2phigd(pos_rot)
+        lon = np.arctan2(pos_rot[1], pos_rot[0])
+        for entry in np.atleast_1d(psd_entries):
+            if mjd_eval > float(entry.epoch):
+                dt_years = (mjd_eval - float(entry.epoch))/365.25
+                d_east, d_north, d_up = (_psd_mm(dt_years, comp)/1000 for comp in (entry.e, entry.n, entry.u))
+                pos = pos + _vievs_ren2xyz(d_up, d_east, d_north, lat_gd, lon)
+
+    # eccentricity (read_ngs.m selection, corr_ant.m rotation)
+    ecc_struct = getattr(station, 'ecc', None)
+    if ecc_struct is not None and not (isinstance(ecc_struct, np.ndarray) and ecc_struct.size == 0):
+        ecc_breaks = np.atleast_1d(getattr(ecc_struct, 'break'))
+        ecc_brk = ecc_breaks[-1] # VieVS keeps the last break if none matches
+        for candidate in ecc_breaks:
+            if _ecc_string_to_mjd(candidate.starting) <= np.floor(mjd_first) <= _ecc_string_to_mjd(candidate.ending):
+                ecc_brk = candidate
+                break
+        ecc = np.array([ecc_brk.FCE, ecc_brk.SCE, ecc_brk.TCE], dtype=float)
+        if str(ecc_brk.type_e).strip().upper() == 'NEU':
+            lat = _vievs_xyz2ell_lat(pos_break)
+            lon = np.arctan2(pos_break[1], pos_break[0])
+            pos = pos + _vievs_ren2xyz(ecc[2], ecc[1], ecc[0], lat, lon)
+        else:
+            pos = pos + ecc
+
+    return pos, pos_break
+
+
+def apriori_positions_from_superstation(superstation_file, trf_name, antenna_names, datetime_array, rxpos_given=None):
+    """ Propagate superstation positions to the session midpoint for each antenna.
+        If rxpos_given is supplied (e.g. NGS header coordinates), print the differences as a check.
+    """
+    stations = load_superstation(superstation_file)
+    mjd_obs = datetime64_to_mjd_float(datetime_array)
+    mjd_first = float(np.min(mjd_obs))
+    mjd_eval = 0.5*(mjd_first + float(np.max(mjd_obs))) # VieVS propagates per scan; midpoint is within ~0.1 mm
+    rxpos_all = []
+    print(f'A priori positions from {trf_name} propagated to MJD {mjd_eval:.4f}:')
+    for idx, antenna_name in enumerate(antenna_names):
+        key = antenna_name.strip().upper()
+        if key not in stations:
+            raise ValueError(f'{antenna_name} not found in superstation file')
+        pos, pos_break = superstation_apriori_pos(stations[key], trf_name, mjd_first, mjd_eval)
+        rxpos_all.append(list(pos))
+        line = f'  {antenna_name:8s} propagated - break: {np.round(pos - pos_break, 4)} m'
+        if rxpos_given is not None:
+            line += f'   given - break: {np.round(np.asarray(rxpos_given[idx]) - pos_break, 5)} m'
+        print(line)
+    return rxpos_all
+
 
 from collections import defaultdict
 def parse_vda_file(file_path, desired_band, antenna_names):
@@ -6352,14 +6534,17 @@ class GNSSTKStores(object):
         
         iono_model = []
         times_common = date_to_common(times_gps, 'GPS')
+        # pos_series is sampled on each antenna's epochs; map baseline epochs into them
+        pos_idxs1 = map_epochs(antenna1_handle.times_gps, times_gps)
+        pos_idxs2 = map_epochs(antenna2_handle.times_gps, times_gps)
         for idx, common_time in enumerate(times_common):
             eph_time = EphTime(common_time)
             eph_time.setTimeSystem(TimeSystem.UTC)
             sat_id = self.source_time_dict[times_gps[idx]]
             sat_antenna = self.antenna_map[str(sat_id)]  
             RSID = RinexSatID(str(sat_id))
-            rxpos1 = antenna1_handle.pos_series[idx,:]
-            rxpos2 = antenna2_handle.pos_series[idx,:]
+            rxpos1 = antenna1_handle.pos_series[pos_idxs1[idx],:]
+            rxpos2 = antenna2_handle.pos_series[pos_idxs2[idx],:]
           
             freq1 = transmitter_antex_code(f1, RSID.systemChar())
             if self.iono_free:
@@ -6793,12 +6978,15 @@ class GNSSTKStores(object):
         times_adj, full_offset = self.adj_clock_ns(antenna1_handle, antenna1_handle.clock_samples, \
                 antenna1_handle.phase_clock_samples, phase, phase_only)
         times_common = date_to_common(times_adj, 'GPS')
+        # pos_series and times_adj are sampled on each antenna's epochs; map baseline epochs into them
+        pos_idxs1 = map_epochs(antenna1_handle.times_gps, times_gps)
+        pos_idxs2 = map_epochs(antenna2_handle.times_gps, times_gps)
         for idx, time in enumerate(times_gps):
             source = self.source_time_dict[time]
-            eph_time = EphTime(times_common[idx])
+            eph_time = EphTime(times_common[pos_idxs1[idx]])
             eph_time.setTimeSystem(TimeSystem.UTC)
-            rxpos1 = antenna1_handle.pos_series[idx,:]
-            rxpos2 = antenna2_handle.pos_series[idx,:]
+            rxpos1 = antenna1_handle.pos_series[pos_idxs1[idx],:]
+            rxpos2 = antenna2_handle.pos_series[pos_idxs2[idx],:]
 
             R_T2I = self.get_ECEF2ECI(eph_time)
             
@@ -6822,29 +7010,24 @@ class GNSSTKStores(object):
             earth_vel = np.array(earth_posvel[3:])*1e3/86400
             eph_time.convertSystemTo(TimeSystem.UTC) # convert time system back for other functions
 
-            # refractivities -- Sovers et al (1998)
-            refrac_1 = 3.13e-4/np.tan(np.radians(elevation1))
-            refrac_2 = 3.13e-4/np.tan(np.radians(elevation2))
-            rxpos1_eci = R_T2I@rxpos1
-            rxpos1_eci /= np.linalg.norm(rxpos1_eci)
-            rxpos2_eci = R_T2I@rxpos2
-            rxpos2_eci /= np.linalg.norm(rxpos2_eci)
-            s_app_1 = earth_vel/const.c - np.dot(s_vec,earth_vel)*s_vec/const.c + np.cos(refrac_1)*s_vec + np.sin(refrac_1)*(rxpos1_eci[2]-rxpos1_eci[2]*s_vec[2]*s_vec)
-            s_app_2 = earth_vel/const.c - np.dot(s_vec,earth_vel)*s_vec/const.c + np.cos(refrac_2)*s_vec + np.sin(refrac_2)*(rxpos2_eci[2]-rxpos2_eci[2]*s_vec[2]*s_vec)
-            s_ecef1 = R_T2I.T@s_app_1 # apparent source vector in ECEF
-            s_ecef1 /= np.linalg.norm(s_ecef1)
-            s_ecef2 = R_T2I.T@s_app_2
-            s_ecef2 /= np.linalg.norm(s_ecef2)
-
-            # update azimuth/elevation for apparent position
-            s1_NEU = R1_NEU@s_ecef1
-            s2_NEU = R2_NEU@s_ecef2
+            # geometric (aberrated, unrefracted) source direction: VieVS evaluates mapping functions and
+            # gradients at this zenith distance (locsource.m); refraction enters only the axis offset
+            s_aber = s_vec + (earth_vel - np.dot(s_vec, earth_vel)*s_vec)/const.c
+            s_geo_ecef = R_T2I.T@s_aber
+            s_geo_ecef /= np.linalg.norm(s_geo_ecef)
+            s1_NEU = R1_NEU@s_geo_ecef
+            s2_NEU = R2_NEU@s_geo_ecef
             elevation1 = np.degrees(np.arcsin(s1_NEU[2]))
             elevation2 = np.degrees(np.arcsin(s2_NEU[2]))
             azimuth1 = np.degrees(np.arctan2(s1_NEU[1], s1_NEU[0]))
             if azimuth1 < 0: azimuth1 += 360
             azimuth2 = np.degrees(np.arctan2(s2_NEU[1], s2_NEU[0]))
             if azimuth2 < 0: azimuth2 += 360
+
+            # refracted pointing direction for the axis offset: raise the elevation by
+            # 3.13e-4/tan(e) rad in the local vertical plane (VieVS corz in axis_stat.m)
+            s_ecef1 = self.refract_ptvec(s_geo_ecef, antenna1_handle.R_mat[:,2], elevation1)
+            s_ecef2 = self.refract_ptvec(s_geo_ecef, antenna2_handle.R_mat[:,2], elevation2)
 
             if antenna1_handle.is_VLBI is True: 
                 # compute the geometric model for the VLBI antenna
@@ -6950,12 +7133,17 @@ class GNSSTKStores(object):
                     if antenna2_handle.weather_cal_active is True:
                         T, P, H = antenna2_handle.interpolate_weather(times_gps[idx])
                         antenna2_handle.tropModel.setWeather(T, P, H)
+                    if getattr(antenna1_handle.tropModel, 'test_trop', False) and \
+                            getattr(baseline_handle, 'pressure_1', None) is not None:
+                        # in situ pressure from the NGS cards, as in the near-field model
+                        antenna1_handle.tropModel.P_insitu = baseline_handle.pressure_1[idx]
+                        antenna2_handle.tropModel.P_insitu = baseline_handle.pressure_2[idx]
 
                 if getattr(antenna1_handle.tropModel, 'vmf3_type', None) is not None:
                     # VMF3 trop needs azimuth and time
                     rxpos1_gnsstk = Position(rxpos1[0], rxpos1[1], rxpos1[2])
                     rxpos2_gnsstk = Position(rxpos2[0], rxpos2[1], rxpos2[2])
-                    common_time = times_common[idx]
+                    common_time = times_common[pos_idxs1[idx]]
                     trop_delay1 = antenna1_handle.tropModel.correction_azel(rxpos1_gnsstk, azimuth1, elevation1, common_time)
                     trop_delay2 = antenna2_handle.tropModel.correction_azel(rxpos2_gnsstk, azimuth2, elevation2, common_time)
                 else:
@@ -7520,6 +7708,16 @@ class GNSSTKStores(object):
         pcv_delay = -sat_PCV*1e-3
         return pcv_delay
 
+    @staticmethod
+    def refract_ptvec(s_ecef, up_ecef, elevation_deg):
+        """ Raise a unit source vector toward the local vertical by the standard refraction
+            angle 3.13e-4/tan(e) rad (Sovers et al. 1998; VieVS corz) """
+        refrac = 3.13e-4/np.tan(np.radians(elevation_deg))
+        perp = up_ecef - np.dot(up_ecef, s_ecef)*s_ecef
+        perp /= np.linalg.norm(perp)
+        s_refr = np.cos(refrac)*s_ecef + np.sin(refrac)*perp
+        return s_refr/np.linalg.norm(s_refr)
+
     def compute_ptvec(self, ra, dec, eph_time, frame='ECEF'):
         """ Compute the ECEF pointing vector to the source from right ascension and declination """
         ra_rad = np.deg2rad(ra)
@@ -7559,9 +7757,10 @@ class GNSSTKStores(object):
             xp = self.EO_obj.xp*np.pi/648000
             yp = self.EO_obj.yp*np.pi/648000
             w_earth = 7.2921150e-5
-            w_vec = w_earth * np.array([-yp, xp, np.sqrt(1-xp**2 - yp**2)])
-            # compute GCRF velocity
-            vel_gcrf = R_T2I@vel_itrf-np.cross(w_vec,pos_gcrf)
+            # rotation vector along the CIP, whose ITRS direction is (xp, -yp, 1) to first order;
+            # d/dt (R_T2I r) = R_T2I (v + omega x r), i.e. +omega x r (eastward) for a fixed site
+            omega_itrf = w_earth * np.array([xp, -yp, np.sqrt(1 - xp**2 - yp**2)])
+            vel_gcrf = R_T2I@(np.asarray(vel_itrf, dtype=float) + np.cross(omega_itrf, np.asarray(pos_itrf, dtype=float)))
 
             return pos_gcrf, vel_gcrf
 
@@ -7857,37 +8056,29 @@ class GNSSTKStores(object):
             # Loop over planets
             rxpos1_brs = rxpos1_crs + earth_pos
             rxpos2_brs = rxpos2_crs + earth_pos
+            # gravitational delay (IERS Conventions 2010 eq. 11.1-11.5, as VieVS grav_delay.m):
+            # Sun, Moon and planets, body taken at its retarded time w.r.t. station 1
+            b_crs_grav = rxpos2_crs - rxpos1_crs
+            bodies = [(self.sol_sys.idSun, MU_SUN), (getattr(self.sol_sys, 'idMoon', 10), MU_MOON)] + \
+                     [(planet_id, planet_mu[planet_id]) for planet_id in planets]
             tau_grav = 0.0
-            for j1 in planets:
-                mu = planet_mu[j1]
-                #mjd_tdb = MJD(eph_time.dMJD(), TimeSystem.TDB)
-                mjd_tdb = eph_time.dMJD() 
-                
-                # Get coordinates of the planet at the moment of time of arrival
-                planet_posvel = [0,0,0,0,0,0]
-                #self.sol_sys.relativeInertialPositionVelocity(mjd_tdb, j1, self.sol_sys.idSolarSystemBarycenter, planet_posvel, set_km)
-                planet_posvel = self.sol_sys.relativeInertialPositionVelocityPyWrapper(mjd_tdb, j1, self.sol_sys.idSolarSystemBarycenter, set_km)
-                planet_pos = np.array(planet_posvel[:3])*1e3
-                planet_vel = np.array(planet_posvel[3:])*1e3/86400
-            
-                # Solve light cone equation (one iteration)
-                r1a = rxpos1_brs - planet_pos 
-                r2a = rxpos2_brs - planet_pos
-                tau_retr1 = -np.linalg.norm(r1a) / const.c
-                tau_retr2 = -np.linalg.norm(r2a) / const.c
-            
-                # Compute position of the gravitating body at retarded moment of time
-                planet_pos1 = planet_pos + tau_retr1*planet_vel
-                r1a = rxpos1_brs - planet_pos1
-                r1a_len = np.linalg.norm(r1a)
-            
-                planet_pos2 = planet_pos + tau_retr2*planet_vel
-                r2a = rxpos2_brs - planet_pos2
-                r2a_len = np.linalg.norm(r2a)
-            
-                tau_grav += (2.0 * mu / const.c**3 * (1.0 + np.dot(s_vec, planet_vel) / const.c) *
-                            np.log((r1a_len * (1.0 + np.dot(s_vec, r1a))) /
-                                   (r2a_len * (1.0 + np.dot(s_vec, r2a)))))
+            for body_id, mu in bodies:
+                body_posvel = self.sol_sys.relativeInertialPositionVelocityPyWrapper(mjd_tdb, body_id, self.sol_sys.idSolarSystemBarycenter, set_km)
+                body_pos_bar = np.array(body_posvel[:3])*1e3
+                body_vel_bar = np.array(body_posvel[3:])*1e3/86400
+                body_pos = body_pos_bar
+                for iteration in range(3):
+                    body_pos = body_pos_bar - np.linalg.norm(body_pos - rxpos1_brs)/const.c*body_vel_bar
+                r1_body = rxpos1_brs - body_pos
+                r2_body = rxpos2_brs - earth_vel/const.c*np.dot(s_vec, b_crs_grav) - body_pos
+                # (1 + K.v_body/c): moving-body factor of Kopeikin & Schaefer (1999), kept from the original
+                # Petrov/Kopeikin form; < 0.01 ps here, omitted by IERS 2010 eq. 11.1
+                tau_grav += 2.0*mu/const.c**3*(1.0 + np.dot(s_vec, body_vel_bar)/const.c) * \
+                            np.log((np.linalg.norm(r1_body) + np.dot(s_vec, r1_body)) /
+                                   (np.linalg.norm(r2_body) + np.dot(s_vec, r2_body)))
+            # Earth (eq. 11.4)
+            tau_grav += 2.0*MU_EARTH/const.c**3*np.log((np.linalg.norm(rxpos1_crs) + np.dot(s_vec, rxpos1_crs)) /
+                                                        (np.linalg.norm(rxpos2_crs) + np.dot(s_vec, rxpos2_crs)))
             
             # Final computations
             b_crs = rxpos2_crs-rxpos1_crs
@@ -7899,7 +8090,7 @@ class GNSSTKStores(object):
             
             # Compute geometric path delay
             tau_geom = (-np.dot(s_vec, b_crs) / const.c * \
-                       (1.0 - 2.0 * MU_SUN / (dist_sun_earth * const.c**2) - np.linalg.norm(earth_vel) / (2.0 * const.c**2) - \
+                       (1.0 - 2.0 * MU_SUN / (dist_sun_earth * const.c**2) - np.dot(earth_vel, earth_vel) / (2.0 * const.c**2) - \
                         np.dot(earth_vel, rxvel2_crs) / const.c**2) - \
                        np.dot(earth_vel, b_crs) / const.c**2 * (1.0 + np.dot(s_vec, earth_vel) / (2.0 * const.c) ) + tau_grav) \
                        / (1.0 + np.dot(s_vec, earth_vel + rxvel2_crs)  / const.c)
@@ -8435,14 +8626,17 @@ class GNSSTKStores(object):
             else:
                 phase_clock_start = antenna2_handle.phase_clock_start
 
+        # pos_series is sampled on each antenna's epochs; map baseline epochs into them
+        pos_idxs1 = map_epochs(antenna1_handle.times_gps, times_gps)
+        pos_idxs2 = map_epochs(antenna2_handle.times_gps, times_gps)
         for idx, common_time in enumerate(times_common):
             eph_time = EphTime(common_time)
             eph_time.setTimeSystem(TimeSystem.UTC)
             sat_id = self.source_time_dict[times_gps[idx]]
             sat_antenna = self.antenna_map[str(sat_id)]  
             RSID = RinexSatID(str(sat_id))
-            rxpos1 = antenna1_handle.pos_series[idx,:]
-            rxpos2 = antenna2_handle.pos_series[idx,:]
+            rxpos1 = antenna1_handle.pos_series[pos_idxs1[idx],:]
+            rxpos2 = antenna2_handle.pos_series[pos_idxs2[idx],:]
           
             freq1 = transmitter_antex_code(f1, RSID.systemChar())
             if self.iono_free:
@@ -8754,12 +8948,15 @@ class GNSSTKStores(object):
             a_vec2 = antenna2_handle.calc_VLBI_mount_vec()
 
         times_common = date_to_common(times_gps, 'GPS')
+        # pos_series is sampled on each antenna's epochs; map baseline epochs into them
+        pos_idxs1 = map_epochs(antenna1_handle.times_gps, times_gps)
+        pos_idxs2 = map_epochs(antenna2_handle.times_gps, times_gps)
         for idx, time in enumerate(times_gps):
             eph_time = EphTime(times_common[idx])
             eph_time.setTimeSystem(TimeSystem.UTC)
             source = self.source_time_dict[time]
-            rxpos1 = antenna1_handle.pos_series[idx,:]
-            rxpos2 = antenna2_handle.pos_series[idx,:]
+            rxpos1 = antenna1_handle.pos_series[pos_idxs1[idx],:]
+            rxpos2 = antenna2_handle.pos_series[pos_idxs2[idx],:]
 
             R_T2I = self.get_ECEF2ECI(eph_time)
 
@@ -8782,17 +8979,17 @@ class GNSSTKStores(object):
             earth_pos = np.array(earth_posvel[:3])*1e3
             earth_vel = np.array(earth_posvel[3:])*1e3
             eph_time.convertSystemTo(TimeSystem.UTC) # convert time system back for other functions
-            # refractivities -- Sovers et al (1998)
-            refrac_1 = 3.13e-4/np.tan(np.radians(elevation1))
-            refrac_2 = 3.13e-4/np.tan(np.radians(elevation2))
-            rxpos1_eci = R_T2I@rxpos1
-            rxpos1_eci /= np.linalg.norm(rxpos1_eci)
-            rxpos2_eci = R_T2I@rxpos1
-            rxpos2_eci /= np.linalg.norm(rxpos2_eci)
-            s_app_1 = earth_vel/const.c - np.dot(s_vec,earth_vel)*s_vec/const.c + np.cos(refrac_1)*s_vec + np.sin(refrac_1)*(rxpos1_eci[2]-rxpos1_eci[2]*s_vec[2]*s_vec)
-            s_app_2 = earth_vel/const.c - np.dot(s_vec,earth_vel)*s_vec/const.c + np.cos(refrac_2)*s_vec + np.sin(refrac_2)*(rxpos2_eci[2]-rxpos2_eci[2]*s_vec[2]*s_vec)
-            s_ecef1 = R_T2I.T@s_app_1 # apparent source vector in ECEF
-            s_ecef2 = R_T2I.T@s_app_2
+            # geometric (aberrated) direction, then refraction for the axis-offset pointing only;
+            # same construction as model_group_phase_farfield (earth_vel here is m/day)
+            s_aber = s_vec + (earth_vel/86400 - np.dot(s_vec, earth_vel/86400)*s_vec)/const.c
+            s_geo_ecef = R_T2I.T@s_aber
+            s_geo_ecef /= np.linalg.norm(s_geo_ecef)
+            s1_NEU = R1_NEU@s_geo_ecef
+            s2_NEU = R2_NEU@s_geo_ecef
+            elevation1 = np.degrees(np.arcsin(s1_NEU[2]))
+            elevation2 = np.degrees(np.arcsin(s2_NEU[2]))
+            s_ecef1 = self.refract_ptvec(s_geo_ecef, antenna1_handle.R_mat[:,2], elevation1)
+            s_ecef2 = self.refract_ptvec(s_geo_ecef, antenna2_handle.R_mat[:,2], elevation2)
 
             rxpos1_gnsstk = Position(rxpos1[0], rxpos1[1], rxpos1[2])
             rxpos2_gnsstk = Position(rxpos2[0], rxpos2[1], rxpos2[2])
@@ -8836,7 +9033,7 @@ class GNSSTKStores(object):
                    rxpos2_dual = rxpos2 + fb_vec
             else:
                 # compute antenna PCV
-                azimuth2 = np.degrees(np.arctan2(s1_NEU[1], s1_NEU[0]))
+                azimuth2 = np.degrees(np.arctan2(s2_NEU[1], s2_NEU[0]))
                 if azimuth2 < 0: azimuth2 += 360
                 ROT = antenna2_handle.R_mat # rotation from NEU to XYZ (ECEF)
                 PCV_L1 = antennaPCOData2.getPhaseCenterVariation(freq1_ant, azimuth2, elevation2)
