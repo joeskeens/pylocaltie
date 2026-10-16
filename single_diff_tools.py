@@ -191,6 +191,7 @@ FREQ_TO_RINEX_ANT = {
     2492.028e6: 'I09',   # NavIC S
 }
 _TX_FREQ_HZ = {
+    'L': {1176.45e6: 'G01'},
     'G': {1575.42e6: 'G01', 1227.60e6: 'G02', 1176.45e6: 'G05'},
     'R': {1602.00e6: 'R01', 1246.00e6: 'R02', 1202.025e6: 'R03'},
     'E': {1575.42e6: 'E01', 1176.45e6: 'E05', 1278.75e6: 'E06',
@@ -1264,10 +1265,13 @@ def import_data_vlbi(fringe_file, antennas, baselines, rinex_sats, key_file=None
             duration_dict[time] = dur[idx]
 
         # check if psolve baselines match baselines array
-        if baseline_use.split()[0] != antennas[baseline[0]]:
-            # need to change the sign of the measurements
-            group_delays = -group_delays
-            phase_delays = -phase_delays
+        #if baseline_use.split()[0] != antennas[baseline[0]]:
+        #    # need to change the sign of the measurements
+        #    group_delays = -group_delays
+        #    phase_delays = -phase_delays
+        if baseline_use.split('_')[0] != antennas[baseline[0]]:
+            baseline = baseline[::-1]
+            antenna1, antenna2 = antenna2, antenna1
             
         group_delays = group_delays*const.c # group delay in meters
         # get correlation between ambiguities by adding nearest integer from group delay -- this will cause linked measurements hopefully
@@ -1399,10 +1403,13 @@ def import_data_nc_sim(nc_file, antennas, baselines, key_file=None):
             point_ra_dec_full = np.array(list(zip(ra_list, dec_list)))
 
         # check if psolve baselines match baselines array
-        if reverse_sign is True:
-            # need to change the sign of the measurements
-            group_delays = -group_delays
-            phase_delays = -phase_delays
+        #if reverse_sign is True:
+        #    # need to change the sign of the measurements
+        #    group_delays = -group_delays
+        #    phase_delays = -phase_delays
+        if reverse_sign: 
+            baseline = baseline[::-1]
+            antenna1, antenna2 = antenna2, antenna1
             
         # get correlation between ambiguities by adding nearest integer from group delay -- this will cause linked measurements hopefully
         baseline_handle = BaselineInfo(datetime_array, freq)
@@ -1480,10 +1487,13 @@ def import_data_vlbi_farfield(fringe_file, antennas, baselines, src_dict):
             src_time_dict[datetime_array[idx]] = source
 
         # check if psolve baselines match baselines array
-        if baseline_use.split()[0] != antennas[baseline[0]]:
-            # need to change the sign of the measurements
-            group_delays = -group_delays
-            phase_delays = -phase_delays
+        #if baseline_use.split()[0] != antennas[baseline[0]]:
+        #    # need to change the sign of the measurements
+        #    group_delays = -group_delays
+        #    phase_delays = -phase_delays
+        if baseline_use.split('_')[0] != antennas[baseline[0]]:
+            baseline = baseline[::-1]
+            antenna1, antenna2 = antenna2, antenna1
             
         group_delays = group_delays*const.c # group delay in meters
         # get correlation between ambiguities by adding nearest integer from group delay -- this will cause linked measurements hopefully
@@ -1692,9 +1702,8 @@ def import_data_ngs(ngs_file, antennas, baselines, utc2gps):
 
         # check if baselines match baselines array
         if baseline_use.split('_')[0] != antennas[baseline[0]]:
-            # need to change the sign of the measurements
-            group_delays = -group_delays
-            phase_delays = -phase_delays
+            baseline = baseline[::-1]
+            antenna1, antenna2 = antenna2, antenna1
             pressure_1_hold = pressure_1
             pressure_1 = pressure_2.copy()
             pressure_2 = pressure_1_hold.copy()
@@ -2152,10 +2161,14 @@ def import_data_vlbi_vda(vda_file, antennas, baselines, band):
             src_time_dict[datetime_array[idx]] = source
 
         # check if baselines match baselines array
+        #if baseline_use.split('_')[0] != antennas[baseline[0]]:
+        #    # need to change the sign of the measurements
+        #    group_delays = -group_delays
+        #    phase_delays = -phase_delays
+
         if baseline_use.split('_')[0] != antennas[baseline[0]]:
-            # need to change the sign of the measurements
-            group_delays = -group_delays
-            phase_delays = -phase_delays
+            baseline = baseline[::-1]
+            antenna1, antenna2 = antenna2, antenna1
             
         group_delays = group_delays*const.c # group delay in meters
         grdel_err = grdel_err*const.c
@@ -2397,10 +2410,14 @@ def import_data_vlbi_vgosdb(db_loc, antennas, baselines, band):
             duration_dict[datetime_array[idx]] = duration_arr[idx]
 
         # check if baselines match baselines array
+        #if baseline_use.index(antennas[baseline[0]])>baseline_use.index(antennas[baseline[1]]):
+        #    # need to change the sign of the measurements
+        #    group_delays = -group_delays
+        #    phase_delays = -phase_delays
+
         if baseline_use.index(antennas[baseline[0]])>baseline_use.index(antennas[baseline[1]]):
-            # need to change the sign of the measurements
-            group_delays = -group_delays
-            phase_delays = -phase_delays
+            baseline = baseline[::-1]
+            antenna1, antenna2 = antenna2, antenna1
 
         group_delays = group_delays*const.c # group delay in meters
         grdel_errors_bl = grdel_errors_bl*const.c
@@ -6246,6 +6263,10 @@ class GNSSTKStores(object):
         phase_model_arr = []
         cpw1_arr = []
         cpw2_arr = []
+        cpw1_arr_rx = []
+        cpw2_arr_rx = []
+        cpw1_arr_tx = []
+        cpw2_arr_tx = []
         f1 = antenna1_handle.f1
         freq1_ant = FREQ_TO_RINEX_ANT[f1]
         if self.iono_free: # iono-free only for GPS, ref frequency for precise range
@@ -6275,16 +6296,24 @@ class GNSSTKStores(object):
                 offset2_dual = antennaPCOData.getPhaseCenterOffset(freq2_ant)
                 offset2_dual = np.array([offset2_dual[0],offset2_dual[1],offset2_dual[2]])/1e3 # convert to m
 
+        cpw_ant1 = {} # carrrier phase windup, dictionary by source
+        cpw_ant2 = {}
+        for source in self.source_array:
+            cpw_ant1[source] = 0.0 # initialize cpw to 0
+            cpw_ant2[source] = 0.0 
+        wavelength_1 = baseline_handle.wavelength
+        if self.iono_free:
+            wavelength_2 = baseline_handle.wavelength_dual
         if phase is True: # need to account for carrier phase windup
-            cpw_ant1 = {} # carrrier phase windup, dictionary by source
-            cpw_ant2 = {}
-            for source in self.source_array:
-                cpw_ant1[source] = 0.0 # initialize cpw to 0
-                cpw_ant2[source] = 0.0 
+            #cpw_ant1 = {} # carrrier phase windup, dictionary by source
+            #cpw_ant2 = {}
+            #for source in self.source_array:
+            #    cpw_ant1[source] = 0.0 # initialize cpw to 0
+            #    cpw_ant2[source] = 0.0 
 
-            wavelength_1 = baseline_handle.wavelength
-            if self.iono_free:
-                wavelength_2 = baseline_handle.wavelength_dual
+            #wavelength_1 = baseline_handle.wavelength
+            #if self.iono_free:
+            #    wavelength_2 = baseline_handle.wavelength_dual
       
             if antenna1_handle.is_VLBI is False:
                 east_triple_ant1 = Position(antenna1_handle.Rotate_obj.get_value(1,0),\
@@ -6571,7 +6600,24 @@ class GNSSTKStores(object):
 
                 group_model_arr.append(group_model)
 
-            if phase is True: 
+            # --- DEBUG: Ishioka near-field timing diagnostics ---
+            #if 'ISHIOKA' in (antenna1_handle.antenna_name, antenna2_handle.antenna_name) and \
+            #        np.datetime64('2025-08-03T06:50') <= times_gps[idx] <= np.datetime64('2025-08-03T07:20'):
+            #    x_rx = np.array([sat_xvt.x[0], sat_xvt.x[1], sat_xvt.x[2]])  # ECEF, at time tag (untouched by get_delay_model)
+            #    v_rx = np.array([sat_xvt.v[0], sat_xvt.v[1], sat_xvt.v[2]])
+            #    rho1 = np.linalg.norm(x_rx - rxpos1)
+            #    rho2 = np.linalg.norm(x_rx - rxpos2)
+            #    rd1 = np.dot(v_rx, (x_rx - rxpos1)/rho1)   # ECEF range rate, fixed station
+            #    rd2 = np.dot(v_rx, (x_rx - rxpos2)/rho2)
+            #    tau_geo = (rho2 - rho1)/const.c
+            #    res = baseline_handle.group_delays[idx] - group_model
+            #    print(f'{antenna1_handle.antenna_name}-{antenna2_handle.antenna_name} {times_gps[idx]} {sat_id} '
+            #          f'res={res:.3f} m  rd1={rd1:.1f} rd2={rd2:.1f} m/s  tau={tau_geo*1e3:.4f} ms  '
+            #          f'dt_bl={res/(rd2-rd1)*1e3:.4f} ms  dt_1={res/rd1*1e3:.4f} ms  '
+            #          f'delay={delay:.3f} clk={clock_offset:.3f}')
+            #    breakpoint()
+
+            if True: #phase is True: 
                 if len(phase_clock_samples) > 0:
                     phase_clock_offset = phase_clock_samples[idx]
                 else:
@@ -6588,6 +6634,8 @@ class GNSSTKStores(object):
                                 rx2sat1, e_vec1, n_vec1, u_vec1)
                     else:
                         cpw1_current = self.phase_windup_VLBI(sat_id, times_gps[idx], eph_time, sat_pos_gnsstk, \
+                                rx2sat1, a_vec1)
+                        cpw1_rx, cpw1_tx = self.phase_windup_VLBI_rx_tx(sat_id, times_gps[idx], eph_time, sat_pos_gnsstk, \
                                 rx2sat1, a_vec1)
                         if antenna1_handle.antenna_type == 'Nasmyth' or antenna1_handle.antenna_type == 'BWG':
                         #if antenna1_handle.antenna_type == 'Nasmyth':
@@ -6609,6 +6657,8 @@ class GNSSTKStores(object):
                     else:
                         cpw2_current = self.phase_windup_VLBI(sat_id, times_gps[idx], eph_time, sat_pos_gnsstk, \
                                 rx2sat2, a_vec2)
+                        cpw2_rx, cpw2_tx = self.phase_windup_VLBI_rx_tx(sat_id, times_gps[idx], eph_time, sat_pos_gnsstk, \
+                                rx2sat2, a_vec2)
                         if antenna2_handle.antenna_type == 'Nasmyth' or antenna2_handle.antenna_type == 'BWG':
                         #if antenna2_handle.antenna_type == 'Nasmyth':
                             cpw2_current += elevation2/360
@@ -6627,6 +6677,10 @@ class GNSSTKStores(object):
                 cpw_ant2[sat_id] = cpw2_current
                 cpw1_arr.append(cpw1_current*wavelength_1)
                 cpw2_arr.append(cpw2_current*wavelength_1)
+                cpw1_arr_rx.append(cpw1_rx*wavelength_1)
+                cpw2_arr_rx.append(cpw2_rx*wavelength_1)
+                cpw1_arr_tx.append(cpw1_tx*wavelength_1)
+                cpw2_arr_tx.append(cpw2_tx*wavelength_1)
 
 
                 phase_model = delay + (trop_delay2-trop_delay1) - (iono_delay2-iono_delay1) + (cpw2_current-cpw1_current)*wavelength_1 \
@@ -6640,6 +6694,8 @@ class GNSSTKStores(object):
 
         if phase is True:
             baseline_handle.save_cpw(cpw1_arr, cpw2_arr)
+            baseline_handle.cpw_rx = np.array(cpw2_arr_rx)-np.array(cpw1_arr_rx)
+            baseline_handle.cpw_tx = np.array(cpw2_arr_tx)-np.array(cpw1_arr_tx)
             if self.iono_free is True:
                 baseline_handle.save_vlbi_model(group_model_arr, phase_model_arr, phase_model_dual_arr)
             else:
@@ -7567,8 +7623,25 @@ class GNSSTKStores(object):
         r = P@a_vec
         t = P@t_a + S_x@t_t
         phase_windup = np.arctan2(r.T@S_x.T@t, r.T@t)/(2*np.pi)
-
         return phase_windup
+
+    def phase_windup_VLBI_rx_tx(self, sat_id, datetime, eph_time, sat_pos, rx2sat, a_vec):
+        """ Compute the carrier phase windup correction for a VLBI antenna
+            using the expression from https://link.springer.com/article/10.1007/s10291-008-0112-1
+            This does not assume perfect RHCP signals
+        """
+        t_a, t_t = self.get_sat_vectors(sat_id, datetime, eph_time, sat_pos)
+        S_x = np.array([[0, -rx2sat[2], rx2sat[1]], [rx2sat[2], 0, -rx2sat[0]], [-rx2sat[1], rx2sat[0], 0]])
+        P = S_x @ S_x.T
+        r = P@a_vec
+        t = P@t_a + S_x@t_t
+
+        z = np.array([0,0,1])
+        pw_rx = np.arctan2(r.T@S_x.T@z, r.T@z)/(2*np.pi)
+        pw_tx = np.arctan2(z.T@S_x.T@t, z.T@t)/(2*np.pi)
+
+        #return phase_windup
+        return pw_rx, pw_tx
 
     def phase_windup_VLBI_BWG(self, antenna_name, sat_id, datetime, eph_time, sat_pos, rx2sat, e_vec, n_vec, u_vec):
         """ Compute the carrier phase windup correction for a VLBI antenna
@@ -12514,7 +12587,7 @@ def analyze_ls_solution(sol_type, plot_results, ref_antenna, clock_idxs, trop_id
         times_gps = antenna_handle.times_gps
         time_deltas_full = (times_gps - times_gps[0])/np.timedelta64(1, 's')
         full_time_hr = np.round(time_deltas_full[-1]/3600) 
-        interval_hr = int(np.ceil(full_time_hr/8))       
+        interval_hr = int(np.ceil(full_time_hr/8))*2 
         #  plot elevation and azimuth 
         plt.figure(figsize=(10, 6))
         plt.plot(times_gps, antenna_handle.elev_arr, marker='x', linestyle='None', color='b', label='elevation') 
@@ -12693,6 +12766,11 @@ def analyze_ls_solution(sol_type, plot_results, ref_antenna, clock_idxs, trop_id
 
     if plot_results is False:
         return
+
+    plot_full = True
+    if plot_full is True:
+        fig_res, ax_res = plt.subplots(figsize=(10, 6))
+
      
     num_samples = 0
     for jdx, baseline in enumerate(baselines): # generate differential measurements on the baselines
@@ -12814,7 +12892,7 @@ def analyze_ls_solution(sol_type, plot_results, ref_antenna, clock_idxs, trop_id
         
         time_deltas_full = (times_gps - times_gps[0])/np.timedelta64(1, 's')
         full_time_hr = np.round(time_deltas_full[-1]/3600) 
-        interval_hr = int(np.ceil(full_time_hr/8))      
+        interval_hr = int(np.ceil(full_time_hr/8))*2 
         if interval_hr ==0: interval_hr = 1 
         
         # print baseline-specific quantities
@@ -13069,6 +13147,38 @@ def analyze_ls_solution(sol_type, plot_results, ref_antenna, clock_idxs, trop_id
                 fig.savefig(sol_type+'_'+sol_name+'_hist_meas_residuals_'+\
                         antenna2_handle.antenna_name+'_' + antenna1_handle.antenna_name + '.png')       
             plt.close(fig)
+
+            if sol_type == 'VLBI' and store_handle.src_type=='GNSS':
+                dt_phase = baseline_handle.datetime_array[baseline_handle.phase_data_idxs]
+
+                wavelength_1 = baseline_handle.wavelength
+                data_phase = DataFrame({
+                    'Datetime': dt_phase})
+                data_phase.set_index('Datetime', inplace=True)
+             
+                phase_index_array = data_phase.index.to_numpy()
+                fig, ax1 = plt.subplots(figsize=(10, 6))
+                #ax1.scatter(phase_index_array, baseline_handle.cpw_1[baseline_handle.phase_data_idxs]/wavelength_1*2*np.pi, color='r', label=antenna1_handle.antenna_name, zorder=0)
+                #ax1.scatter(phase_index_array, baseline_handle.cpw_2[baseline_handle.phase_data_idxs]/wavelength_1*2*np.pi, color='b', label=antenna2_handle.antenna_name, zorder=0)
+                #ax1.scatter(phase_index_array, (baseline_handle.cpw_2-baseline_handle.cpw_1)[baseline_handle.phase_data_idxs]/wavelength_1*2*np.pi, color='k', label='differential', zorder=1)
+                ax1.scatter(phase_index_array, baseline_handle.cpw_rx[baseline_handle.phase_data_idxs]/wavelength_1*2*np.pi, color='r', label='parallactic angle', zorder=0)
+                ax1.scatter(phase_index_array, baseline_handle.cpw_tx[baseline_handle.phase_data_idxs]/wavelength_1*2*np.pi, color='b', label='transmitter wind-up', zorder=0)
+                ax1.scatter(phase_index_array, (baseline_handle.cpw_rx+baseline_handle.cpw_tx)[baseline_handle.phase_data_idxs]/wavelength_1*2*np.pi, color='k', label='full', zorder=1)
+                ax1.legend()
+                ax1.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d %H:%M'))
+                ax1.xaxis.set_major_locator(mdates.HourLocator(interval=interval_hr))  # Adjust interval as needed
+                fig.autofmt_xdate()  # Auto-rotate date labels
+                ax1.set_title('phase windup (' + antenna2_handle.antenna_name + '—' + antenna1_handle.antenna_name + ')')
+                #ax1.set_xlabel('date + hr')
+                ax1.set_ylabel('phase windup (rad)')
+                ax1.grid(True)
+                if iono_free is True:
+                    fig.savefig(sol_type+'_'+sol_name+'_phase_windup_'+antenna2_handle.antenna_name+'_' + antenna1_handle.antenna_name + '_ionofree.png')
+                else:
+                    fig.savefig(sol_type+'_'+sol_name+'_phase_windup_'+antenna2_handle.antenna_name+'_' + antenna1_handle.antenna_name + '.png')
+                plt.close(fig)
+            if sol_type == 'VLBI' and plot_full:
+                ax_res.plot(index_array, data['Residuals'].to_numpy(), marker='x', linestyle='None')
 
             #for src in np.unique(source_array):
             #    residuals_src = []
@@ -13657,6 +13767,21 @@ def analyze_ls_solution(sol_type, plot_results, ref_antenna, clock_idxs, trop_id
             #                fig.savefig(sol_type+'_'+sol_name+'_hist_phase_meas_residuals_'+src+'_'+\
             #                        antenna2_handle.antenna_name+'_' + antenna1_handle.antenna_name + '.png')       
             #            plt.close(fig)
+    if plot_full:
+        # Formatting the date on the x-axis
+        ax_res.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d %H:%M'))
+        ax_res.xaxis.set_major_locator(mdates.HourLocator(interval=interval_hr))  # Adjust interval as needed
+        #plt.gcf().autofmt_xdate()  # Auto-rotate date labels
+        
+        ax_res.set_ylabel('meas. residuals (m)')
+        ax_res.grid(True)
+
+        if iono_free is True:
+            fig_res.savefig(sol_type+'_'+sol_name+'_meas_residuals_full_ionofree.png')
+        else:
+            fig_res.savefig(sol_type+'_'+sol_name+'_meas_residuals_full.png')
+        plt.close(fig_res)
+
     if phase_delay is True and len(antenna_handles)>2:
         # first use integer amb to get amb_state by baseline, then send this to find_closure_meas
         # generate phase closure plots
