@@ -764,11 +764,11 @@ if __name__ == '__main__':
     elif obs_type == 'VLBI':
         # parse key file
         if args.src_type == 'GNSS':
-            baseline_handles, datetime_array, source_array, point_ra_dec_array, dt_ant, duration_arr = import_data_vlbi(args.fringe_file, \
+            baseline_handles, baselines, datetime_array, source_array, point_ra_dec_array, dt_ant, duration_arr = import_data_vlbi(args.fringe_file, \
                     antenna_names, baselines, rinex_sats, args.key_file)
         elif args.src_type == 'VLBI':
             if args.fringe_file is not None:
-                baseline_handles, datetime_array, source_array, point_ra_dec_array, dt_ant, duration_arr = import_data_vlbi_farfield(args.fringe_file, antenna_names, baselines, src_dict)
+                baseline_handles, baselines, datetime_array, source_array, point_ra_dec_array, dt_ant, duration_arr = import_data_vlbi_farfield(args.fringe_file, antenna_names, baselines, src_dict)
             if args.ngs_file is not None:
                 if args.utc2gps is None:
                     raise ValueError('UTC2GPS cannot be none when reading NGS file')
@@ -776,7 +776,7 @@ if __name__ == '__main__':
             if args.vda_file is not None:
                 if args.band is None:
                     raise ValueError('Must select a band when reading vgosDA')
-                baseline_handles, datetime_array, source_array, point_ra_dec_array, dt_ant, rxpos_all_db, duration_arr = import_data_vlbi_vda(args.vda_file, antenna_names, baselines, args.band)
+                baseline_handles, baselines, datetime_array, source_array, point_ra_dec_array, dt_ant, rxpos_all_db, duration_arr, _ = import_data_vlbi_vda(args.vda_file, antenna_names, baselines, args.band)
                 if args.rxpos is None:
                     rxpos_all = rxpos_all_db
             if args.vgosDB is not None:
@@ -784,7 +784,7 @@ if __name__ == '__main__':
                     raise ValueError('Must select a band when reading vgosDB')
                 if args.utc2gps is not None:
                     print('argument utc2gps has no effect with vgosDB data input (offset is in DB)')
-                baseline_handles, datetime_array, source_array, point_ra_dec_array, dt_ant, rxpos_all_db, duration_arr = import_data_vlbi_vgosdb(args.vgosDB, antenna_names, baselines, args.band)
+                baseline_handles, baselines, datetime_array, source_array, point_ra_dec_array, dt_ant, rxpos_all_db, duration_arr = import_data_vlbi_vgosdb(args.vgosDB, antenna_names, baselines, args.band)
                 if args.rxpos is None:
                     rxpos_all = rxpos_all_db
 

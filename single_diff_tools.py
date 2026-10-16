@@ -1159,6 +1159,7 @@ def import_data_vlbi(fringe_file, antennas, baselines, rinex_sats, key_file=None
     if False: # key_file is not None:
         datetime_array_srt = np.array(deepcopy(datetime_array_full))
     baseline_handles = []
+    baselines_final = []
     for jdx, baseline in enumerate(baselines):
         antenna1 = antennas[baseline[0]]
         antenna2 = antennas[baseline[1]]
@@ -1269,7 +1270,7 @@ def import_data_vlbi(fringe_file, antennas, baselines, rinex_sats, key_file=None
         #    # need to change the sign of the measurements
         #    group_delays = -group_delays
         #    phase_delays = -phase_delays
-        if baseline_use.split('_')[0] != antennas[baseline[0]]:
+        if baseline_use.split('/')[0].strip() != antennas[baseline[0]]:
             baseline = baseline[::-1]
             antenna1, antenna2 = antenna2, antenna1
             
@@ -1283,6 +1284,7 @@ def import_data_vlbi(fringe_file, antennas, baselines, rinex_sats, key_file=None
         baseline_handle.prepare_vlbi(group_delays, phase_delays, grdel_err, phdel_err)
         #baseline_handle.prepare_vlbi(group_delays, phase_delays, grdel_err, phdel_err, group_delays_dual, phase_delays_dual)
         baseline_handles.append(baseline_handle)
+        baselines_final.append(baseline)
 
         # add observed epochs to datetimes for each antenna
         dt_ant[antenna1] = np.union1d(dt_ant[antenna1], datetime_array)
@@ -1302,7 +1304,7 @@ def import_data_vlbi(fringe_file, antennas, baselines, rinex_sats, key_file=None
     
     datetime_array_srt = np.array(datetime_array_srt, dtype='datetime64[ns]')
     print('Number of scans: ' + str(len(datetime_array_srt)))
-    return baseline_handles, datetime_array_srt, source_array_full, point_ra_dec_full, dt_ant, duration_dict
+    return baseline_handles, baselines_final, datetime_array_srt, source_array_full, point_ra_dec_full, dt_ant, duration_dict
 
 
 TOLERANCE_SECONDS=100
@@ -1371,6 +1373,7 @@ def import_data_nc_sim(nc_file, antennas, baselines, key_file=None):
     freq = nc_data.attrs["frequency"]
 
     baseline_handles = []
+    baselines_final = []
     for baseline in baselines:
         antenna1 = antennas[baseline[0]]
         antenna2 = antennas[baseline[1]]
@@ -1416,12 +1419,13 @@ def import_data_nc_sim(nc_file, antennas, baselines, key_file=None):
         baseline_handle.prepare_vlbi(group_delays, phase_delays, grdel_err, phdel_err)
         #baseline_handle.prepare_vlbi(group_delays, phase_delays, grdel_err, phdel_err, group_delays_dual, phase_delays_dual)
         baseline_handles.append(baseline_handle)
+        baselines_final.append(baseline)
 
         # add observed epochs to datetimes for each antenna
         dt_ant[antenna1] = np.union1d(dt_ant[antenna1], datetime_array)
         dt_ant[antenna2] = np.union1d(dt_ant[antenna2], datetime_array)
 
-    return baseline_handles, datetime_array, source_array_full, point_ra_dec_full, dt_ant
+    return baseline_handles, baselines_final, datetime_array, source_array_full, point_ra_dec_full, dt_ant
 
 
 def import_data_vlbi_farfield(fringe_file, antennas, baselines, src_dict):
@@ -1441,6 +1445,7 @@ def import_data_vlbi_farfield(fringe_file, antennas, baselines, src_dict):
     datetime_array_srt = np.array([],dtype=np.datetime64)
     src_time_dict = {}
     baseline_handles = []
+    baselines_final = []
     for baseline in baselines:
         antenna1 = antennas[baseline[0]]
         antenna2 = antennas[baseline[1]]
@@ -1491,7 +1496,7 @@ def import_data_vlbi_farfield(fringe_file, antennas, baselines, src_dict):
         #    # need to change the sign of the measurements
         #    group_delays = -group_delays
         #    phase_delays = -phase_delays
-        if baseline_use.split('_')[0] != antennas[baseline[0]]:
+        if baseline_use.split('/')[0].strip() != antennas[baseline[0]]:
             baseline = baseline[::-1]
             antenna1, antenna2 = antenna2, antenna1
             
@@ -1505,6 +1510,7 @@ def import_data_vlbi_farfield(fringe_file, antennas, baselines, src_dict):
         baseline_handle.prepare_vlbi(group_delays, phase_delays, grdel_err, phdel_err)
         #baseline_handle.prepare_vlbi(group_delays, phase_delays, grdel_err, phdel_err, group_delays_dual, phase_delays_dual)
         baseline_handles.append(baseline_handle)
+        baselines_final.append(baseline)
 
         for idx, time in enumerate(np.array(dt_psolve, dtype='datetime64[ns]')):
             duration_dict[time] = dur[idx]
@@ -1523,7 +1529,7 @@ def import_data_vlbi_farfield(fringe_file, antennas, baselines, src_dict):
         source_array_full.append(source)
         point_ra_dec_full.append((ra,dec))
     print('Number of scans: ' + str(len(datetime_array_srt)))
-    return baseline_handles, datetime_array_srt, source_array_full, point_ra_dec_full, dt_ant, duration_dict
+    return baseline_handles, baselines_final, datetime_array_srt, source_array_full, point_ra_dec_full, dt_ant, duration_dict
 
 def parse_ra_dec(ra_hours, ra_mins, ra_secs, dec_sign, dec_degs, dec_mins, dec_secs):
     """Convert RA and DEC from hms/dms to decimal degrees."""
@@ -1704,9 +1710,6 @@ def import_data_ngs(ngs_file, antennas, baselines, utc2gps):
         if baseline_use.split('_')[0] != antennas[baseline[0]]:
             baseline = baseline[::-1]
             antenna1, antenna2 = antenna2, antenna1
-            pressure_1_hold = pressure_1
-            pressure_1 = pressure_2.copy()
-            pressure_2 = pressure_1_hold.copy()
             
         group_delays = group_delays*(const.c/1e9) # group delay in meters
         # get correlation between ambiguities by adding nearest integer from group delay -- this will cause linked measurements hopefully
@@ -2112,6 +2115,7 @@ def import_data_vlbi_vda(vda_file, antennas, baselines, band):
     src_time_dict = {}
     duration_dict = {}
     baseline_handles = []
+    baselines_final = []
     for baseline in baselines:
         antenna1 = antennas[baseline[0]]
         antenna2 = antennas[baseline[1]]
@@ -2183,6 +2187,7 @@ def import_data_vlbi_vda(vda_file, antennas, baselines, band):
         baseline_handle.prepare_vlbi(group_delays, phase_delays, grdel_err, phdel_err)
         #baseline_handle.prepare_vlbi(group_delays, phase_delays, group_delays_dual, phase_delays_dual)
         baseline_handles.append(baseline_handle)
+        baselines_final.append(baseline)
 
         for idx, time in enumerate(np.array(dt_gps, dtype='datetime64[ns]')):
             duration_dict[time] = dur_arr[idx]
@@ -2201,7 +2206,7 @@ def import_data_vlbi_vda(vda_file, antennas, baselines, band):
         source_array_full.append(source)
         point_ra_dec_full.append((ra,dec))
     print('Number of scans: ' + str(len(datetime_array_srt)))
-    return baseline_handles, datetime_array_srt, source_array_full, point_ra_dec_full, dt_ant, rxpos_all, duration_dict, baseline_observations
+    return baseline_handles, baselines_final, datetime_array_srt, source_array_full, point_ra_dec_full, dt_ant, rxpos_all, duration_dict, baseline_observations
 
 def import_data_vlbi_vgosdb(db_loc, antennas, baselines, band):
     """
@@ -2334,6 +2339,7 @@ def import_data_vlbi_vgosdb(db_loc, antennas, baselines, band):
     src_time_dict = {}
     duration_dict = {}
     baseline_handles = []
+    baselines_final = []
     for baseline in baselines:
         antenna1 = antennas[baseline[0]]
         antenna2 = antennas[baseline[1]]
@@ -2497,6 +2503,7 @@ def import_data_vlbi_vgosdb(db_loc, antennas, baselines, band):
         baseline_handle.save_weather(met_1_P, met_1_H, met_1_T, met_2_P, met_2_H, met_2_T)
         print('using vgosDB meteorological data -- command line inputs will not be used')
         baseline_handles.append(baseline_handle)
+        baselines_final.append(baseline)
 
         # add observed epochs to datetimes for each antenna
         dt_ant[antenna1] = np.union1d(dt_ant[antenna1], datetime_array)
@@ -2512,7 +2519,7 @@ def import_data_vlbi_vgosdb(db_loc, antennas, baselines, band):
         source_array_full.append(source)
         point_ra_dec_full.append((ra,dec))
     print('Number of scans: ' + str(len(datetime_array_srt)))
-    return baseline_handles, datetime_array_srt, source_array_full, point_ra_dec_full, dt_ant, rxpos_all, duration_arr
+    return baseline_handles, baselines_final, datetime_array_srt, source_array_full, point_ra_dec_full, dt_ant, rxpos_all, duration_arr
 
 def gen_key(rinex_files, full_data, start_date, end_date, eph_sats, iono_free, iono_freq):
     """ Generate a key file choosing a random satellite for each 60 second scan from the commonly observed SVs """

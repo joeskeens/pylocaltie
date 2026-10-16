@@ -81,7 +81,7 @@ def test_VLBI_VLBI():
     clock_poly_length = 60*60
 
     baselines = list(itertools.combinations(range(len(antenna_names)), 2))
-    baseline_handles, datetime_array, source_array, point_ra_dec_array, dt_ant, rxpos_all_db, duration_arr = import_data_vlbi_vgosdb(vgosDB, antenna_names, baselines, band)
+    baseline_handles, baselines, datetime_array, source_array, point_ra_dec_array, dt_ant, rxpos_all_db, duration_arr = import_data_vlbi_vgosdb(vgosDB, antenna_names, baselines, band)
     trop_H = 50
      
     antenna_store = AntennaStore()
@@ -159,7 +159,7 @@ def test_VLBI_VLBI():
 
     # import simulated data
     print('Loading simulated VLBI data...')
-    baseline_handles, datetime_array, source_array, point_ra_dec_array, dt_ant = import_data_nc_sim(nc_out[0], \
+    baseline_handles, baselines, datetime_array, source_array, point_ra_dec_array, dt_ant = import_data_nc_sim(nc_out[0], \
                                     antenna_names, baselines)
     baseline_handles[0].save_weather(P1, H1, T1, P2, H2, T2)
 
@@ -233,7 +233,7 @@ def test_GNSS_VLBI():
        rinex_id = system_code + sv_id
        rinex_sats.append(rinex_id)
 
-    baseline_handles, datetime_array, source_array, point_ra_dec_array, dt_ant, duration_dict = import_data_vlbi(fringe_file, \
+    baseline_handles, baselines, datetime_array, source_array, point_ra_dec_array, dt_ant, duration_dict = import_data_vlbi(fringe_file, \
         antenna_names, baselines, rinex_sats, key_file)
     antenna_store = AntennaStore()
     time_beg = date_to_common(datetime_array[0], 'GPS')
@@ -304,7 +304,7 @@ def test_GNSS_VLBI():
 
     # import simulated data
     print('Loading simulated data...')
-    baseline_handles, datetime_array, source_array, point_ra_dec_array, dt_ant = import_data_nc_sim(nc_out[0], \
+    baseline_handles, baselines, datetime_array, source_array, point_ra_dec_array, dt_ant = import_data_nc_sim(nc_out[0], \
                                     antenna_names, baselines)
 
     print('Estimating positions from simulated data (this will take a little while)...')
@@ -380,7 +380,7 @@ def test_MULTI_GNSS_VLBI():
        rinex_id = system_code + sv_id
        rinex_sats.append(rinex_id)
 
-    baseline_handles, datetime_array, source_array, point_ra_dec_array, dt_ant, duration_dict = import_data_vlbi(fringe_file, \
+    baseline_handles, baselines, datetime_array, source_array, point_ra_dec_array, dt_ant, duration_dict = import_data_vlbi(fringe_file, \
         antenna_names, baselines, rinex_sats, key_file)
     antenna_store = AntennaStore()
     time_beg = date_to_common(datetime_array[0], 'GPS')
@@ -451,7 +451,7 @@ def test_MULTI_GNSS_VLBI():
 
     # import simulated data
     print('Loading simulated data...')
-    baseline_handles, datetime_array, source_array, point_ra_dec_array, dt_ant = import_data_nc_sim(nc_out[0], \
+    baseline_handles, baselines, datetime_array, source_array, point_ra_dec_array, dt_ant = import_data_nc_sim(nc_out[0], \
                                     antenna_names, baselines)
 
     print('Estimating positions from simulated data (this will take a little while)...')
