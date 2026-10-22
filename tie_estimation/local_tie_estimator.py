@@ -71,6 +71,10 @@ from single_diff_tools import import_key_gnss, import_vex_gnss, import_data_vlbi
 
 MIN_SLICE = 0
 MIN_TROP_DIST = 0.5e3 # 1 km
+# Longest baseline above which every antenna (reference included) carries absolute ZWD states. Below it the
+# wet mapping functions at the two ends are nearly equal, so only ZWD differences w.r.t. the reference are
+# observable: m_w(e) changes by ~0.5 per degree at 10 deg elevation and the elevation difference is ~b/R_E.
+MIN_ABS_TROP_DIST = 100e3
 MU_EARTH = 3.9860044188e14
 #TK_LAMBDA = 1e-9
 #TK_LAMBDA = 1e-9
@@ -804,6 +808,55 @@ def update_baseline_handles_vlbi(store_handle, antenna_handles, baseline_handles
 
     return baseline_handles
 
+def assign_trop_estimation(antenna_handles, store_handle, ref_antenna):
+    """ Decide which antennas carry zenith wet delay states.
+        Absolute mode (some antenna >= MIN_ABS_TROP_DIST from the reference): every antenna, reference included,
+        estimates its own ZWD -- the common mode is fixed by the elevation difference on the long baselines.
+        Relative mode (short-baseline network): only ZWD differences are observable, so the reference carries
+        none and antennas within MIN_TROP_DIST of it share its (a priori) troposphere. """
+    if not store_handle.estimate_trop:
+        for antenna_handle in antenna_handles:
+            antenna_handle.estimate_trop = False
+        return
+    ref_handle = [antenna_handle for antenna_handle in antenna_handles if antenna_handle.antenna_name == ref_antenna][0]
+    dist_to_ref = [np.linalg.norm(np.array(antenna_handle.ref_pos) - np.array(ref_handle.ref_pos)) for antenna_handle in antenna_handles]
+    absolute_trop = max(dist_to_ref) >= MIN_ABS_TROP_DIST
+    for antenna_handle, dist in zip(antenna_handles, dist_to_ref):
+        if absolute_trop:
+            antenna_handle.estimate_trop = True
+        elif antenna_handle.antenna_name == ref_antenna:
+            antenna_handle.estimate_trop = False
+        else:
+            antenna_handle.estimate_trop = dist >= MIN_TROP_DIST
+    trop_mode = 'absolute' if absolute_trop else 'relative'
+    if getattr(store_handle, 'trop_mode', None) != trop_mode:
+        store_handle.trop_mode = trop_mode
+        if absolute_trop:
+            print('Troposphere: absolute ZWD estimated at all antennas incl. reference ' + ref_antenna \
+                  + ' (longest baseline to reference ' + str(np.round(max(dist_to_ref)/1e3, 1)) + ' km)')
+        else:
+            print('Troposphere: ZWD estimated relative to reference ' + ref_antenna)
+            for antenna_handle, dist in zip(antenna_handles, dist_to_ref):
+                if antenna_handle.antenna_name != ref_antenna and dist < MIN_TROP_DIST:
+                    print('Troposphere parameters for antenna ' + antenna_handle.antenna_name + ' disabled '\
+                          + '(too close to reference antenna ' + ref_antenna + ')')
+
+def num_trop_states(store_handle, antenna_handle, trop_poly_length):
+    """ Number of ZWD state elements for an antenna that estimates troposphere """
+    if store_handle.stochastic_trop:
+        return len(antenna_handle.trop_times)
+    if trop_poly_length > 0:
+        exp_length = (antenna_handle.times_gps[-1]-antenna_handle.times_gps[0])/np.timedelta64(1, 's')
+        return 1+int(np.ceil(exp_length/trop_poly_length)) # number of piecewise-linear intervals
+    return 0
+
+def hold_trop_slice(store_handle, antenna_handle, n_trop_loop, trop_poly_length):
+    """ Assign this antenna's slice of the ZWD state block; returns the number of states """
+    trop_times = antenna_handle.trop_times if store_handle.stochastic_trop else antenna_handle.times_gps
+    ntrop = num_trop_states(store_handle, antenna_handle, trop_poly_length) if antenna_handle.estimate_trop else 0
+    antenna_handle.hold_trop_params(slice(n_trop_loop, n_trop_loop + ntrop), trop_times)
+    return ntrop
+
 def find_clock_trop_params(sol_type, antenna_handles, store_handle, trop_poly_length, clock_poly_length, ref_antenna):
     """ Find the number of clock and troposphere state elements based on the input arguments """
     if (store_handle.stochastic_clock or store_handle.stochastic_trop) and sol_type=='GNSS':
@@ -843,6 +896,7 @@ def find_clock_trop_params(sol_type, antenna_handles, store_handle, trop_poly_le
             if ref_antenna == antenna_handle.antenna_name:
                 ref_handle = antenna_handle
 
+    assign_trop_estimation(antenna_handles, store_handle, ref_antenna)
     n_clock_tot = 0
     n_trop_tot = 0
     for antenna_handle in antenna_handles:
@@ -870,16 +924,9 @@ def find_clock_trop_params(sol_type, antenna_handles, store_handle, trop_poly_le
                 nclock += 2
             n_clock_tot += nclock
 
-            if store_handle.stochastic_trop is False and trop_poly_length > 0:
-                ntrop = 1+int(np.ceil(exp_length/trop_poly_length)) # number of piecewise-linear intervals
-            elif store_handle.stochastic_trop:
-                ntrop = len(antenna_handle.trop_times)
-            else:
-                ntrop = 0
-            if np.linalg.norm(np.array(ref_handle.ref_pos)-np.array(antenna_handle.ref_pos))< MIN_TROP_DIST:
-                # override -- distance to reference too small
-                ntrop = 0
-            n_trop_tot += ntrop
+        # ZWD states may include the reference antenna (see assign_trop_estimation)
+        if store_handle.estimate_trop and antenna_handle.estimate_trop:
+            n_trop_tot += num_trop_states(store_handle, antenna_handle, trop_poly_length)
 
     return n_clock_tot, n_trop_tot
 
@@ -1035,24 +1082,6 @@ def lstsq_estimation(sol_type, plot_intermediate_results, ref_antenna, store_han
                 antenna_handle.hold_range_clock_params(slice(n_clock_loop,n_clock_loop + nclock), antenna_handle.times_gps)
             else:
                 antenna_handle.hold_range_clock_params(slice(n_clock_loop,n_clock_loop + nclock), antenna_handle.clock_times)
-            # only add troposphere states if they can be estimated (>MIN_TROP_DIST from reference antenna)
-            if store_handle.estimate_trop:
-                antenna_handle.estimate_trop = True
-                if np.linalg.norm(np.array(antenna_handle.ref_pos) - np.array(ref_handle.ref_pos)) < MIN_TROP_DIST:
-                    print('Troposphere parameters for antenna ' + antenna_handle.antenna_name +' disabled '\
-                            +'(too close to reference antenna ' + ref_handle.antenna_name + ')' )
-                    antenna_handle.estimate_trop = False
-                    ntrop = 0
-                    antenna_handle.hold_trop_params(slice(n_trop_loop, n_trop_loop), antenna_handle.times_gps)
-                elif store_handle.stochastic_trop is False:
-                    ntrop = 1+int(np.ceil(exp_length/trop_poly_length)) # number of piecewise-linear intervals
-                    antenna_handle.hold_trop_params(slice(n_trop_loop, n_trop_loop + ntrop), antenna_handle.times_gps)
-                else:
-                    ntrop = len(antenna_handle.trop_times)
-                    antenna_handle.hold_trop_params(slice(n_trop_loop, n_trop_loop + ntrop), antenna_handle.trop_times)
-                #state[n_rxpos+n_clock_tot+n_ao_state+n_grav_state+n_trop_loop] = 0
-            else:
-                ntrop = 0
 
             if store_handle.estimate_disb:
                 # no need to set a value in state, these are initialized as 0
@@ -1065,12 +1094,15 @@ def lstsq_estimation(sol_type, plot_intermediate_results, ref_antenna, store_han
                 antenna_handle.hold_phase_disb_params(slice(n_disb_loop_phase, n_disb_loop_phase + ndisb))
                 n_disb_loop_phase += ndisb
 
-            n_trop_loop += ntrop
             n_clock_loop += nclock
             count += 1 
         else: 
             ref_idx = idx
             antenna_handle.clock_times = antenna_handle.times_gps
+
+        # ZWD states, in antenna order -- includes the reference in absolute mode (assign_trop_estimation)
+        if store_handle.estimate_trop:
+            n_trop_loop += hold_trop_slice(store_handle, antenna_handle, n_trop_loop, trop_poly_length)
         
         # compute corrected ranges
         if ref_antenna == antenna_handle.antenna_name and clock_file is not None:
@@ -1156,21 +1188,17 @@ def lstsq_estimation(sol_type, plot_intermediate_results, ref_antenna, store_han
                 else:
                     state[n_rxpos+n_clock_loop+idx_start] = antenna_handle.bulk_clock
                 antenna_handle.hold_range_clock_params(slice(n_clock_loop,n_clock_loop + nclock), antenna_handle.clock_times)
-                if store_handle.estimate_trop and antenna_handle.estimate_trop:
-                    if store_handle.stochastic_trop is False:
-                        ntrop = 1+int(np.ceil(exp_length/trop_poly_length)) # number of piecewise-linear intervals
-                        antenna_handle.hold_trop_params(slice(n_trop_loop, n_trop_loop + ntrop), antenna_handle.times_gps)
-                    else:
-                        ntrop = len(antenna_handle.trop_times)
-                        antenna_handle.hold_trop_params(slice(n_trop_loop, n_trop_loop + ntrop), antenna_handle.trop_times)
-                    state[n_rxpos+n_clock_tot+n_ao_state+n_grav_state+n_trop_loop] = 0
-                else:
-                    ntrop = 0
-                n_trop_loop += ntrop
                 n_clock_loop += nclock
                 count += 1 
             else: 
                 ref_idx = idx
+
+            # ZWD states, in antenna order -- includes the reference in absolute mode (assign_trop_estimation)
+            if store_handle.estimate_trop:
+                ntrop = hold_trop_slice(store_handle, antenna_handle, n_trop_loop, trop_poly_length)
+                if ntrop > 0:
+                    state[n_rxpos+n_clock_tot+n_ao_state+n_grav_state+n_trop_loop] = 0
+                n_trop_loop += ntrop
 
     if sol_type == 'GNSS':
         # take only linearly independent baselines in GNSS data
@@ -2507,7 +2535,7 @@ if __name__ == '__main__':
             antenna_handle.clock_psd_irw = 0
             antenna_handle.phase_clock_psd_rw = 0
             antenna_handle.phase_clock_psd_irw = 0
-            antenna_handle.trop_psd_rw = 0
+            # trop_psd_rw kept: the reference carries ZWD states in absolute mode (assign_trop_estimation)
 
         if len(args.sta_codes)==len(args.antenna_names) and len(args.domes_names)==len(args.antenna_names):
             sta_code = sta_codes[antenna_idx]
