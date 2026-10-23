@@ -14280,7 +14280,7 @@ def analyze_ls_solution(sol_type, plot_results, ref_antenna, clock_idxs, trop_id
         print('formal baseline errors (XYZ, m): sigma_xx: ' + str(np.round(sigmas_b[0],6)) +  \
                     ' sigma_yy: ' + str(np.round(sigmas_b[1],6)) +  ' sigma_zz: ' + str(np.round(sigmas_b[2],6)))
         print(f"baseline vector (NEU, m): {b_12_NEU[0]:.4f}, {b_12_NEU[1]:.4f}, {b_12_NEU[2]:.4f}")
-        print('formal baseline errors (NEU, m): sigma_NN: ' + str(np.round(sigmas_NEU[0],6)) +  \
+        print('formal baseline errors (NEU, m): sigma_NN: ' + str(np.round(sigmas_b_NEU[0],6)) +  \
                     ' sigma_EE: ' + str(np.round(sigmas_b_NEU[1],6)) +  ' sigma_UU: ' + str(np.round(sigmas_b_NEU[2],6)))
 
 
