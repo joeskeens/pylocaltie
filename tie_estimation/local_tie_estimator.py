@@ -1713,17 +1713,21 @@ def lstsq_estimation(sol_type, plot_intermediate_results, ref_antenna, store_han
     # do the ionosphere-free combination and float ambiguity resolution
     if store_handle.iono_free:
         # generate fixed widelane solution (for debugging purposes)
-        print('Executing widelane fixed ambiguity solution:', flush=True)
         state_WL = phfloat_state[:amb_state_idxs.start]
-        ls_phfixed_WL = least_squares(calc_residuals, state_WL, jac=jac, method='trf',\
-            max_nfev=100, bounds=(bound_low_expanded[:amb_state_idxs.start], bound_high_expanded[:amb_state_idxs.start]), verbose=2, x_scale = 'jac', xtol=1e-15,\
-            args=(ref_antenna, baselines, store_handle, antenna_handles, clock_idxs, \
-                   clock_poly_length, trop_idxs, trop_poly_length, disb_idxs, baseline_handles, phase_delay, phase_only, \
-                   use_amb_state, amb_state_idxs, use_phase_weights, tikhonov_lambda, cont_penalty, phase_clock_idxs, phase_disb_idxs,  \
-                   combination_type))
-        sol_name = 'amb_fixed_WL'
-        analyze_ls_solution(sol_type, plot_intermediate_results, ref_antenna, clock_idxs, trop_idxs, disb_idxs, ls_phfixed_WL, store_handle, antenna_handles, sol_name, baselines,\
-                        n_ao_state, baseline_handles, phase_delay, phase_only, phase_clock_idxs, phase_disb_idxs)
+        if n_unresolved == 0:
+            # wide-lane ambiguities held at their integers, as in the fixed L1 solution: no ambiguity states
+            print('Executing widelane fixed ambiguity solution:', flush=True)
+            ls_phfixed_WL = least_squares(calc_residuals, state_WL, jac=jac, method='trf',\
+                max_nfev=100, bounds=(bound_low_expanded[:amb_state_idxs.start], bound_high_expanded[:amb_state_idxs.start]), verbose=2, x_scale = 'jac', xtol=1e-15,\
+                args=(ref_antenna, baselines, store_handle, antenna_handles, clock_idxs, \
+                       clock_poly_length, trop_idxs, trop_poly_length, disb_idxs, baseline_handles, phase_delay, phase_only, \
+                       False, slice(amb_state_idxs.start, amb_state_idxs.start), use_phase_weights, tikhonov_lambda, cont_penalty, \
+                       phase_clock_idxs, phase_disb_idxs, combination_type, afixed))
+            sol_name = 'amb_fixed_WL'
+            analyze_ls_solution(sol_type, plot_intermediate_results, ref_antenna, clock_idxs, trop_idxs, disb_idxs, ls_phfixed_WL, store_handle, antenna_handles, sol_name, baselines,\
+                            n_ao_state, baseline_handles, phase_delay, phase_only, phase_clock_idxs, phase_disb_idxs, use_phase_weights, afixed)
+        else:
+            print(f'{n_unresolved} wide-lane ambiguities unresolved -- skipping the widelane fixed solution', flush=True)
 
         bound_low_expanded, bound_high_expanded, state_WL = set_bounds_phase_clock(bound_low_expanded, bound_high_expanded,\
                 CLOCK_BOUND, store_handle, antenna_handles, baseline_handles, baselines, ref_antenna, state_WL, end_range_state, \
@@ -1743,8 +1747,11 @@ def lstsq_estimation(sol_type, plot_intermediate_results, ref_antenna, store_han
             data_ant1 = antenna1_handle.antenna_data
             data_ant2 = antenna2_handle.antenna_data
 
-            diff_cp_model = data_ant2.cp_model.values - data_ant1.cp_model.values  
-            diff_cp_dual_model = data_ant2.cp_dual_model.values - data_ant1.cp_dual_model.values  
+            # the antennas have different epochs: index both into the baseline epochs
+            _, ant1_idxs, _ = np.intersect1d(antenna1_handle.times_gps, baseline_handle.datetime_array, return_indices=True)
+            _, ant2_idxs, _ = np.intersect1d(antenna2_handle.times_gps, baseline_handle.datetime_array, return_indices=True)
+            diff_cp_model = data_ant2.cp_model.values[ant2_idxs] - data_ant1.cp_model.values[ant1_idxs]
+            diff_cp_dual_model = data_ant2.cp_dual_model.values[ant2_idxs] - data_ant1.cp_dual_model.values[ant1_idxs]
             baseline_handle.combination_measurement('IF')
             baseline_handle.combination_model(diff_cp_model, diff_cp_dual_model, 'IF')
 

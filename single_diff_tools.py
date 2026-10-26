@@ -10912,9 +10912,10 @@ def slip_detect_single_freq(f1, diff_phase_data, diff_phase_model, times_arr, so
     return slips
 
 
-def slip_detect_full(f1, diff_phase_data, diff_phase_model, times_arr, plot=False):
+def slip_detect_full(f1, diff_phase_data, diff_phase_model, times_arr, plot=False, wavelength=None):
     """
     Detect cycle slips using single frequency data, no source differentiation
+    wavelength: of the observable (combination), scalar or per observation; default c/f1
     """
     b_del = diff_phase_data-diff_phase_model
     K_factor = 4 
@@ -10922,7 +10923,9 @@ def slip_detect_full(f1, diff_phase_data, diff_phase_model, times_arr, plot=Fals
     b_del_init=b_del_init[np.abs(b_del_init<20)]
     sigma_phase, _ = find_sigmas(b_del_init-np.median(b_del_init))
 
-    threshold = const.c/(f1*3)
+    if wavelength is None: wavelength = const.c/f1
+    threshold_by_epoch = np.broadcast_to(np.asarray(wavelength, dtype=float)/3, np.shape(b_del))
+    threshold = threshold_by_epoch[0]
 
     slips = []
     k=2
@@ -10937,6 +10940,7 @@ def slip_detect_full(f1, diff_phase_data, diff_phase_model, times_arr, plot=Fals
     threshold_arr.append(threshold)
 
     for epoch in range(1,len(b_del)):
+        threshold = threshold_by_epoch[epoch]
         time = times_arr[epoch]
         time_last = times_arr[epoch-1]
         # avoid bad data -- not a slip
@@ -15630,7 +15634,7 @@ def detect_unresolved_amb_gnss(store_handle, amb_state, antenna_handles, baselin
             diff_cp_data[slip_slice] = diff_cp_data[slip_slice] + wavelength_at(wavelength, slip_slice)*amb_state[idx]
         
         sigma_pd, use_idxs_pd = find_sigmas(diff_cp_data-diff_cp_model)
-        slips = slip_detect_full(baseline_handle.f1, diff_cp_data, diff_cp_model, times_diff)
+        slips = slip_detect_full(baseline_handle.f1, diff_cp_data, diff_cp_model, times_diff, wavelength=wavelength)
         if len(slips) > 0:
             slips = np.intersect1d(slips,np.argwhere(use_idxs_pd)) # take only non-outlier slips
             slips = np.intersect1d(slips, baseline_handle.phase_data_idxs)
