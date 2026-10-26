@@ -163,6 +163,9 @@ CODE_NOISE_COEFF = {  # m^2-Hz
 PHASE_NOISE_BW = 10.0       # Hz (reproduces the SIGMA-epsilon L1 value, ~2.2e-3 m^2-Hz)
 SNR_FILL_DBHZ = 45.0               # used only where no C/N0 is available at all
 DITHER_MAX_N = 4                   # integer cycles added/subtracted when dithering phase
+# geometry-free cycle slip detector (slip_detect_GF): epoch-to-epoch tolerance and its growth with the gap
+GF_THRESHOLD = 0.03               # m, ~5 sigma of a differenced single-difference phase; a 1/1 slip is 5.4-6.5 cm
+GF_IONO_RATE = 1.5e-4             # m/s, differential ionosphere in L1 - L2 (~5 TECU/hr over ~1000 km)
 
 def snr_candidates(obs_name):
     """ Signal-strength variables matching an observation name, most specific first
@@ -3151,6 +3154,9 @@ def vlbi_transform_data(store_handle, antenna_handles, igs_data=False, dt_vlbi=N
             if store_handle.iono_free is True:
                 smoothed_values['cp_dual_model'] = obs_time.cp_dual_model[ref_idx]
                 smoothed_values['cp_dual'] = cp_dual_meas
+                # single-frequency codes for the Melbourne-Wubbena detector: no model to smooth against, take the epoch
+                smoothed_values['pr_l1'] = obs_time.pr_l1[ref_idx]
+                smoothed_values['pr_dual'] = obs_time.pr_dual[ref_idx]
 
             # Create the new dataset 
             data_dict = {var_name: (["time"], value.values) for var_name, value in smoothed_values.items()}
@@ -4581,6 +4587,15 @@ class BaselineInfo(object):
         """ Save range data idxs for later plotting against phase-only solution"""
         self.range_only_idxs = self.range_data_idxs
 
+    def hold_single_frequency_raw(self, pr_l1, pr_dual, cp_l1, cp_dual):
+        """Hold the differenced single-frequency codes and phases (m) before any integer adjustment,
+           for cycle slip detection (slip_detect_MW, slip_detect_GF)
+        """
+        self.pr_l1_raw = pr_l1
+        self.pr_dual_raw = pr_dual
+        self.cp_l1_raw = cp_l1
+        self.cp_dual_raw = cp_dual
+
     def prepare_dual_frequency(self, cp_dual, f2):
         """Set up the dual frequency samples with differenced L2/L5 carrier phase
         """
@@ -4643,10 +4658,10 @@ class BaselineInfo(object):
             # ambiguity in IF sol. is lambda_N*(N_1 + lambda_W/lambda_2*N_W)
             # where N_1 : L1 integer amb., lambda_W : wide lane wavelength,
             # lambda_2: L2 wavelength, N_W: wide lane integer amb.
-            # thus we remove lambda_N*lambda_W/lambda_2 * N_W = corr_wavelength * N_W
+            # the data carry -corr_wavelength*N_W, so it is removed by adding corr_wavelength * N_W
             corr_wavelength = const.c*self.f2/(self.f1**2-self.f2**2)  
             for idx, slip_slice in enumerate(self.slip_slices_arr):
-                self.narrowlane_correction[slip_slice] = -wavelength_at(corr_wavelength, slip_slice)*fixed_amb[idx]
+                self.narrowlane_correction[slip_slice] = wavelength_at(corr_wavelength, slip_slice)*fixed_amb[idx] # data + lambda*a = model convention
         else:
             raise ValueError('Combination type must be WL for resolve_widelane_amb')
 
@@ -4913,6 +4928,9 @@ class AntennaInfo(object):
             snr, snr_dual, band_dual = snr.sel(time=pr.time), snr_dual.sel(time=pr.time), band_dual.sel(time=pr.time)
             f2 = np.array([BAND_FREQ[band] for band in band_dual.values]) # by epoch (system) for 'preferred'
             gamma = self.f1**2 / f2**2
+            # single-frequency codes, kept for the Melbourne-Wubbena cycle slip detector
+            pr_single = {'pr_l1': ('time', np.asarray(pr.values, dtype=float)),
+                         'pr_dual': ('time', np.asarray(pr_dual.values, dtype=float))}
             pr = (pr_dual - gamma*pr)/(1 - gamma)
             code_coeff_dual = np.array([CODE_NOISE_COEFF[band] for band in band_dual.values])
             pr_var = iono_free_variance(thermal_variance(CODE_NOISE_COEFF[freq_select], snr.values),
@@ -4928,6 +4946,8 @@ class AntennaInfo(object):
             'snr_pr':   ('time', np.asarray(snr.values, dtype=float)),
             'pr_sigma': ('time', np.sqrt(pr_var)),
         })
+        if iono_free is True:
+            self.antenna_data = self.antenna_data.assign(pr_single)
 
         # formal errors, aligned with antenna_data.time
         self.SNR_array = self.antenna_data.snr_pr.values
@@ -10680,80 +10700,59 @@ def slip_detect_MW(freq_1, freq_2, phase1, phase2, range1, range2, times_arr, so
     """
     Use Melbourne-Wubbena combination cycle slip detection if wide-lane available,
     https://agupubs.onlinelibrary.wiley.com/doi/epdf/10.1029/GL017i003p00199
+    Inputs are single-frequency phases and codes in m; freq_2 may be per observation (--iono_freq preferred).
+    The running mean and variance of the combination are kept per source.
     """
     L_del = (freq_1*phase1-freq_2*phase2)/(freq_1-freq_2) # carrier-phase combination
     P_del = (freq_1*range1+freq_2*range2)/(freq_1+freq_2) # pseudorange combination
     b_del = L_del-P_del
     K_factor = 4 # 4?
     time_limit = 3600 # 1 hr
+    source_arr = np.asarray(source_arr)
 
-    #lambda_del = const.c/(freq_1-freq_2)
-    #S_Bw = (lambda_del/2)**2  # initialize sigma value
+    # initial variance from the scatter about each source's median (the wide-lane ambiguity differs by source)
+    b_del_init = np.full(len(b_del), np.nan)
+    for src in np.unique(source_arr):
+        epochs_src = source_arr == src
+        if np.any(~np.isnan(b_del[epochs_src])):
+            b_del_init[epochs_src] = b_del[epochs_src] - np.nanmedian(b_del[epochs_src])
+    b_del_init = b_del_init[np.abs(b_del_init) < 20] # also drops NaN
+    sigma_init, _ = find_sigmas(b_del_init)
+    var_init = sigma_init**2
 
-    # assess variance using longest segment of continuous phase
-    b_del_init=b_del-np.median(b_del)
-    b_del_init=b_del_init[np.abs(b_del_init)<20]
-    sigma_phase, _ = find_sigmas(b_del_init)
-    S_Bw = sigma_phase**2
-
-    threshold = K_factor*S_Bw
     slips = []
-    k=2
-
-    m_Bw_dict = {}
-    time_dict = {}
-    threshold_dict = {}
+    arc_state = {} # source -> running mean, variance, sample count, last epoch time of the current arc
     m_Bw_arr = []
     threshold_arr = []
-    m_Bw_arr.append(b_del[0])
-    threshold_arr.append(threshold)
-    for src in np.unique(source_arr): # initialize src dicts
-        epochs_src = np.array(source_arr) == src
-        m_Bw_candidate = b_del[epochs_src]
-        # first value needs to be a non-NaN
-        m_Bw_good = m_Bw_candidate[~np.isnan(m_Bw_candidate)] 
-        m_Bw_dict[src] = m_Bw_good[0] # initialize m_Bw
-        threshold_dict[src] = threshold
-        time_dict[src] = times_arr[epochs_src][0] 
-    
-    for epoch in range(1,len(phase1)):
+    for epoch in range(len(b_del)):
         src = source_arr[epoch]
-        m_Bw = m_Bw_dict[src]
-        threshold = threshold_dict[src]
         time = times_arr[epoch]
-        time_last = time_dict[src]
-        # avoid bad data -- not a slip
-        if np.isnan(b_del[epoch]): 
-            m_Bw_arr.append(m_Bw)
-            threshold_arr.append(threshold)
+        if np.isnan(b_del[epoch]): # avoid bad data -- not a slip
+            src_state = arc_state.get(src)
+            m_Bw_arr.append(np.nan if src_state is None else src_state['mean'])
+            threshold_arr.append(K_factor*np.sqrt(var_init if src_state is None else src_state['var']))
             continue
-        if np.abs(b_del[epoch]-m_Bw)>threshold\
-           or time-time_last > time_limit:
-            threshold_arr.append(threshold)
-            m_Bw_arr.append(m_Bw)
-
-            slips.append(epoch)
-            m_Bw = b_del[epoch]
-            #S_Bw = (lambda_del/2)**2 
-            S_Bw = sigma_phase**2
-            threshold = K_factor*np.sqrt(S_Bw)
-            k = 2
-            m_Bw_dict[src] = m_Bw
-            threshold_dict[src] = threshold
-            time_dict[src] = time
+        if src not in arc_state: # first good epoch of this source opens its arc
+            arc_state[src] = {'mean': b_del[epoch], 'var': var_init, 'count': 2, 'time': time}
+            m_Bw_arr.append(b_del[epoch])
+            threshold_arr.append(K_factor*np.sqrt(var_init))
             continue
 
-        S_Bw = (k-1)*1./k*S_Bw + 1./k*(b_del[epoch]-m_Bw)**2
-        m_Bw = (k-1)*1./k*m_Bw + 1./k*b_del[epoch]
-        threshold = K_factor*np.sqrt(S_Bw)
-        m_Bw_dict[src] = m_Bw
-        threshold_dict[src] = threshold
-        time_dict[src] = time
-        k = k + 1
-
+        src_state = arc_state[src]
+        threshold = K_factor*np.sqrt(src_state['var'])
+        m_Bw_arr.append(src_state['mean'])
         threshold_arr.append(threshold)
-        m_Bw_arr.append(m_Bw)
-    
+        if np.abs(b_del[epoch]-src_state['mean']) > threshold or time-src_state['time'] > time_limit:
+            slips.append(epoch)
+            arc_state[src] = {'mean': b_del[epoch], 'var': var_init, 'count': 2, 'time': time}
+            continue
+
+        count = src_state['count']
+        src_state['var'] = (count-1)/count*src_state['var'] + (b_del[epoch]-src_state['mean'])**2/count
+        src_state['mean'] = (count-1)/count*src_state['mean'] + b_del[epoch]/count
+        src_state['count'] = count + 1
+        src_state['time'] = time
+
     if plot is True:
         m_Bw_arr = np.array(m_Bw_arr)
         threshold_arr = np.array(threshold_arr)
@@ -10768,9 +10767,35 @@ def slip_detect_MW(freq_1, freq_2, phase1, phase2, range1, range2, times_arr, so
         slip_fig.tight_layout()
         slip_fig.savefig('slip_fig.png')
         plt.close(slip_fig)
-        breakpoint()
 
     return slips, m_Bw_arr, threshold_arr
+
+def slip_detect_GF(phase1, phase2, times_arr, source_arr):
+    """
+    Geometry-free (phase1 - phase2, m) cycle slip detection, for the slips the Melbourne-Wubbena combination
+    cannot see: equal cycle counts on both frequencies leave the wide-lane unchanged, but change phase1 - phase2
+    by lambda_1 - lambda_2 per cycle (-5.4 cm L1/L2, -6.5 cm L1/L5).
+    Each epoch is compared with the previous epoch of the same source; the threshold grows with the gap
+    (GF_IONO_RATE) to allow for the ionosphere, so a 1/1 slip is only detectable across gaps shorter than
+    about (5.4 cm - GF_THRESHOLD)/GF_IONO_RATE.
+    """
+    phase_gf = np.asarray(phase1, dtype=float) - np.asarray(phase2, dtype=float)
+    source_arr = np.asarray(source_arr)
+    time_limit = 3600 # 1 hr, as slip_detect_MW
+    slips = []
+    last_epoch = {} # source -> (time, geometry-free phase) of its previous good epoch
+    for epoch in range(len(phase_gf)):
+        if np.isnan(phase_gf[epoch]):
+            continue
+        src = source_arr[epoch]
+        time = times_arr[epoch]
+        if src in last_epoch:
+            time_last, gf_last = last_epoch[src]
+            gap = time - time_last
+            if gap > time_limit or np.abs(phase_gf[epoch]-gf_last) > GF_THRESHOLD + GF_IONO_RATE*gap:
+                slips.append(epoch)
+        last_epoch[src] = (time, phase_gf[epoch])
+    return slips
 
 def slip_detect_single_freq(f1, diff_phase_data, diff_phase_model, times_arr, source_array, plot=True):
     """
@@ -15529,7 +15554,7 @@ def plot_time_units(ref_antenna, ls_sol_grdel, ls_sol_phdel, sol_type, store_han
         #    fig.savefig(sol_type+'_'+label.replace(' ','_')+'_only_phase_only_clock_variation_residuals_'+antenna2_handle.antenna_name+'_' + antenna1_handle.antenna_name + '.png')
         #plt.close(fig)
 
-def detect_unresolved_amb_vlbi(iono_free, amb_state, baseline_handles):
+def detect_unresolved_amb_vlbi(iono_free, amb_state, baseline_handles, combination_type):
     """ find if any cycle slips remain in the data """
     slips_detected = False 
     slips_full = []
@@ -15566,7 +15591,7 @@ def detect_unresolved_amb_vlbi(iono_free, amb_state, baseline_handles):
 
     return slips_detected, slips_full, slips_baseline
 
-def detect_unresolved_amb_gnss(store_handle, amb_state, antenna_handles, baselines, baseline_handles):
+def detect_unresolved_amb_gnss(store_handle, amb_state, antenna_handles, baselines, baseline_handles, combination_type):
     """ find if any cycle slips remain in the data """
     slips_detected = False 
     slips_full = []
@@ -15992,9 +16017,9 @@ def resolve_float_amb(store_handle, state_expanded, bounds, n_ao_state, n_grav_s
                                       False, amb_state_idxs_eval, use_phase_weights, tikhonov_lambda, cont_penalty, phase_clock_idxs_eval, \
                                       phase_disb_idxs_eval, combination_type, a_fixed))
                         if sol_type == 'VLBI':
-                            slip_detected, slips, _ = detect_unresolved_amb_vlbi(store_handle.iono_free, a_fixed, baseline_handles)
+                            slip_detected, slips, _ = detect_unresolved_amb_vlbi(store_handle.iono_free, a_fixed, baseline_handles, combination_type)
                         elif sol_type == 'GNSS': 
-                            slip_detected, slips, _ = detect_unresolved_amb_gnss(store_handle, a_fixed, antenna_handles, baselines, baseline_handles)
+                            slip_detected, slips, _ = detect_unresolved_amb_gnss(store_handle, a_fixed, antenna_handles, baselines, baseline_handles, combination_type)
                         slips_candidate.append(len(slips))
                         cost_candidate.append(ls_phfloat_eval.cost)
                     #min_slip_jdx = np.argmin(slips_candidate) # if identical, will return 0 
@@ -16048,9 +16073,9 @@ def resolve_float_amb(store_handle, state_expanded, bounds, n_ao_state, n_grav_s
                         z_fixed = np.concatenate((np.ndarray.flatten(np.round(z_fixed_minor[:,jdx])),z_par))
                         a_fixed = np.round(iZt.dot(z_fixed))
                         if sol_type == 'VLBI':
-                            slip_detected, slips, _ = detect_unresolved_amb_vlbi(store_handle.iono_free, a_fixed, baseline_handles)
+                            slip_detected, slips, _ = detect_unresolved_amb_vlbi(store_handle.iono_free, a_fixed, baseline_handles, combination_type)
                         elif sol_type == 'GNSS': 
-                            slip_detected, slips, _ = detect_unresolved_amb_gnss(store_handle, a_fixed, antenna_handles, baselines, baseline_handles)
+                            slip_detected, slips, _ = detect_unresolved_amb_gnss(store_handle, a_fixed, antenna_handles, baselines, baseline_handles, combination_type)
                         slips_candidate.append(len(slips))
                     min_slip_jdx = np.argmin(slips_candidate)
                     z_fixed = np.concatenate((np.ndarray.flatten(np.round(z_fixed_minor[:,min_slip_jdx])),z_par))

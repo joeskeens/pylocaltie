@@ -60,7 +60,7 @@ from gnsstk import std_vector_string, Position, AntennaStore, AntexData, OceanLo
 
 from single_diff_tools import import_key_gnss, import_vex_gnss, import_data_vlbi, import_data_vlbi_farfield, import_data_vlbi_vgosdb, \
                   import_data_vlbi_vda, import_data_ngs, apriori_positions_from_superstation, write_SINEX, datetime64_to_mjd, map_datasets, import_data_nc_sim,\
-                  find_common_epochs, BaselineInfo, AntennaInfo, GNSSTKStores, ECEF2ECI, slip_detect_MW, slip_detect_single_freq,\
+                  find_common_epochs, BaselineInfo, AntennaInfo, GNSSTKStores, ECEF2ECI, slip_detect_MW, slip_detect_GF, slip_detect_single_freq,\
                   slip_detect_phase_delay, sample_poly_at_interval, trim_amb_Zdom, trim_amb_state, gen_phase_clock_state, adjust_stoch_params, thin_data,\
                   analyze_ls_solution, resolve_float_amb, construct_float_amb, remove_outliers, iterative_remove_outliers, calc_residuals, \
                   calc_jac, plot_time_units, read_src, date_to_common, date_to_mjd, detect_unresolved_amb_vlbi, \
@@ -610,9 +610,13 @@ def define_amb_state_gnss(store_handle, baselines, antenna_handles, baseline_han
         amb_int_total = np.concatenate((amb_int_total, amb_int))
     
         if store_handle.iono_free:
-            # detect slips
-            slips, m_Bw_arr, threshod_arr = slip_detect_MW(baseline_handle.f1, baseline_handle.f2, baseline_handle.cp_diff, baseline_handle.cp_dual,\
-                           baseline_handle.pr_diff, baseline_handle.pr_dual, times_diff, source_array, plot=True)
+            # detect slips on the single-frequency data before integer adjustment: Melbourne-Wubbena for wide-lane
+            # slips, geometry-free for equal slips on both frequencies (wide-lane unchanged)
+            slips_MW, m_Bw_arr, threshod_arr = slip_detect_MW(baseline_handle.f1, baseline_handle.f2, baseline_handle.cp_l1_raw, \
+                           baseline_handle.cp_dual_raw, baseline_handle.pr_l1_raw, baseline_handle.pr_dual_raw, times_diff, source_array, plot=True)
+            slips_GF = slip_detect_GF(baseline_handle.cp_l1_raw, baseline_handle.cp_dual_raw, times_diff, source_array)
+            slips = sorted(set(slips_MW) | set(slips_GF))
+            print(f'{len(slips)} cycle slips detected ({len(slips_MW)} Melbourne-Wubbena, {len(slips_GF)} geometry-free)')
         else: # need to detect slips with single-frequency
             slips = slip_detect_single_freq(baseline_handle.f1, baseline_handle.cp_diff, diff_cp_model, \
                      times_diff, source_array)
@@ -778,6 +782,10 @@ def define_baseline_handles_gnss(store_handle, clock_state, clock_poly_length, a
                f2 = antenna1_handle.f2
            diff_cp_dual_model = data_ant2.cp_dual_model.values[ant2_idxs] - data_ant1.cp_dual_model.values[ant1_idxs]
            diff_cp_dual = data_ant2.cp_dual.values[ant2_idxs] - data_ant1.cp_dual.values[ant1_idxs]
+           # single-frequency data before integer adjustment, for cycle slip detection
+           diff_pr_l1 = data_ant2.pr_l1.values[ant2_idxs] - data_ant1.pr_l1.values[ant1_idxs]
+           diff_pr_dual = data_ant2.pr_dual.values[ant2_idxs] - data_ant1.pr_dual.values[ant1_idxs]
+           baseline_handle.hold_single_frequency_raw(diff_pr_l1, diff_pr_dual, diff_cp_data.copy(), diff_cp_dual.copy())
            wavelength2 = const.c/f2
            N_int = np.rint((diff_cp_dual_model-diff_cp_dual)/wavelength2)
            diff_cp_dual = diff_cp_dual + N_int*wavelength2
@@ -1629,9 +1637,10 @@ def lstsq_estimation(sol_type, plot_intermediate_results, ref_antenna, store_han
 
     if recursive_amb:
         if sol_type == 'GNSS':
-            slip_detected, slips_full_last, slips_baseline = detect_unresolved_amb_gnss(store_handle, afixed, antenna_handles, baselines, baseline_handles)
+            slip_detected, slips_full_last, slips_baseline = detect_unresolved_amb_gnss(store_handle, afixed, antenna_handles, baselines,\
+                    baseline_handles, combination_type)
         elif sol_type == 'VLBI':
-            slip_detected, slips_full_last, slips_baseline = detect_unresolved_amb_vlbi(store_handle.iono_free, afixed, baseline_handles)
+            slip_detected, slips_full_last, slips_baseline = detect_unresolved_amb_vlbi(store_handle.iono_free, afixed, baseline_handles, combination_type)
         slips_full_last2 = slips_full_last
         if slip_detected:
             max_iter = 30
@@ -1671,9 +1680,10 @@ def lstsq_estimation(sol_type, plot_intermediate_results, ref_antenna, store_han
                         n_ao_state, n_grav_state, ls_args, calc_residuals, jac, sol_type, recursive_amb)
                 iterations += 1 
                 if sol_type == 'GNSS':
-                    slip_detected, slips_full, slips_baseline = detect_unresolved_amb_gnss(store_handle, afixed, antenna_handles, baselines, baseline_handles)
+                    slip_detected, slips_full, slips_baseline = detect_unresolved_amb_gnss(store_handle, afixed, antenna_handles, baselines,\
+                            baseline_handles, combination_type)
                 elif sol_type == 'VLBI':
-                    slip_detected, slips_full, slips_baseline = detect_unresolved_amb_vlbi(store_handle.iono_free, afixed, baseline_handles)
+                    slip_detected, slips_full, slips_baseline = detect_unresolved_amb_vlbi(store_handle.iono_free, afixed, baseline_handles, combination_type)
                 if iterations > max_iter or slips_full == slips_full_last: 
                     break
                 if slips_full==slips_full_last2:
