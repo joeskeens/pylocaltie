@@ -120,15 +120,35 @@ BAND_FREQ = {
 CODE_PREF_ORDER = {
     'L1': ['C1L', 'C1S', 'C1X', 'C1P', 'C1W', 'C1'],
     'L2': ['C2L', 'C2S', 'C2X', 'C2P', 'C2W', 'C2', 'P2'],
-    'L5': ['C5Q', 'C5X', 'C5I', 'C5'],
+    'L5': ['C5Q', 'C5X', 'C5P', 'C5I', 'C5'],
     'E6': ['C6C', 'C6X', 'C6Z', 'C6B', 'C6A', 'C6Q', 'C6I', 'C6'],
 }
 PHASE_PREF_ORDER = {
     'L1': ['L1L', 'L1S', 'L1X', 'L1P', 'L1W', 'L1'],
     'L2': ['L2L', 'L2S', 'L2X', 'L2P', 'L2W', 'L2'],
-    'L5': ['L5Q', 'L5X', 'L5I', 'L5'],
+    'L5': ['L5Q', 'L5X', 'L5P', 'L5I', 'L5'],
     'E6': ['L6C', 'L6X', 'L6Z', 'L6B', 'L6A', 'L6Q', 'L6I', 'L6'],
 }
+
+# --iono_freq preferred: second band of the ionosphere-free pair by satellite system, with the first band
+# --freq_select L1 (L1/E1/B1C). GPS/QZSS L1/L2 and Galileo E1/E5a match the IGS satellite antenna model and
+# the clock products; BDS-3 B1C/B2a. GLONASS (FDMA) and other systems have no entry.
+PREFERRED_IONO_BAND = {'G': 'L2', 'J': 'L2', 'E': 'L5', 'C': 'L5'}
+
+def iono_free_band(iono_freq, system_char):
+    """ Band of the second ionosphere-free frequency ('L2', 'L5') for a satellite system (RINEX system char) """
+    if iono_freq != 'preferred':
+        return iono_freq
+    if system_char not in PREFERRED_IONO_BAND:
+        raise ValueError(f'--iono_freq preferred: no ionosphere-free pair defined for system {system_char}')
+    return PREFERRED_IONO_BAND[system_char]
+
+def wavelength_at(wavelength, idxs):
+    """ Wavelength of the observations idxs -- scalar, or per-observation array when the
+        ionosphere-free pair differs by system (--iono_freq preferred) """
+    if np.ndim(wavelength) == 0:
+        return wavelength
+    return np.asarray(wavelength)[idxs]
 
 # a priori thermal-noise model, sigma^2 = C * 10^(-C/N0 / 10)  [m^2], C in m^2-Hz -- order of magnitude only
 #   code:  C ~ (c/R_c)^2 * B_n * d / 2 (DLL), by band; 1e3 for C/A ~ d = 0.1 chip, B_n = 0.25 Hz, scaled by
@@ -2744,13 +2764,19 @@ def gen_key(rinex_files, full_data, start_date, end_date, eph_sats, iono_free, i
                     obs_dual = obs_time['P2'].dropna(dim='sv',how='all')
                 elif iono_freq == 'L5':
                     obs_dual = obs_time['C5'].dropna(dim='sv',how='all')
+                elif iono_freq == 'preferred':
+                    # each system on its own second band (PREFERRED_IONO_BAND)
+                    svs_dual = [sv for band, var in (('L2', 'P2'), ('L5', 'C5')) if var in obs_time \
+                            for sv in obs_time[var].dropna(dim='sv',how='all').sv.values \
+                            if PREFERRED_IONO_BAND.get(str(sv)[0]) == band]
+                    obs_dual = xr.DataArray(svs_dual, coords={'sv': svs_dual}, dims='sv')
                 svs_obs = np.intersect1d(obs_L1.sv, obs_dual.sv)
             else:
                 svs_obs = obs_L1.sv
-            
-            if len(sv_arr) == 0: 
+
+            if len(sv_arr) == 0:
                 sv_arr = np.array(svs_obs)
-            elif len(svs_obs.sv.values)>0:
+            elif len(svs_obs)>0:
                 sv_arr = np.intersect1d(sv_arr, np.array(svs_obs))
         if len(sv_arr)>0:
             if len(sv_arr)>1:
@@ -3070,6 +3096,20 @@ def vlbi_transform_data(store_handle, antenna_handles, igs_data=False, dt_vlbi=N
                      eps_cp_ref = res_cp.slope*ref_time + res_cp.intercept
 
                  cp_meas = obs_time.cp_model[ref_idx] + eps_cp_ref
+
+                 # fit second-frequency carrier phase, same as the first
+                 if store_handle.iono_free is True:
+                     eps_phase_dual = (obs_time.cp_dual - obs_time.cp_dual_model).values
+                     sig_phase_dual, use_idxs_phase_dual = find_sigmas(eps_phase_dual-np.median(eps_phase_dual[~np.isnan(eps_phase_dual)]))
+                     if len(times_sec[use_idxs_phase_dual])>=5:
+                         res_cp_dual = make_smoothing_spline(times_sec[use_idxs_phase_dual], eps_phase_dual[use_idxs_phase_dual])
+                         eps_cp_dual_ref = res_cp_dual(ref_time)
+                     elif len(times_sec[use_idxs_phase_dual])==0:
+                         continue
+                     else:
+                         res_cp_dual = linregress(times_sec[use_idxs_phase_dual], eps_phase_dual[use_idxs_phase_dual])
+                         eps_cp_dual_ref = res_cp_dual.slope*ref_time + res_cp_dual.intercept
+                     cp_dual_meas = obs_time.cp_dual_model[ref_idx] + eps_cp_dual_ref
                  #if cp_meas.sv.values[0][0] == 'E':
                  #    cp_meas += 0.0*wavelength
                  #elif cp_meas.sv.values[0][0] == 'G':
@@ -3099,6 +3139,8 @@ def vlbi_transform_data(store_handle, antenna_handles, igs_data=False, dt_vlbi=N
                 # this happens for IGS data
                 pr_meas = obs_time.pr_data[ref_idx]
                 cp_meas = obs_time.cp_data[ref_idx]
+                if store_handle.iono_free is True:
+                    cp_dual_meas = obs_time.cp_dual[ref_idx]
 
             # save data to dict
             smoothed_values = {}
@@ -3106,6 +3148,9 @@ def vlbi_transform_data(store_handle, antenna_handles, igs_data=False, dt_vlbi=N
             smoothed_values['pr_data'] = pr_meas
             smoothed_values['cp_model'] = obs_time.cp_model[ref_idx]
             smoothed_values['cp_data'] = cp_meas
+            if store_handle.iono_free is True:
+                smoothed_values['cp_dual_model'] = obs_time.cp_dual_model[ref_idx]
+                smoothed_values['cp_dual'] = cp_dual_meas
 
             # Create the new dataset 
             data_dict = {var_name: (["time"], value.values) for var_name, value in smoothed_values.items()}
@@ -4601,7 +4646,7 @@ class BaselineInfo(object):
             # thus we remove lambda_N*lambda_W/lambda_2 * N_W = corr_wavelength * N_W
             corr_wavelength = const.c*self.f2/(self.f1**2-self.f2**2)  
             for idx, slip_slice in enumerate(self.slip_slices_arr):
-                self.narrowlane_correction[slip_slice] = -corr_wavelength*fixed_amb[idx]
+                self.narrowlane_correction[slip_slice] = -wavelength_at(corr_wavelength, slip_slice)*fixed_amb[idx]
         else:
             raise ValueError('Combination type must be WL for resolve_widelane_amb')
 
@@ -4727,7 +4772,8 @@ class AntennaInfo(object):
         self.l4r_name = None
         self.use_zwd_file = False
         self.f1 = None
-        self.f2 = None
+        self.f2 = None # second ionosphere-free frequency; None for --iono_freq preferred (set by system)
+        self.pco_cache = {}
         self.source_time_dict = None # epoch->source observed by this antenna, see hold_sources
 
         # currently hard-code a priori PSD scalings
@@ -4810,6 +4856,44 @@ class AntennaInfo(object):
             snr = snr.fillna(fill)
         return obs, snr
 
+    def select_dual_obs_with_snr(self, pref_orders, iono_freq):
+        """Second-frequency observation of the ionosphere-free combination, with its C/N0 and band.
+           For iono_freq 'preferred' the band follows the system of the satellite tracked at each epoch
+           (PREFERRED_IONO_BAND); each band is selected with its own preference order from pref_orders.
+           Returns (obs, snr, band) DataArrays on obs.time, band holding the band name of each epoch.
+        """
+        if iono_freq != 'preferred':
+            obs, snr = self.select_obs_with_snr(pref_orders[iono_freq])
+            return obs, snr, xr.full_like(obs, iono_freq, dtype=object)
+
+        times = self.antenna_data.time.values
+        systems = np.array([str(sv)[0] for sv in self.antenna_data.sv.values])
+        obs_vals = np.full(len(times), np.nan)
+        snr_vals = np.full(len(times), np.nan)
+        band_vals = np.full(len(times), '', dtype=object)
+        for band in sorted(set(PREFERRED_IONO_BAND.values())):
+            band_systems = [system_char for system_char, system_band in PREFERRED_IONO_BAND.items() if system_band == band]
+            in_band = np.isin(systems, band_systems)
+            if not np.any(in_band):
+                continue
+            try:
+                obs_band, snr_band = self.select_obs_with_snr(pref_orders[band])
+            except ValueError:
+                print(f'warning: {self.antenna_name}: no {band} observations, dropping systems {band_systems}')
+                continue
+            obs_band = obs_band.reindex(time=times).values
+            snr_band = snr_band.reindex(time=times).values
+            use = in_band & ~np.isnan(obs_band)
+            obs_vals[use] = obs_band[use]
+            snr_vals[use] = snr_band[use]
+            band_vals[use] = band
+
+        valid = ~np.isnan(obs_vals)
+        coords = {'time': times[valid]}
+        return (xr.DataArray(obs_vals[valid], coords=coords, dims='time'),
+                xr.DataArray(snr_vals[valid], coords=coords, dims='time'),
+                xr.DataArray(band_vals[valid], coords=coords, dims='time'))
+
     def dither_rng(self):
         """ Reproducible per-antenna generator for integer-cycle phase dithering """
         seed = int(sha256(self.antenna_name.encode('utf-8')).hexdigest(), 16) % (2**32)
@@ -4823,15 +4907,17 @@ class AntennaInfo(object):
         self.f1 = BAND_FREQ[freq_select]
         pr, snr = self.select_obs_with_snr(CODE_PREF_ORDER[freq_select])
         if iono_free is True:
-            self.f2 = BAND_FREQ[iono_freq]
-            pr_dual, snr_dual = self.select_obs_with_snr(CODE_PREF_ORDER[iono_freq])
+            self.f2 = None if iono_freq == 'preferred' else BAND_FREQ[iono_freq]
+            pr_dual, snr_dual, band_dual = self.select_dual_obs_with_snr(CODE_PREF_ORDER, iono_freq)
             pr, pr_dual = xr.align(pr, pr_dual, join='inner')
-            snr, snr_dual = snr.sel(time=pr.time), snr_dual.sel(time=pr.time)
-            gamma = self.f1**2 / self.f2**2
+            snr, snr_dual, band_dual = snr.sel(time=pr.time), snr_dual.sel(time=pr.time), band_dual.sel(time=pr.time)
+            f2 = np.array([BAND_FREQ[band] for band in band_dual.values]) # by epoch (system) for 'preferred'
+            gamma = self.f1**2 / f2**2
             pr = (pr_dual - gamma*pr)/(1 - gamma)
+            code_coeff_dual = np.array([CODE_NOISE_COEFF[band] for band in band_dual.values])
             pr_var = iono_free_variance(thermal_variance(CODE_NOISE_COEFF[freq_select], snr.values),
-                                        thermal_variance(CODE_NOISE_COEFF[iono_freq], snr_dual.values),
-                                        self.f1, self.f2)
+                                        thermal_variance(code_coeff_dual, snr_dual.values),
+                                        self.f1, f2)
         else:
             pr_var = thermal_variance(CODE_NOISE_COEFF[freq_select], snr.values)
 
@@ -4864,11 +4950,12 @@ class AntennaInfo(object):
         wavelength_1 = const.c/self.f1
         cp, snr = self.select_obs_with_snr(PHASE_PREF_ORDER[freq_select])
         if iono_free is True:
-            self.f2 = BAND_FREQ[iono_freq]
-            wavelength_2 = const.c/self.f2
-            cp_dual, snr_dual = self.select_obs_with_snr(PHASE_PREF_ORDER[iono_freq])
+            self.f2 = None if iono_freq == 'preferred' else BAND_FREQ[iono_freq]
+            cp_dual, snr_dual, band_dual = self.select_dual_obs_with_snr(PHASE_PREF_ORDER, iono_freq)
             cp, cp_dual = xr.align(cp, cp_dual, join='inner')
-            snr, snr_dual = snr.sel(time=cp.time), snr_dual.sel(time=cp.time)
+            snr, snr_dual, band_dual = snr.sel(time=cp.time), snr_dual.sel(time=cp.time), band_dual.sel(time=cp.time)
+            f2 = np.array([BAND_FREQ[band] for band in band_dual.values]) # by epoch (system) for 'preferred'
+            wavelength_2 = const.c/f2
 
         cp_cycles = np.asarray(cp.values, dtype=float)
         if iono_free is True:
@@ -4882,8 +4969,8 @@ class AntennaInfo(object):
 
         var_1 = thermal_variance(phase_noise_coeff(self.f1), np.asarray(snr.values, dtype=float))
         if iono_free is True:
-            var_2 = thermal_variance(phase_noise_coeff(self.f2), np.asarray(snr_dual.values, dtype=float))
-            cp_var = iono_free_variance(var_1, var_2, self.f1, self.f2)
+            var_2 = thermal_variance(phase_noise_coeff(f2), np.asarray(snr_dual.values, dtype=float))
+            cp_var = iono_free_variance(var_1, var_2, self.f1, f2)
         else:
             cp_var = var_1
 
@@ -5461,6 +5548,14 @@ class AntennaInfo(object):
     def hold_PCO(self, PCOData):
         """ Hold the phase center offset data for the antenna"""
         self.antenna_PCO = PCOData
+        self.pco_cache = {}
+
+    def get_pco(self, freq_code):
+        """ Receiver antenna PCO (NEU, m) for an ANTEX frequency code, cached per code """
+        if freq_code not in self.pco_cache:
+            offset = self.antenna_PCO.getPhaseCenterOffset(freq_code)
+            self.pco_cache[freq_code] = np.array([offset[0], offset[1], offset[2]])/1e3 # convert to m
+        return self.pco_cache[freq_code]
 
     def hold_elevs(self, elev_arr):
         """ Hold the source elevations for reweighting in least squares """
@@ -5536,6 +5631,10 @@ class GNSSTKStores(object):
         self.quat_sats = []
         self.R_T2I = []
         self.mjd_last = 0
+
+    def iono_f2(self, system_char):
+        """ Second ionosphere-free carrier frequency [Hz] for a satellite system (see PREFERRED_IONO_BAND) """
+        return BAND_FREQ[iono_free_band(self.iono_freq, system_char)]
 
     def build_antenna_map(self, source_array, datetime_array_full):
         """Build the satellite antenna map dictionary.
@@ -6116,27 +6215,21 @@ class GNSSTKStores(object):
         else:
             f1 = antenna_handle.f1
             freq1 = FREQ_TO_RINEX_ANT[f1]
-            if self.iono_free: # iono-free only for GPS, ref frequency for precise range
-                f2 = antenna_handle.f2
-                freq2 = FREQ_TO_RINEX_ANT[f2]
-            else:
-                freq2 ='0'
-                f2 = 0
+        if not self.iono_free: # otherwise the second frequency is set by satellite system, per epoch
+            freq2 ='0'
+            f2 = 0
 
         if antenna_handle.is_VLBI is False:
             # RX PCO correction
             antennaPCOData = antenna_handle.antenna_PCO
-            try: 
+            try:
                 offset_f1 = antennaPCOData.getPhaseCenterOffset(freq1)
             except:
                 if freq1=='E06':
                     offset_f1 = antennaPCOData.getPhaseCenterOffset('G02')
 
-            
+
             offset_f1 = np.array([offset_f1[0],offset_f1[1],offset_f1[2]])/1e3 # convert to m
-            if self.iono_free is True:
-                offset_dual = antennaPCOData.getPhaseCenterOffset(freq2)
-                offset_dual = np.array([offset_dual[0],offset_dual[1],offset_dual[2]])/1e3 # convert to m
 
         if antenna_handle.offset_NEU is not None:
             offset_XYZ = antenna_handle.R_mat.dot(antenna_handle.offset_NEU)
@@ -6154,8 +6247,7 @@ class GNSSTKStores(object):
             wavelength_1 = const.c/f1
             if self.iono_free:
                 cp_dual_model_arr = []
-                wavelength_2 = const.c/f2
-      
+
             if antenna_handle.is_VLBI is False:
                 east_triple = Position(antenna_handle.Rotate_obj.get_value(1,0),\
                                      antenna_handle.Rotate_obj.get_value(1,1),
@@ -6186,8 +6278,11 @@ class GNSSTKStores(object):
 
             freq1 = transmitter_antex_code(f1, RSID.systemChar())
             if self.iono_free:
-                freq2 = transmitter_antex_code(f2, RSID.systemChar())
-            
+                f2 = self.iono_f2(RSID.systemChar())
+                freq2_ant = FREQ_TO_RINEX_ANT[f2] # receiver antenna
+                freq2 = transmitter_antex_code(f2, RSID.systemChar()) # satellite antenna
+                wavelength_2 = const.c/f2
+
             # find satellite position, pointing vector at receive time
             sat_xvt = self.nav_store.get_xvt(RSID, common_time)
             rxpos_gnsstk = Position(rxpos[0], rxpos[1], rxpos[2])
@@ -6198,8 +6293,8 @@ class GNSSTKStores(object):
             sat_vel = np.array([sat_xvt.v[0],sat_xvt.v[1],sat_xvt.v[2]])
             rx2sat = sat_pos - rxpos
             rx2sat /= np.linalg.norm(rx2sat) # normalize vector
-            
-            if antenna_handle.is_VLBI is True: 
+
+            if antenna_handle.is_VLBI is True:
                 # compute the geometric model for the VLBI antenna
                 if antenna_handle.point_ra_dec_dict is not None:
                     ra, dec = antenna_handle.point_ra_dec_dict[times_gps[idx]]
@@ -6238,10 +6333,10 @@ class GNSSTKStores(object):
 
                 rxpos_L1 = rxpos + ROT@offset_f1 - PCV_L1*1e-3*rx2sat
                 if self.iono_free:
-                    PCV_dual = antennaPCOData.getPhaseCenterVariation(freq2, azimuth, elevation)
-                    rxpos_dual = rxpos + ROT@(offset_dual) - PCV_dual*1e-3*rx2sat
- 
-            try: 
+                    PCV_dual = antennaPCOData.getPhaseCenterVariation(freq2_ant, azimuth, elevation)
+                    rxpos_dual = rxpos + ROT@antenna_handle.get_pco(freq2_ant) - PCV_dual*1e-3*rx2sat
+
+            try:
                 sat_pos_L1 = self.sat_adj_PC(freq1, sat_antenna, times_adj[idx], eph_time, sat_xvt.x, rx2sat)
             except:
                 # PRN 03 has no G05 for some reason
@@ -6524,10 +6619,8 @@ class GNSSTKStores(object):
         #cpw2_arr_tx = []
         f1 = antenna1_handle.f1
         freq1_ant = FREQ_TO_RINEX_ANT[f1]
-        if self.iono_free: # iono-free only for GPS, ref frequency for precise range
-            f2 = antenna1_handle.f2
-            freq2_ant = FREQ_TO_RINEX_ANT[f2]
-            if phase is True: 
+        if self.iono_free: # second frequency set by satellite system, per epoch
+            if phase is True:
                 phase_model_dual_arr = []
         else:
             freq2 ='0'
@@ -6538,27 +6631,19 @@ class GNSSTKStores(object):
             antennaPCOData1 = antenna1_handle.antenna_PCO
             offset1_L1 = antennaPCOData1.getPhaseCenterOffset(freq1_ant)
             offset1_L1 = np.array([offset1_L1[0],offset1_L1[1],offset1_L1[2]])/1e3 # convert to m
-            if self.iono_free is True:
-                offset1_dual = antennaPCOData.getPhaseCenterOffset(freq2_ant)
-                offset1_dual = np.array([offset_dual[0],offset_dual[1],offset_dual[2]])/1e3 # convert to m
 
         if antenna2_handle.is_VLBI is False:
             # RX PCO correction
             antennaPCOData2 = antenna2_handle.antenna_PCO
             offset2_L1 = antennaPCOData2.getPhaseCenterOffset(freq1_ant)
             offset2_L1 = np.array([offset2_L1[0],offset2_L1[1],offset2_L1[2]])/1e3 # convert to m
-            if self.iono_free is True:
-                offset2_dual = antennaPCOData.getPhaseCenterOffset(freq2_ant)
-                offset2_dual = np.array([offset2_dual[0],offset2_dual[1],offset2_dual[2]])/1e3 # convert to m
 
         cpw_ant1 = {} # carrrier phase windup, dictionary by source
         cpw_ant2 = {}
         for source in self.source_array:
             cpw_ant1[source] = 0.0 # initialize cpw to 0
-            cpw_ant2[source] = 0.0 
+            cpw_ant2[source] = 0.0
         wavelength_1 = baseline_handle.wavelength
-        if self.iono_free:
-            wavelength_2 = baseline_handle.wavelength_dual
         if phase is True: # need to account for carrier phase windup
             #cpw_ant1 = {} # carrrier phase windup, dictionary by source
             #cpw_ant2 = {}
@@ -6616,11 +6701,14 @@ class GNSSTKStores(object):
             RSID = RinexSatID(str(sat_id))
             rxpos1 = antenna1_handle.pos_series[pos_idxs1[idx],:]
             rxpos2 = antenna2_handle.pos_series[pos_idxs2[idx],:]
-          
+
             freq1 = transmitter_antex_code(f1, RSID.systemChar())
             if self.iono_free:
-                freq2 = transmitter_antex_code(f2, RSID.systemChar())
-            
+                f2 = self.iono_f2(RSID.systemChar())
+                freq2_ant = FREQ_TO_RINEX_ANT[f2] # receiver antenna
+                freq2 = transmitter_antex_code(f2, RSID.systemChar()) # satellite antenna
+                wavelength_2 = const.c/f2
+
             # find satellite position, pointing vector at receive time
             sat_xvt = self.nav_store.get_xvt(RSID, common_time)
             rxpos1_gnsstk = Position(rxpos1[0], rxpos1[1], rxpos1[2])
@@ -6632,11 +6720,11 @@ class GNSSTKStores(object):
             rx2sat1 /= np.linalg.norm(rx2sat1) # normalize vector
             rx2sat2 = sat_pos - rxpos2
             rx2sat2 /= np.linalg.norm(rx2sat2) # normalize vector
-            
-            if antenna1_handle.is_VLBI is True: 
+
+            if antenna1_handle.is_VLBI is True:
                 # compute the geometric model for the VLBI antenna
                 point_vec = rx2sat1-a_vec1*np.dot(rx2sat1, a_vec1)
-                fb_vec1 = antenna1_handle.axis_offset*point_vec/np.linalg.norm(point_vec) 
+                fb_vec1 = antenna1_handle.axis_offset*point_vec/np.linalg.norm(point_vec)
 
                 # shift rxpos by offset
                 rxpos1_L1 = rxpos1 + fb_vec1
@@ -6669,7 +6757,7 @@ class GNSSTKStores(object):
                 rxpos1_L1 = rxpos1 + ROT@offset1_L1 - PCV_L1*1e-3*rx2sat1
                 if self.iono_free:
                     PCV_dual = antennaPCOData1.getPhaseCenterVariation(freq2_ant, azimuth, elevation)
-                    rxpos1_dual = rxpos1 + ROT@(offset1_dual) - PCV_dual*1e-3*rx2sat1
+                    rxpos1_dual = rxpos1 + ROT@antenna1_handle.get_pco(freq2_ant) - PCV_dual*1e-3*rx2sat1
 
             if antenna2_handle.is_VLBI is True: 
                 # compute the geometric model for the VLBI antenna
@@ -6707,7 +6795,7 @@ class GNSSTKStores(object):
                 rxpos2_L1 = rxpos2 + ROT@offset2_L1 - PCV_L1*1e-3*rx2sat2
                 if self.iono_free:
                     PCV_dual = antennaPCOData2.getPhaseCenterVariation(freq2_ant, azimuth, elevation)
-                    rxpos2_dual = rxpos2 + ROT@(offset2_dual) - PCV_dual*1e-3*rx2sat2
+                    rxpos2_dual = rxpos2 + ROT@antenna2_handle.get_pco(freq2_ant) - PCV_dual*1e-3*rx2sat2
             if sat_id[0] != 'L': # LEO
                 sat_pos_L1 = self.sat_adj_PC(freq1, sat_antenna, times_gps[idx], eph_time, sat_xvt.x, 0, noPCV=True)
                 if self.iono_free:
@@ -6736,8 +6824,8 @@ class GNSSTKStores(object):
                 PCV_delay1 = self.sat_PCV_delay(freq1, sat_antenna, times_gps[idx], eph_time, sat_xvt_corr.x, rx2sat1)
                 PCV_delay2 = self.sat_PCV_delay(freq1, sat_antenna, times_gps[idx], eph_time, sat_xvt_corr.x, rx2sat2)
                 if self.iono_free:
-                    PCV_dual_delay1 = self.sat_PCV_delay(freq2, sat_antenna, time_gps[idx], eph_time, sat_xvt_dual.x, rx2sat1)
-                    PCV_dual_delay2 = self.sat_PCV_delay(freq2, sat_antenna, time_gps[idx], eph_time, sat_xvt_dual.x, rx2sat2)
+                    PCV_dual_delay1 = self.sat_PCV_delay(freq2, sat_antenna, times_gps[idx], eph_time, sat_xvt_dual.x, rx2sat1)
+                    PCV_dual_delay2 = self.sat_PCV_delay(freq2, sat_antenna, times_gps[idx], eph_time, sat_xvt_dual.x, rx2sat2)
             else:
                 PCV_delay1 = 0 
                 PCV_delay2 = 0
@@ -6855,7 +6943,8 @@ class GNSSTKStores(object):
             # we need to add the modeled troposphere and clock offset to mirror the real PR measurement
             if phase_only is False:
                 if self.iono_free is True:
-                    group_model = float(IonosphereFreeRange([f1, f2], [delay, delay_dual])) + (trop_delay2-trop_delay1) + clock_offset \
+                    group_model = float(IonosphereFreeRange([f1, f2], [delay + PCV_delay2-PCV_delay1, \
+                            delay_dual + PCV_dual_delay2-PCV_dual_delay1])) + (trop_delay2-trop_delay1) + clock_offset \
                             - (dt_therm2-dt_therm1) + (grav_delay2-grav_delay1) + (cc_delay2-cc_delay1)
                 else:
                     group_model = delay + (trop_delay2-trop_delay1) + (iono_delay2-iono_delay1) + clock_offset + PCV_delay2-PCV_delay1 \
@@ -6951,7 +7040,7 @@ class GNSSTKStores(object):
                 phase_model_arr.append(phase_model)
                 
                 if self.iono_free is True:
-                    phase_model_dual = delay + (trop_delay2-trop_delay1) + (cpw2_current-cpw1_current)*wavelength_2 + phase_clock_offset\
+                    phase_model_dual = delay_dual + (trop_delay2-trop_delay1) + (cpw2_current-cpw1_current)*wavelength_2 + phase_clock_offset\
                             + (PCV_dual_delay2-PCV_dual_delay1) - (dt_therm2-dt_therm1) + (grav_delay2-grav_delay1) + (cc_delay2-cc_delay1)
                     phase_model_dual_arr.append(phase_model_dual)
 
@@ -8452,10 +8541,7 @@ class GNSSTKStores(object):
         times_gps = antenna_handle.times_gps
         f1 = antenna_handle.f1
         freq1_ant = FREQ_TO_RINEX_ANT[f1]
-        if self.iono_free: # iono-free only for GPS, ref frequency for precise range
-            f2 = antenna_handle.f2
-            freq2_ant = FREQ_TO_RINEX_ANT[f2]
-        else:
+        if not self.iono_free: # otherwise the second frequency is set by satellite system, per epoch
             freq2 ='0'
             f2 = 0
 
@@ -8471,15 +8557,10 @@ class GNSSTKStores(object):
             antennaPCOData = antenna_handle.antenna_PCO
             offset_f1 = antennaPCOData.getPhaseCenterOffset(freq1_ant)
             offset_f1 = np.array([offset_f1[0],offset_f1[1],offset_f1[2]])/1e3 # convert to m
-            if self.iono_free is True:
-                offset_dual = antennaPCOData.getPhaseCenterOffset(freq2_ant)
-                offset_dual = np.array([offset_dual[0],offset_dual[1],offset_dual[2]])/1e3 # convert to m
 
         if phase is True: # and antenna_handle.is_VLBI is False: # need to account for carrier phase windup
             wavelength_1 = const.c/f1
-            if self.iono_free:
-                wavelength_2 = const.c/f2
-        
+
         if antenna_handle.is_VLBI is True:
             a_vec = antenna_handle.calc_VLBI_mount_vec()
 
@@ -8513,11 +8594,13 @@ class GNSSTKStores(object):
             sat_antenna = self.antenna_map[str(sat_id)]  
             RSID = RinexSatID(str(sat_id))
             rxpos = antenna_handle.pos_series[idx,:]
-          
+
             freq1 = transmitter_antex_code(f1, RSID.systemChar())
             if self.iono_free:
-                freq2 = transmitter_antex_code(f2, RSID.systemChar())
-            
+                f2 = self.iono_f2(RSID.systemChar())
+                freq2_ant = FREQ_TO_RINEX_ANT[f2] # receiver antenna
+                freq2 = transmitter_antex_code(f2, RSID.systemChar()) # satellite antenna
+
             # find satellite position, pointing vector at receive time
             sat_xvt = self.nav_store.get_xvt(RSID, common_time)
             rxpos_gnsstk = Position(rxpos[0], rxpos[1], rxpos[2])
@@ -8528,8 +8611,8 @@ class GNSSTKStores(object):
             sat_vel = np.array([sat_xvt.v[0],sat_xvt.v[1],sat_xvt.v[2]])
             rx2sat = sat_pos - rxpos
             rx2sat /= np.linalg.norm(rx2sat) # normalize vector
-            
-            if antenna_handle.is_VLBI is True: 
+
+            if antenna_handle.is_VLBI is True:
                 # compute the geometric model for the VLBI antenna
                 if antenna_handle.point_ra_dec_dict is not None:
                     ra, dec = antenna_handle.point_ra_dec_dict[times_gps[idx]]
@@ -8554,7 +8637,7 @@ class GNSSTKStores(object):
                 rxpos_L1 = rxpos + ROT@(offset_f1) - PCV_L1*1e-3*rx2sat
                 if self.iono_free:
                     PCV_dual = antennaPCOData.getPhaseCenterVariation(freq2_ant, azimuth, elevation)
-                    rxpos_dual = rxpos + ROT@(offset_dual) - PCV_dual*1e-3*rx2sat
+                    rxpos_dual = rxpos + ROT@antenna_handle.get_pco(freq2_ant) - PCV_dual*1e-3*rx2sat
 
             sat_pos_L1 = self.sat_adj_PC(freq1, sat_antenna, times_gps[idx], eph_time, sat_xvt.x, rx2sat)
             if self.iono_free:
@@ -8646,10 +8729,7 @@ class GNSSTKStores(object):
         isCOM = True
         f1 = antenna1_handle.f1
         freq1_ant = FREQ_TO_RINEX_ANT[f1]
-        if self.iono_free: # iono-free only for GPS, ref frequency for precise range
-            f2 = antenna_handle.f2
-            freq2_ant = FREQ_TO_RINEX_ANT[f2]
-        else:
+        if not self.iono_free: # otherwise the second frequency is set by satellite system, per epoch
             freq2 ='0'
             f2 = 0
 
@@ -8665,23 +8745,15 @@ class GNSSTKStores(object):
             antennaPCOData1 = antenna1_handle.antenna_PCO
             offset1_L1 = antennaPCOData1.getPhaseCenterOffset(freq1_ant)
             offset1_L1 = np.array([offset1_L1[0],offset1_L1[1],offset1_L1[2]])/1e3 # convert to m
-            if self.iono_free is True:
-                offset1_dual = antennaPCOData1.getPhaseCenterOffset(freq2_ant)
-                offset1_dual = np.array([offset1_dual[0],offset1_dual[1],offset1_dual[2]])/1e3 # convert to m
         if antenna2_handle.is_VLBI is False:
             # RX PCO correction
             antennaPCOData2 = antenna2_handle.antenna_PCO
             offset2_L1 = antennaPCOData2.getPhaseCenterOffset(freq1_ant)
             offset2_L1 = np.array([offset2_L1[0],offset2_L1[1],offset2_L1[2]])/1e3 # convert to m
-            if self.iono_free is True:
-                offset2_dual = antennaPCOData2.getPhaseCenterOffset(freq2_ant)
-                offset2_dual = np.array([offset2_dual[0],offset2_dual[1],offset2_dual[2]])/1e3 # convert to m
 
         if phase is True: # and antenna_handle.is_VLBI is False: # need to account for carrier phase windup
             wavelength_1 = baseline_handle.wavelength
-            if self.iono_free:
-                wavelength_2 = baseline_handle.wavelength_dual
-        
+
         if antenna1_handle.is_VLBI is True:
             a_vec1 = antenna1_handle.calc_VLBI_mount_vec()
         if antenna2_handle.is_VLBI is True:
@@ -8736,11 +8808,13 @@ class GNSSTKStores(object):
             RSID = RinexSatID(str(sat_id))
             rxpos1 = antenna1_handle.pos_series[pos_idxs1[idx],:]
             rxpos2 = antenna2_handle.pos_series[pos_idxs2[idx],:]
-          
+
             freq1 = transmitter_antex_code(f1, RSID.systemChar())
             if self.iono_free:
-                freq2 = transmitter_antex_code(f2, RSID.systemChar())
-            
+                f2 = self.iono_f2(RSID.systemChar())
+                freq2_ant = FREQ_TO_RINEX_ANT[f2] # receiver antenna
+                freq2 = transmitter_antex_code(f2, RSID.systemChar()) # satellite antenna
+
             # find satellite position, pointing vector at receive time
             sat_xvt = self.nav_store.get_xvt(RSID, common_time)
             rxpos1_gnsstk = Position(rxpos1[0], rxpos1[1], rxpos1[2])
@@ -8777,7 +8851,7 @@ class GNSSTKStores(object):
                 rxpos1_L1 = rxpos1 + ROT@(offset1_L1) - PCV_L1*1e-3*rx2sat1
                 if self.iono_free:
                     PCV_dual = antennaPCOData1.getPhaseCenterVariation(freq2_ant, azimuth1, elevation1)
-                    rxpos1_dual = rxpos1 + ROT@(offset1_dual) - PCV_dual*1e-3*rx2sat1
+                    rxpos1_dual = rxpos1 + ROT@antenna1_handle.get_pco(freq2_ant) - PCV_dual*1e-3*rx2sat1
 
             elevation2 = rxpos2_gnsstk.elevationGeodetic(sat_pos_gnsstk)
             if antenna2_handle.is_VLBI is True: 
@@ -8796,13 +8870,13 @@ class GNSSTKStores(object):
                    rxpos2_dual = rxpos2 + fb_vec
             else:
                 # compute antenna PCV
-                ROT = antenna1_handle.R_mat # rotation from NEU to XYZ (ECEF) 
+                ROT = antenna2_handle.R_mat # rotation from NEU to XYZ (ECEF)
                 azimuth2 = rxpos2_gnsstk.azimuthGeodetic(sat_pos_gnsstk)
                 PCV_L1 = antennaPCOData2.getPhaseCenterVariation(freq1_ant, azimuth2, elevation2)
                 rxpos2_L1 = rxpos2 + ROT@(offset2_L1) - PCV_L1*1e-3*rx2sat2
                 if self.iono_free:
-                    PCV_dual = antennaPCOData1.getPhaseCenterVariation(freq2_ant, azimuth2, elevation2)
-                    rxpos2_dual = rxpos2 + ROT@(offset2_dual) - PCV_dual*1e-3*rx2sat2
+                    PCV_dual = antennaPCOData2.getPhaseCenterVariation(freq2_ant, azimuth2, elevation2)
+                    rxpos2_dual = rxpos2 + ROT@antenna2_handle.get_pco(freq2_ant) - PCV_dual*1e-3*rx2sat2
             
             if sat_id[0] != 'L':
                 sat_pos_L1 = self.sat_adj_PC(freq1, sat_antenna, times_gps[idx], eph_time, sat_xvt.x, 0, noPCV=True)
@@ -11501,7 +11575,7 @@ def find_diff_meas_phase(antenna1_handle, antenna2_handle, baseline_handle, \
     # subtract float or integer ambiguities from data
     slip_slices_arr = baseline_handle.slip_slices_arr
     for idx, slip_slice in enumerate(slip_slices_arr):
-        diff_cp_data[slip_slice] = diff_cp_data[slip_slice] + wavelength*amb_state[idx]
+        diff_cp_data[slip_slice] = diff_cp_data[slip_slice] + wavelength_at(wavelength, slip_slice)*amb_state[idx]
     
     residuals_phase = diff_cp_data - diff_cp_model
     residuals_phase = residuals_phase[baseline_handle.phase_data_idxs]
@@ -11531,7 +11605,7 @@ def find_diff_meas_phase_vlbi(baseline_handle, amb_state, combination_type='WL',
     # subtract float or integer ambiguities from data
     slip_slices_arr = baseline_handle.slip_slices_arr
     for idx, slip_slice in enumerate(slip_slices_arr):
-        phase_delays[slip_slice] = phase_delays[slip_slice] + wavelength*amb_state[idx]
+        phase_delays[slip_slice] = phase_delays[slip_slice] + wavelength_at(wavelength, slip_slice)*amb_state[idx]
 
     residuals_phase = phase_delays - phase_delay_model
     residuals_phase = residuals_phase[baseline_handle.phase_data_idxs]
@@ -15479,7 +15553,7 @@ def detect_unresolved_amb_vlbi(iono_free, amb_state, baseline_handles):
         # subtract float or integer ambiguities from data
         slip_slices_arr = baseline_handle.slip_slices_arr
         for idx, slip_slice in enumerate(slip_slices_arr):
-            phase_delays[slip_slice] = phase_delays[slip_slice] + wavelength*amb_state[idx]
+            phase_delays[slip_slice] = phase_delays[slip_slice] + wavelength_at(wavelength, slip_slice)*amb_state[idx]
 
         sigma_pd, use_idxs_pd = find_sigmas(phase_delays-phase_delay_model)
         slips = slip_detect_full(baseline_handle.f1, phase_delays, phase_delay_model, times_diff)
@@ -15528,7 +15602,7 @@ def detect_unresolved_amb_gnss(store_handle, amb_state, antenna_handles, baselin
         # subtract float or integer ambiguities from data
         slip_slices_arr = baseline_handle.slip_slices_arr
         for idx, slip_slice in enumerate(slip_slices_arr):
-            diff_cp_data[slip_slice] = diff_cp_data[slip_slice] + wavelength*amb_state[idx]
+            diff_cp_data[slip_slice] = diff_cp_data[slip_slice] + wavelength_at(wavelength, slip_slice)*amb_state[idx]
         
         sigma_pd, use_idxs_pd = find_sigmas(diff_cp_data-diff_cp_model)
         slips = slip_detect_full(baseline_handle.f1, diff_cp_data, diff_cp_model, times_diff)
@@ -18285,13 +18359,14 @@ def calc_jac(state, ref_antenna, baselines, store_handle, antenna_handles, \
 
             for slip_idx, slip_slice in enumerate(baseline_handle.slip_slices_arr):
                 idxs_slice, _, idxs_residuals = np.intersect1d(slip_slice, baseline_handle.phase_data_idxs, return_indices=True)
-                idxs_full = idxs_residuals + num_samples 
+                idxs_full = idxs_residuals + num_samples
+                wavelength_slice = wavelength_at(wavelength, idxs_slice) # per observation for --iono_freq preferred
                 if len(inverse_Z_transform)>0:
                     # each Z-domain ambiguity contributes to each of the A-domain ambiguities
                     analytical_jac[idxs_full, amb_state_idxs.start:]\
-                            = wavelength*inverse_Z_transform[slip_idx+n_amb, :len(amb_state)]
+                            = np.reshape(wavelength_slice, (-1, 1))*inverse_Z_transform[slip_idx+n_amb, :len(amb_state)]
                 else:
-                    analytical_jac[idxs_full, amb_state_idxs.start+n_amb+slip_idx] = wavelength
+                    analytical_jac[idxs_full, amb_state_idxs.start+n_amb+slip_idx] = wavelength_slice
                 
             num_samples += len(baseline_handle.phase_data_idxs)
             n_amb += baseline_handle.n_amb_state

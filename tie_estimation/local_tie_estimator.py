@@ -67,7 +67,8 @@ from single_diff_tools import import_key_gnss, import_vex_gnss, import_data_vlbi
                   detect_unresolved_amb_gnss, set_bounds_phase_clock, union_of_slices, get_residuals, iterative_weight_adjust, iterative_weight_adjust_ls_vce, \
                   iterative_weight_adjust_LS_VCE_full, sample_global_poly_at_interval, gen_key, VMF3Model, TropTestModel, get_spanning_tree, \
                   read_thermal_deformation_coeffs, get_obs_weights, find_cont_penalty, mcmc_correlation, ls_correlation, load_kernel_parameters, vlbi_transform_data,\
-                  write_vda_phase, NavStore, fit_phase_clock_params_grdel, nearest_rinex_ant_code, source_map
+                  write_vda_phase, NavStore, fit_phase_clock_params_grdel, nearest_rinex_ant_code, source_map, \
+                  wavelength_at, PREFERRED_IONO_BAND
 
 MIN_SLICE = 0
 MIN_TROP_DIST = 0.5e3 # 1 km
@@ -490,7 +491,9 @@ def add_args_to_parser(parser_in):
             +'GNSS antenna to compensate in VLBI. CURRENTLY NOT FULLY IMPLEMENTED.')
     parser.add_argument("--ionex_files", dest="ionex_files", action="append", type=str, nargs="+", help = 'Compensate for ionosphere with an IONEX model. Repeat for multiple days.')
     parser.add_argument("--iono_freq", type=str, default='L2',
-                       help = 'Carrier frequency to use in iono-free combination (L2 or L5). NB: will only use GPS satellites with L2.')
+                       help = 'Second carrier frequency of the iono-free combination: L2, L5, or preferred (by system with '\
+                              +'--freq_select L1: GPS/QZSS L1/L2, Galileo E1/E5a, BDS B1C/B2a; other systems dropped). '\
+                              +'NB: L2 will only use GPS satellites.')
     parser.add_argument("--freq_select", type=str, default='L1',
                        help = 'Carrier frequency to use in single-difference GNSS baseline estimation. (L2, E6, L5) NB: will only use GPS satellites with L2.')
    
@@ -592,8 +595,9 @@ def define_amb_state_gnss(store_handle, baselines, antenna_handles, baseline_han
         baseline_handle.cp_diff += N_int*wavelength
 
         if store_handle.iono_free: # get float ambiguity for combination
-            diff_cp_dual_model = data_ant2.cp_dual_model.values[ant2_idxs] - data_ant1.cp_dual_model.values
-            wavelength2 = const.c/baseline_handle.f2
+            diff_cp_dual_model = antenna2_handle.antenna_data.cp_dual_model.values[ant2_idxs] \
+                    - antenna1_handle.antenna_data.cp_dual_model.values[ant1_idxs]
+            wavelength2 = const.c/baseline_handle.f2 # per observation for --iono_freq preferred
             N_int2 = np.rint((diff_cp_dual_model-baseline_handle.cp_dual)/wavelength2)
             baseline_handle.cp_dual += N_int2*wavelength2
             N_float = construct_float_amb(baseline_handle.cp_combination, \
@@ -766,8 +770,13 @@ def define_baseline_handles_gnss(store_handle, clock_state, clock_poly_length, a
        diff_pr_data = data_ant2.pr_data.values[ant2_idxs] - data_ant1.pr_data.values[ant1_idxs]
  
        if store_handle.iono_free:
-           f2 = antenna_handle.f2
-           diff_cp_dual_model = data_ant2.cp_dual_model.values[ant2_idxs] - data_ant1.cp_dual_model.values
+           if store_handle.iono_freq == 'preferred':
+               # second frequency by system of the satellite observed at each epoch (same at both antennas)
+               src_dict = source_map(baseline_handle, store_handle)
+               f2 = np.array([store_handle.iono_f2(str(src_dict[time])[0]) for time in times_gps])
+           else:
+               f2 = antenna1_handle.f2
+           diff_cp_dual_model = data_ant2.cp_dual_model.values[ant2_idxs] - data_ant1.cp_dual_model.values[ant1_idxs]
            diff_cp_dual = data_ant2.cp_dual.values[ant2_idxs] - data_ant1.cp_dual.values[ant1_idxs]
            wavelength2 = const.c/f2
            N_int = np.rint((diff_cp_dual_model-diff_cp_dual)/wavelength2)
@@ -777,12 +786,13 @@ def define_baseline_handles_gnss(store_handle, clock_state, clock_poly_length, a
        baseline_handle.datetime_array = times_gps
        baseline_handle.prepare_l1_frequency(diff_pr_data, diff_cp_data)
        baseline_handle.hold_range_idxs(np.arange(len(diff_pr_data))[idxs_nonnan])
-       baseline_handle.get_phase_idxs(store_handle.iono_free)
        if store_handle.iono_free: 
            diff_cp_model = data_ant2.cp_model.values[ant2_idxs] - data_ant1.cp_model.values[ant1_idxs]
+           baseline_handle.cp_model = np.zeros(len(diff_cp_model))
            baseline_handle.prepare_dual_frequency(diff_cp_dual, f2)
            baseline_handle.combination_measurement('WL')
            baseline_handle.combination_model(diff_cp_model, diff_cp_dual_model, 'WL')
+       baseline_handle.get_phase_idxs(store_handle.iono_free)
 
     return baseline_handles
 
@@ -950,7 +960,8 @@ def assimilate_amb_state(sol_type, a_fixed, baseline_handles, iono_free):
                 baseline_handle.phase_delays[slip_slice] = baseline_handle.phase_delays[slip_slice] + wavelength*amb_baseline[idx]
             elif sol_type == 'GNSS':
                 if iono_free:
-                    baseline_handle.cp_combination[slip_slice] = baseline_handle.cp_combination[slip_slice] + wavelength*amb_baseline[idx]
+                    baseline_handle.cp_combination[slip_slice] = baseline_handle.cp_combination[slip_slice] \
+                            + wavelength_at(wavelength, slip_slice)*amb_baseline[idx]
                 else:
                     baseline_handle.cp_diff[slip_slice] = baseline_handle.cp_diff[slip_slice] + wavelength*amb_baseline[idx]
 
@@ -2254,6 +2265,13 @@ if __name__ == '__main__':
             print('Using iono-free combination with L1/L2')
         elif args.iono_freq == 'L5':
             print('Using iono-free combination with L1/L5')
+        elif args.iono_freq == 'preferred':
+            if args.freq_select != 'L1':
+                raise ValueError('--iono_freq preferred pairs with --freq_select L1, got ' + args.freq_select)
+            if args.src_type != 'GNSS':
+                raise ValueError('--iono_freq preferred sets the pair by satellite system, needs --src_type GNSS')
+            print('Using iono-free combination by system: ' + ', '.join(system_char + ' L1/' + band \
+                    for system_char, band in PREFERRED_IONO_BAND.items()))
         else:
             raise ValueError('Unknown carrier frequency ' + args.iono_freq)
 
