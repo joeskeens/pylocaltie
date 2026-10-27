@@ -306,7 +306,7 @@ def add_args_to_parser(parser_in):
     parser.add_argument("--baseline_strategy",
                          type=str,
                          default='Obs-Max',
-                         help="If using GNSS observables, choose a strategy for forming the spanning tree of baselines. Options: Obs-Max, Shortest",
+                         help="If using GNSS observables, choose a strategy for forming the spanning tree of baselines. Options: Obs-Max, Shortest, Ties-GNSS (local ties, then GNSS-GNSS baselines between sites), Ties-VLBI (local ties, then VLBI-VLBI baselines between sites)",
                          )
     parser.add_argument("--stochastic_trop",
                          action="store_true",
@@ -491,8 +491,8 @@ def add_args_to_parser(parser_in):
             +'GNSS antenna to compensate in VLBI. CURRENTLY NOT FULLY IMPLEMENTED.')
     parser.add_argument("--ionex_files", dest="ionex_files", action="append", type=str, nargs="+", help = 'Compensate for ionosphere with an IONEX model. Repeat for multiple days.')
     parser.add_argument("--iono_freq", type=str, default='L2',
-                       help = 'Second carrier frequency of the iono-free combination: L2, L5, or preferred (by system with '\
-                              +'--freq_select L1: GPS/QZSS L1/L2, Galileo E1/E5a, BDS B1C/B2a; other systems dropped). '\
+                       help = 'Second carrier frequency of the iono-free combination: L2, L5, E6 (Galileo E1/E6), or preferred '\
+                              +'(by system with --freq_select L1: GPS/QZSS L1/L2, Galileo E1/E5a, BDS B1C/B2a; other systems dropped). '\
                               +'NB: L2 will only use GPS satellites.')
     parser.add_argument("--freq_select", type=str, default='L1',
                        help = 'Carrier frequency to use in single-difference GNSS baseline estimation. (L2, E6, L5) NB: will only use GPS satellites with L2.')
@@ -566,6 +566,101 @@ def define_amb_state_vlbi(store_handle, baseline_handles):
 
     return amb_state, amb_int_total
 
+def weight_adjust_phase(store_handle, ls_sol, bounds, ls_args, jac, sol_type, no_PSD=False):
+    """ Phase weight adjustment as in the fixed phase-only solution (LS-VCE where available) """
+    if sol_type == 'GNSS' and store_handle.vlbi_like is False:
+        return iterative_weight_adjust_LS_VCE_full(store_handle, ls_sol.x, bounds, ls_args, calc_residuals, jac, sol_type, 'phase')
+    elif store_handle.stochastic_clock or store_handle.stochastic_trop:
+        return iterative_weight_adjust_ls_vce(store_handle, ls_sol.x, bounds, ls_args, calc_residuals, jac, sol_type, 'phase', no_PSD=no_PSD)
+    return iterative_weight_adjust(store_handle, ls_sol.x, bounds, ls_args, calc_residuals, jac, sol_type, 'phase')
+
+WEIGHT_ATTRS_BASELINE = ('q_range', 'q_phase', 'q_range_satellite', 'q_phase_satellite')
+# weights and process noise (weight adjustment), and the stochastic clock/troposphere/DISB layout (adjust_stoch_params,
+# called by iterative_remove_outliers), all held per antenna
+WEIGHT_ATTRS_ANTENNA = ('clock_psd_rw', 'clock_psd_irw', 'phase_clock_psd_rw', 'phase_clock_psd_irw', 'trop_psd_rw', \
+        'clock_samples', 'phase_clock_samples', 'trop_samples', 'range_disb', 'phase_disb', 'range_clock_idxs', 'clock_times', \
+        'phase_clock_start', 'phase_clock_end', 'phase_clock_idxs', 'phase_clock_times', 'trop_idxs', 'trop_times', \
+        'range_disb_idxs', 'phase_disb_idxs')
+
+def hold_weights(antenna_handles, baseline_handles):
+    """ Snapshot of the observation weights, process noise and stochastic state layout of a solution """
+    return ([{attr: getattr(handle, attr) for attr in WEIGHT_ATTRS_BASELINE if hasattr(handle, attr)} for handle in baseline_handles],
+            [{attr: getattr(handle, attr) for attr in WEIGHT_ATTRS_ANTENNA if hasattr(handle, attr)} for handle in antenna_handles])
+
+def restore_weights(antenna_handles, baseline_handles, weights_held):
+    """ Restore a snapshot from hold_weights """
+    for handle, held in zip(baseline_handles, weights_held[0]):
+        for attr, value in held.items(): setattr(handle, attr, value)
+    for handle, held in zip(antenna_handles, weights_held[1]):
+        for attr, value in held.items(): setattr(handle, attr, value)
+
+def phase_only_state(state, bounds, ls_args, n_ao_state, n_grav_state):
+    """ Phase-only version of a fixed-ambiguity range+phase state, as the fixed phase-only solution uses: the range
+        clock and range DISB states are dropped. The state layout is
+        [positions | range clock | AO | gravity | troposphere | range DISB | phase clock | phase DISB | ambiguities].
+        returns: state, bounds, calc_residuals arguments with phase_only set and the indices of the new layout
+    """
+    clock_idxs, trop_idxs, phase_clock_idxs, phase_disb_idxs = ls_args[4], ls_args[6], ls_args[17], ls_args[18]
+    ao_grav_idxs = slice(clock_idxs.stop, clock_idxs.stop + n_ao_state + n_grav_state)
+    blocks = (slice(0, clock_idxs.start), ao_grav_idxs, trop_idxs, phase_clock_idxs, phase_disb_idxs)
+    state_po = np.concatenate([state[block] for block in blocks])
+    bounds_po = tuple(np.concatenate([bound[block] for block in blocks]) for bound in bounds)
+
+    n_rxpos = clock_idxs.start
+    trop_po = slice(n_rxpos + n_ao_state + n_grav_state, n_rxpos + n_ao_state + n_grav_state + len(state[trop_idxs]))
+    phase_clock_po = slice(trop_po.stop, trop_po.stop + len(state[phase_clock_idxs]))
+    phase_disb_po = slice(phase_clock_po.stop, phase_clock_po.stop + len(state[phase_disb_idxs]))
+    ls_args_po = list(ls_args)
+    ls_args_po[4] = slice(n_rxpos, n_rxpos)                       # range clock
+    ls_args_po[6] = trop_po
+    ls_args_po[8] = slice(trop_po.stop, trop_po.stop)             # range DISB
+    ls_args_po[11] = True                                          # phase_only
+    ls_args_po[13] = slice(phase_disb_po.stop, phase_disb_po.stop) # ambiguities held at their integers
+    ls_args_po[17] = phase_clock_po
+    ls_args_po[18] = phase_disb_po
+    return state_po, bounds_po, tuple(ls_args_po)
+
+def source_arcs(source_array, slips):
+    """ Observation indices of each continuous arc: per source, split at the slips (epochs that start a new arc) """
+    source_array = np.asarray(source_array)
+    arcs = []
+    for src in np.unique(source_array):
+        idxs_src = np.flatnonzero(source_array == src)
+        arcs.extend(np.split(idxs_src, np.flatnonzero(np.isin(idxs_src, slips))))
+    return [arc for arc in arcs if len(arc) > 0]
+
+def widelane_mw_check(baseline_handle, widelane_integers, source_array):
+    """ Check the fixed wide-lane integers against the Melbourne-Wubbena combination, which needs no clock, position
+        or troposphere. With data + lambda_W*N_W = model, (L_W - P_N)/lambda_W + N_W is, per epoch, the phase-minus-code
+        receiver bias of the system in wide-lane cycles plus code noise: constant within a system if the integers are
+        right. Prints, per system, the scatter of the arc medians and the arcs off by one cycle or more.
+    """
+    freq_1, freq_2 = baseline_handle.f1, baseline_handle.f2
+    phase_widelane = (freq_1*baseline_handle.cp_diff - freq_2*baseline_handle.cp_dual)/(freq_1 - freq_2)
+    code_narrowlane = (freq_1*baseline_handle.pr_l1_raw + freq_2*baseline_handle.pr_dual_raw)/(freq_1 + freq_2)
+    cycles = (phase_widelane - code_narrowlane)/(const.c/(freq_1 - freq_2)) + widelane_integers # comb_wavelength may be IF by now
+    source_array = np.asarray(source_array)
+    arcs = source_arcs(source_array, getattr(baseline_handle, 'detector_slips', []))
+    for system in sorted({str(src)[0] for src in source_array}):
+        arc_medians, arc_names = [], []
+        for arc in arcs:
+            if str(source_array[arc[0]])[0] != system or not np.any(np.isfinite(cycles[arc])):
+                continue
+            arc_medians.append(np.nanmedian(cycles[arc]))
+            arc_names.append(f'{source_array[arc[0]]}@{arc[0]}')
+        if len(arc_medians) == 0:
+            continue
+        arc_medians = np.array(arc_medians)
+        offsets = arc_medians - np.median(arc_medians)
+        off_cycle = np.flatnonzero(np.abs(offsets) >= 0.5)
+        print(f'MW check {system}: {len(arc_medians)} arcs, bias {np.median(arc_medians):.3f} cyc, '
+              f'arc scatter {np.std(offsets):.3f} cyc, {len(off_cycle)} arcs off by >= 1 cycle'
+              + (': ' + ', '.join(f'{arc_names[idx]} ({offsets[idx]:+.2f})' for idx in off_cycle) if len(off_cycle) else ''))
+
+# fraction of same-source revisits flagged by the raw geometry-free detector above which the raw phases are taken as
+# not connected between epochs (per-scan data): integers from the model at every epoch instead (define_amb_state_gnss)
+RAW_GF_SLIP_FRACTION = 0.3
+
 def define_amb_state_gnss(store_handle, baselines, antenna_handles, baseline_handles):
     """ Define the ambiguity state for GNSS solution type """
     # Get rough float ambiguity estimate from PR solution rxpos/clock
@@ -591,24 +686,6 @@ def define_amb_state_gnss(store_handle, baselines, antenna_handles, baseline_han
             stec_vals = store_handle.interp_l4r(baseline_handle.datetime_array, source_array, antenna1_handle.l4r_name, antenna2_handle.l4r_name)
             diff_cp_model += ALPHA_IONO/baseline_handle.f1**2*const.c*stec_vals 
         
-        N_int = np.rint((diff_cp_model-baseline_handle.cp_diff)/wavelength)
-        baseline_handle.cp_diff += N_int*wavelength
-
-        if store_handle.iono_free: # get float ambiguity for combination
-            diff_cp_dual_model = antenna2_handle.antenna_data.cp_dual_model.values[ant2_idxs] \
-                    - antenna1_handle.antenna_data.cp_dual_model.values[ant1_idxs]
-            wavelength2 = const.c/baseline_handle.f2 # per observation for --iono_freq preferred
-            N_int2 = np.rint((diff_cp_dual_model-baseline_handle.cp_dual)/wavelength2)
-            baseline_handle.cp_dual += N_int2*wavelength2
-            N_float = construct_float_amb(baseline_handle.cp_combination, \
-                        baseline_handle.cp_model_combination, baseline_handle.comb_wavelength)
-        else:
-            N_float = construct_float_amb(baseline_handle.cp_diff, diff_cp_model, wavelength)
-
-        #amb_int = N_int[baseline_handle.range_data_idxs]
-        amb_int = N_int
-        amb_int_total = np.concatenate((amb_int_total, amb_int))
-    
         if store_handle.iono_free:
             # detect slips on the single-frequency data before integer adjustment: Melbourne-Wubbena for wide-lane
             # slips, geometry-free for equal slips on both frequencies (wide-lane unchanged)
@@ -616,15 +693,70 @@ def define_amb_state_gnss(store_handle, baselines, antenna_handles, baseline_han
                            baseline_handle.cp_dual_raw, baseline_handle.pr_l1_raw, baseline_handle.pr_dual_raw, times_diff, source_array, plot=True)
             slips_GF = slip_detect_GF(baseline_handle.cp_l1_raw, baseline_handle.cp_dual_raw, times_diff, source_array)
             slips = sorted(set(slips_MW) | set(slips_GF))
+            baseline_handle.detector_slips = slips # arcs of the narrow-lane stage
             print(f'{len(slips)} cycle slips detected ({len(slips_MW)} Melbourne-Wubbena, {len(slips_GF)} geometry-free)')
-        else: # need to detect slips with single-frequency
-            slips = slip_detect_single_freq(baseline_handle.f1, baseline_handle.cp_diff, diff_cp_model, \
-                     times_diff, source_array)
 
-        baseline_handle.save_phase_slips(slips)
-        if store_handle.iono_free: 
+            diff_cp_dual_model = antenna2_handle.antenna_data.cp_dual_model.values[ant2_idxs] \
+                    - antenna1_handle.antenna_data.cp_dual_model.values[ant1_idxs]
+            wavelength2 = const.c/baseline_handle.f2 # per observation for --iono_freq preferred
+            cp_l1 = np.array(baseline_handle.cp_l1_raw, dtype=float)
+            cp_dual = np.array(baseline_handle.cp_dual_raw, dtype=float)
+
+            # are the raw phases connected from one epoch of a source to the next? Data merged from per-scan files (VLBI
+            # recordings) can start each scan's phase at an arbitrary integer, and then the geometry-free combination
+            # jumps at most revisits of a source
+            n_revisits = len(source_array) - len(np.unique(source_array))
+            raw_connected = len(slips_GF) <= RAW_GF_SLIP_FRACTION*max(n_revisits, 1)
+            if raw_connected:
+                # integer adjustment toward the model: one integer per frequency per detector arc. Rounding every epoch
+                # to the code-solution model (errors of dm) changes the integer inside an arc whenever the model error
+                # crosses half a cycle, separately on each frequency -- jumps of the wide-lane and ionosphere-free
+                # combinations that the detectors above (raw data) never see
+                N_int = np.zeros(len(cp_l1))
+                N_int2 = np.zeros(len(cp_dual))
+                for arc in source_arcs(source_array, slips):
+                    cycles_l1 = (diff_cp_model[arc]-cp_l1[arc])/wavelength
+                    cycles_dual = (diff_cp_dual_model[arc]-cp_dual[arc])/wavelength_at(wavelength2, arc)
+                    if np.any(np.isfinite(cycles_l1)): N_int[arc] = np.rint(np.nanmedian(cycles_l1))
+                    if np.any(np.isfinite(cycles_dual)): N_int2[arc] = np.rint(np.nanmedian(cycles_dual))
+            else:
+                # not connected: take the integer of every epoch from the model, as the single-frequency solution does,
+                # so the raw discontinuities drop out. The adjusted data then jump only where the (smooth) model error
+                # crosses half a cycle on either frequency, which the single-frequency detector finds on each frequency;
+                # these wraps, not the raw-data detectors, define the arcs
+                print(f'raw phases not connected between epochs of a source ({len(slips_GF)} geometry-free slips in '
+                      f'{n_revisits} revisits): integers from the model at every epoch, arcs at the half-cycle wraps '
+                      'of each frequency')
+                N_int = np.nan_to_num(np.rint((diff_cp_model-cp_l1)/wavelength))
+                N_int2 = np.nan_to_num(np.rint((diff_cp_dual_model-cp_dual)/wavelength2))
+                slips_l1 = slip_detect_single_freq(baseline_handle.f1, cp_l1 + N_int*wavelength, diff_cp_model, \
+                        times_diff, source_array, plot=False)
+                # threshold capped at a third of the shortest second-frequency wavelength (per system for 'preferred')
+                slips_dual = slip_detect_single_freq(np.max(baseline_handle.f2), cp_dual + N_int2*wavelength2, \
+                        diff_cp_dual_model, times_diff, source_array, plot=False)
+                slips = sorted(set(slips_l1) | set(slips_dual))
+                baseline_handle.detector_slips = slips
+                print(f'{len(slips)} arc boundaries from the wraps ({len(slips_l1)} frequency 1, {len(slips_dual)} frequency 2)')
+            baseline_handle.cp_diff = cp_l1 + N_int*wavelength
+            baseline_handle.cp_dual = cp_dual + N_int2*wavelength2
+            baseline_handle.save_phase_slips(slips)
             baseline_handle.combination_measurement('WL')
             baseline_handle.combination_model(diff_cp_model, diff_cp_dual_model, 'WL')
+            # float wide-lane ambiguity from the combination of the adjusted data
+            N_float = construct_float_amb(baseline_handle.cp_combination, \
+                        baseline_handle.cp_model_combination, baseline_handle.comb_wavelength)
+        else:
+            N_int = np.rint((diff_cp_model-baseline_handle.cp_diff)/wavelength)
+            baseline_handle.cp_diff += N_int*wavelength
+            N_float = construct_float_amb(baseline_handle.cp_diff, diff_cp_model, wavelength)
+            # need to detect slips with single-frequency
+            slips = slip_detect_single_freq(baseline_handle.f1, baseline_handle.cp_diff, diff_cp_model, \
+                     times_diff, source_array)
+            baseline_handle.save_phase_slips(slips)
+
+        #amb_int = N_int[baseline_handle.range_data_idxs]
+        amb_int = N_int
+        amb_int_total = np.concatenate((amb_int_total, amb_int))
 
         n_amb_state = 0
         len_N_good_idx = []
@@ -875,6 +1007,21 @@ def hold_trop_slice(store_handle, antenna_handle, n_trop_loop, trop_poly_length)
     antenna_handle.hold_trop_params(slice(n_trop_loop, n_trop_loop + ntrop), trop_times)
     return ntrop
 
+def subset_held_samples(antenna_handle, samples_attr, times_attr, new_times):
+    """ Keep the samples held on an antenna (clock, phase clock or troposphere) at new_times, a subset of the epochs
+        they are held on, so samples and epochs stay the same length when the stochastic epochs are redefined. Samples
+        not held on the current epochs (not yet set, or set from the state elsewhere) are left alone.
+    """
+    samples = getattr(antenna_handle, samples_attr, None)
+    old_times = getattr(antenna_handle, times_attr, None)
+    if samples is None or old_times is None or np.ndim(samples) == 0 or len(samples) != len(old_times):
+        return
+    keep = np.isin(np.asarray(old_times), np.asarray(new_times))
+    if np.sum(keep) != len(new_times):
+        raise ValueError(f'{antenna_handle.antenna_name}: new {times_attr} are not a subset of the epochs {samples_attr} '
+                         'are held on')
+    setattr(antenna_handle, samples_attr, np.asarray(samples)[keep])
+
 def find_clock_trop_params(sol_type, antenna_handles, store_handle, trop_poly_length, clock_poly_length, ref_antenna):
     """ Find the number of clock and troposphere state elements based on the input arguments """
     if (store_handle.stochastic_clock or store_handle.stochastic_trop) and sol_type=='GNSS':
@@ -890,10 +1037,15 @@ def find_clock_trop_params(sol_type, antenna_handles, store_handle, trop_poly_le
                 else:
                     intersect_times = np.union1d(intersect_times, np.intersect1d(antenna_handle.times_gps, antenna_handle_comp.times_gps))
 
+            # samples held on the previous epochs (e.g. the reference clock, which is not a state) follow the epochs
             if store_handle.stochastic_clock:
+                subset_held_samples(antenna_handle, 'clock_samples', 'clock_times', intersect_times)
+                subset_held_samples(antenna_handle, 'phase_clock_samples', 'phase_clock_times', intersect_times)
+                subset_held_samples(antenna_handle, 'ppp_clock_samples', 'clock_times', intersect_times)
                 antenna_handle.clock_times = intersect_times
                 antenna_handle.phase_clock_times = intersect_times
             if store_handle.stochastic_trop:
+                subset_held_samples(antenna_handle, 'trop_samples', 'trop_times', intersect_times)
                 antenna_handle.trop_times = intersect_times
 
     elif (store_handle.stochastic_clock or store_handle.stochastic_trop) and sol_type=='VLBI':
@@ -1005,6 +1157,131 @@ def update_measurements_vlbi(store_handle, src_type, baselines, baseline_handles
             store_handle.model_group_phase_farfield(antenna1_handle, antenna2_handle, baseline_handle, \
                                      baseline_handle.datetime_array, clock_samples, trop_samples1, trop_samples2,\
                                      True, phase_clock_samples)
+
+def refresh_fixed_model(afixed, phfloat_state, bounds, ls_args, jac):
+    """ Re-solve the non-ambiguity state with the ambiguities held at afixed, and leave the carrier-phase model at
+        that solution. detect_unresolved_amb_* difference the data (plus the integers) against the model held on
+        the antenna handles, which is otherwise the last float or partially-fixed evaluation in resolve_float_amb:
+        ambiguities fixed with low confidence (recursive mode) move along weakly-determined directions -- e.g. all
+        ambiguities of one system against its phase DISB, or against the phase clock -- that the float phase clock
+        and phase DISB do not follow, so the stale model shows jumps at most epochs (system changes) that are not
+        cycle slips.
+
+        args:
+            afixed: integer ambiguities in the order of the baseline slip slices
+            phfloat_state: non-ambiguity state of the fix (layout of ls_args, ambiguities removed or trailing)
+            bounds: (low, high) of the state with ambiguities
+            ls_args: calc_residuals arguments of the fix
+            jac: Jacobian function
+        returns:
+            least_squares result of the fixed solution (non-ambiguity layout of ls_args)
+    """
+    store_handle = ls_args[2]
+    amb_state_idxs = ls_args[13]
+    amb_start = amb_state_idxs.start
+    bound_low, bound_high = bounds
+    bound_low_fixed = bound_low[:amb_start]
+    bound_high_fixed = bound_high[:amb_start]
+    # start inside the bounds (the conditional update of the float state can leave a phase clock sample outside)
+    span = np.where(np.isfinite(bound_high_fixed - bound_low_fixed), bound_high_fixed - bound_low_fixed, 1.0)
+    state_fixed = np.clip(np.asarray(phfloat_state[:amb_start], dtype=float), bound_low_fixed + 1e-9*span, \
+            bound_high_fixed - 1e-9*span)
+    ls_args_fixed = tuple(ls_args[:12]) + (False, slice(amb_start, amb_start)) + tuple(ls_args[14:20]) + (afixed,)
+    store_handle.hold_state(state_fixed+1e-9)
+    ls_fixed = least_squares(calc_residuals, state_fixed, jac=jac, method='trf', max_nfev=100, \
+            bounds=(bound_low_fixed, bound_high_fixed), verbose=0, x_scale='jac', xtol=1e-15, args=ls_args_fixed)
+    # the last evaluation inside least_squares may be a trial step: evaluate at the solution to set the model
+    calc_residuals(ls_fixed.x, *ls_args_fixed)
+    return ls_fixed
+
+def recursive_amb_resolution(fixed_solution, state_expanded, bounds, ls_args, sol_type, jac, rxpos_state_length, pos_bound, \
+        clock_bound, end_range_state, n_ao_state, n_grav_state):
+    """ Detect cycle slips left after fixing; assimilate the fixed ambiguities, redefine the ambiguity state at the
+        slips and re-fix until none remain (--recursive_amb). Used for the L1 or wide-lane fix and for the
+        ionosphere-free (narrow-lane) fix.
+
+        args:
+            fixed_solution: (afixed, ls_phfloat, phfloat_state, n_unresolved, z_fixed, iZt, phase_only_res), as returned
+                by resolve_float_amb
+            state_expanded, bounds, ls_args: state, (low, high) bounds and calc_residuals arguments of that fix
+            sol_type, jac: solution type and Jacobian function
+            rxpos_state_length, pos_bound, clock_bound, end_range_state, n_ao_state, n_grav_state: state layout and
+                bounds, for set_bounds_phase_clock
+        returns:
+            fixed_solution, state_expanded, amb_state_idxs, bounds -- updated
+    """
+    afixed, ls_phfloat, phfloat_state, n_unresolved, z_fixed, iZt, phase_only_res = fixed_solution
+    bound_low_expanded, bound_high_expanded = bounds
+    (ref_antenna, baselines, store_handle, antenna_handles, clock_idxs, clock_poly_length, trop_idxs, trop_poly_length, \
+            disb_idxs, baseline_handles, phase_delay, phase_only, use_amb_state, amb_state_idxs, use_phase_weights, \
+            tikhonov_lambda, cont_penalty, phase_clock_idxs, phase_disb_idxs, combination_type) = ls_args
+
+    if sol_type == 'GNSS':
+        # check the integers against the solution they imply, not the float model
+        ls_fixed = refresh_fixed_model(afixed, phfloat_state, bounds, ls_args, jac)
+        phfloat_state = ls_fixed.x
+        slip_detected, slips_full_last, slips_baseline = detect_unresolved_amb_gnss(store_handle, afixed, antenna_handles, baselines,\
+                baseline_handles, combination_type)
+    elif sol_type == 'VLBI':
+        slip_detected, slips_full_last, slips_baseline = detect_unresolved_amb_vlbi(store_handle.iono_free, afixed, baseline_handles, combination_type)
+    slips_full_last2 = slips_full_last
+    if slip_detected:
+        max_iter = 30
+        #max_iter = 4
+        iterations = 0 
+        while slip_detected:
+            print(str(len(slips_full_last)) + ' cycle slips detected, re-running ambiguity fix')
+            assimilate_amb_state(sol_type, afixed, baseline_handles, store_handle.iono_free)
+            for jdx, baseline_handle in enumerate(baseline_handles):
+               if len(slips_baseline)>0:
+                   baseline_handle.save_phase_slips(slips_baseline[jdx])
+               else:
+                   baseline_handle.save_phase_slips([])
+            amb_state = redefine_amb_state(sol_type, store_handle, baseline_handles, baselines, antenna_handles)
+            state_expanded = np.append(state_expanded[:phase_disb_idxs.stop], amb_state)
+            store_handle.hold_state(state_expanded+1e-9)
+            amb_state_idxs = slice(phase_disb_idxs.stop,len(state_expanded))
+            bound_low_expanded = np.zeros_like(state_expanded)
+            bound_low_expanded[:rxpos_state_length] = state_expanded[:rxpos_state_length]-pos_bound
+            bound_low_expanded[rxpos_state_length:] = bound_low_expanded[rxpos_state_length:] - np.inf
+            bound_high_expanded = np.zeros_like(state_expanded)
+            bound_high_expanded[rxpos_state_length:] = bound_high_expanded[rxpos_state_length:] + np.inf
+            bound_high_expanded[:rxpos_state_length] = state_expanded[:rxpos_state_length]+pos_bound
+            bound_low_expanded, bound_high_expanded, state_expanded = set_bounds_phase_clock(bound_low_expanded, bound_high_expanded,\
+                    clock_bound, store_handle, antenna_handles, baseline_handles, baselines, ref_antenna, state_expanded, end_range_state, \
+                    clock_idxs, clock_poly_length, trop_idxs, disb_idxs, phase_clock_idxs, phase_disb_idxs, n_ao_state, n_grav_state, amb_state_idxs)
+            bounds=(bound_low_expanded, bound_high_expanded)
+            ls_args=(ref_antenna, baselines, store_handle, antenna_handles, clock_idxs, \
+                           clock_poly_length, trop_idxs, trop_poly_length, disb_idxs, baseline_handles, phase_delay, phase_only, use_amb_state, \
+                          amb_state_idxs, use_phase_weights, tikhonov_lambda, cont_penalty, phase_clock_idxs, phase_disb_idxs, combination_type)
+
+            # update measurement model after redefining state -- calling residuals fcn will do this
+            res = calc_residuals(state_expanded+1e-9, ref_antenna, baselines, store_handle, antenna_handles, clock_idxs, \
+                           clock_poly_length, trop_idxs, trop_poly_length, disb_idxs, baseline_handles, phase_delay, phase_only, use_amb_state, \
+                          amb_state_idxs, use_phase_weights, tikhonov_lambda, cont_penalty, phase_clock_idxs, phase_disb_idxs, combination_type)
+            afixed, ls_phfloat, phfloat_state, n_unresolved, z_fixed, iZt, phase_only_res = resolve_float_amb(store_handle, state_expanded, bounds, \
+                    n_ao_state, n_grav_state, ls_args, calc_residuals, jac, sol_type, True)
+            iterations += 1
+            if sol_type == 'GNSS':
+                ls_fixed = refresh_fixed_model(afixed, phfloat_state, bounds, ls_args, jac)
+                phfloat_state = ls_fixed.x
+                slip_detected, slips_full, slips_baseline = detect_unresolved_amb_gnss(store_handle, afixed, antenna_handles, baselines,\
+                        baseline_handles, combination_type)
+            elif sol_type == 'VLBI':
+                slip_detected, slips_full, slips_baseline = detect_unresolved_amb_vlbi(store_handle.iono_free, afixed, baseline_handles, combination_type)
+            if iterations > max_iter or slips_full == slips_full_last: 
+                break
+            if slips_full==slips_full_last2:
+                if len(slips_full) < len(slips_full_last):
+                    break
+            slips_full_last2 = slips_full_last
+            slips_full_last = slips_full
+    if slip_detected is False:
+        print('All ambiguities successfully resolved!')
+    else:
+        print('Problem with ambiguity resolution. ' + str(len(slips_full_last)) + ' cycle slips or outliers remain. Review phase residuals')
+    fixed_solution = (afixed, ls_phfloat, phfloat_state, n_unresolved, z_fixed, iZt, phase_only_res)
+    return fixed_solution, state_expanded, amb_state_idxs, (bound_low_expanded, bound_high_expanded)
 
 def lstsq_estimation(sol_type, plot_intermediate_results, ref_antenna, store_handle, antenna_handles, baselines, baseline_handles, \
                      clock_poly_length, trop_poly_length, clock_file=None, estimate_AO=False, \
@@ -1221,12 +1498,13 @@ def lstsq_estimation(sol_type, plot_intermediate_results, ref_antenna, store_han
 
     if sol_type == 'GNSS':
         # take only linearly independent baselines in GNSS data
-        if baseline_strategy == 'Obs-Max':
-            maximize=True
-        else:
-            maximize=False
         baselines_old = baselines
-        baselines = get_spanning_tree(antenna_handles, maximize)
+        baselines = get_spanning_tree(antenna_handles, baseline_strategy)
+        for antenna1_idx, antenna2_idx in baselines:
+            length = np.linalg.norm(np.asarray(antenna_handles[antenna1_idx].ref_pos, dtype=float) \
+                    - np.asarray(antenna_handles[antenna2_idx].ref_pos, dtype=float))
+            print(f'baseline {antenna_handles[antenna1_idx].antenna_name}--{antenna_handles[antenna2_idx].antenna_name}: '
+                  f'{length/1e3:.3f} km ({baseline_strategy})')
         # baseline epochs/sources are needed for the group delay solution (sub-arrays); data are added after it
         baseline_handles = define_baseline_epochs_gnss(store_handle, antenna_handles, baselines)
 
@@ -1636,65 +1914,11 @@ def lstsq_estimation(sol_type, plot_intermediate_results, ref_antenna, store_han
             n_ao_state, n_grav_state, ls_args, calc_residuals, jac, sol_type, recursive_amb, L_curve=L_curve)
 
     if recursive_amb:
-        if sol_type == 'GNSS':
-            slip_detected, slips_full_last, slips_baseline = detect_unresolved_amb_gnss(store_handle, afixed, antenna_handles, baselines,\
-                    baseline_handles, combination_type)
-        elif sol_type == 'VLBI':
-            slip_detected, slips_full_last, slips_baseline = detect_unresolved_amb_vlbi(store_handle.iono_free, afixed, baseline_handles, combination_type)
-        slips_full_last2 = slips_full_last
-        if slip_detected:
-            max_iter = 30
-            #max_iter = 4
-            iterations = 0 
-            while slip_detected:
-                print(str(len(slips_full_last)) + ' cycle slips detected, re-running ambiguity fix')
-                assimilate_amb_state(sol_type, afixed, baseline_handles, store_handle.iono_free)
-                for jdx, baseline_handle in enumerate(baseline_handles):
-                   if len(slips_baseline)>0:
-                       baseline_handle.save_phase_slips(slips_baseline[jdx])
-                   else:
-                       baseline_handle.save_phase_slips([])
-                amb_state = redefine_amb_state(sol_type, store_handle, baseline_handles, baselines, antenna_handles)
-                state_expanded = np.append(state_expanded[:phase_disb_idxs.stop], amb_state)
-                store_handle.hold_state(state_expanded+1e-9)
-                amb_state_idxs = slice(phase_disb_idxs.stop,len(state_expanded))
-                bound_low_expanded = np.zeros_like(state_expanded)
-                bound_low_expanded[:rxpos_state_length] = state_expanded[:rxpos_state_length]-pos_bound
-                bound_low_expanded[rxpos_state_length:] = bound_low_expanded[rxpos_state_length:] - np.inf
-                bound_high_expanded = np.zeros_like(state_expanded)
-                bound_high_expanded[rxpos_state_length:] = bound_high_expanded[rxpos_state_length:] + np.inf
-                bound_high_expanded[:rxpos_state_length] = state_expanded[:rxpos_state_length]+pos_bound
-                bound_low_expanded, bound_high_expanded, state_expanded = set_bounds_phase_clock(bound_low_expanded, bound_high_expanded,\
-                        CLOCK_BOUND, store_handle, antenna_handles, baseline_handles, baselines, ref_antenna, state_expanded, end_range_state, \
-                        clock_idxs, clock_poly_length, trop_idxs, disb_idxs, phase_clock_idxs, phase_disb_idxs, n_ao_state, n_grav_state, amb_state_idxs)
-                bounds=(bound_low_expanded, bound_high_expanded)
-                ls_args=(ref_antenna, baselines, store_handle, antenna_handles, clock_idxs, \
-                               clock_poly_length, trop_idxs, trop_poly_length, disb_idxs, baseline_handles, phase_delay, phase_only, use_amb_state, \
-                              amb_state_idxs, use_phase_weights, tikhonov_lambda, cont_penalty, phase_clock_idxs, phase_disb_idxs, combination_type)
-
-                # update measurement model after redefining state -- calling residuals fcn will do this
-                res = calc_residuals(state_expanded+1e-9, ref_antenna, baselines, store_handle, antenna_handles, clock_idxs, \
-                               clock_poly_length, trop_idxs, trop_poly_length, disb_idxs, baseline_handles, phase_delay, phase_only, use_amb_state, \
-                              amb_state_idxs, use_phase_weights, tikhonov_lambda, cont_penalty, phase_clock_idxs, phase_disb_idxs, combination_type)
-                afixed, ls_phfloat, phfloat_state, n_unresolved, z_fixed, iZt, phase_only_res = resolve_float_amb(store_handle, state_expanded, bounds, \
-                        n_ao_state, n_grav_state, ls_args, calc_residuals, jac, sol_type, recursive_amb)
-                iterations += 1 
-                if sol_type == 'GNSS':
-                    slip_detected, slips_full, slips_baseline = detect_unresolved_amb_gnss(store_handle, afixed, antenna_handles, baselines,\
-                            baseline_handles, combination_type)
-                elif sol_type == 'VLBI':
-                    slip_detected, slips_full, slips_baseline = detect_unresolved_amb_vlbi(store_handle.iono_free, afixed, baseline_handles, combination_type)
-                if iterations > max_iter or slips_full == slips_full_last: 
-                    break
-                if slips_full==slips_full_last2:
-                    if len(slips_full) < len(slips_full_last):
-                        break
-                slips_full_last2 = slips_full_last
-                slips_full_last = slips_full
-        if slip_detected is False:
-            print('All ambiguities successfully resolved!')
-        else:
-            print('Problem with ambiguity resolution. ' + str(len(slips_full_last)) + ' cycle slips or outliers remain. Review phase residuals')
+        fixed_solution, state_expanded, amb_state_idxs, bounds = recursive_amb_resolution(\
+                (afixed, ls_phfloat, phfloat_state, n_unresolved, z_fixed, iZt, phase_only_res), state_expanded, bounds, ls_args, \
+                sol_type, jac, rxpos_state_length, pos_bound, CLOCK_BOUND, end_range_state, n_ao_state, n_grav_state)
+        afixed, ls_phfloat, phfloat_state, n_unresolved, z_fixed, iZt, phase_only_res = fixed_solution
+        bound_low_expanded, bound_high_expanded = bounds
 
     # Show float ambiguity solution
     if store_handle.iono_free: 
@@ -1717,15 +1941,51 @@ def lstsq_estimation(sol_type, plot_intermediate_results, ref_antenna, store_han
         if n_unresolved == 0:
             # wide-lane ambiguities held at their integers, as in the fixed L1 solution: no ambiguity states
             print('Executing widelane fixed ambiguity solution:', flush=True)
-            ls_phfixed_WL = least_squares(calc_residuals, state_WL, jac=jac, method='trf',\
-                max_nfev=100, bounds=(bound_low_expanded[:amb_state_idxs.start], bound_high_expanded[:amb_state_idxs.start]), verbose=2, x_scale = 'jac', xtol=1e-15,\
-                args=(ref_antenna, baselines, store_handle, antenna_handles, clock_idxs, \
+            bounds_WL = (bound_low_expanded[:amb_state_idxs.start], bound_high_expanded[:amb_state_idxs.start])
+            ls_args_WL = (ref_antenna, baselines, store_handle, antenna_handles, clock_idxs, \
                        clock_poly_length, trop_idxs, trop_poly_length, disb_idxs, baseline_handles, phase_delay, phase_only, \
                        False, slice(amb_state_idxs.start, amb_state_idxs.start), use_phase_weights, tikhonov_lambda, cont_penalty, \
-                       phase_clock_idxs, phase_disb_idxs, combination_type, afixed))
-            sol_name = 'amb_fixed_WL'
-            analyze_ls_solution(sol_type, plot_intermediate_results, ref_antenna, clock_idxs, trop_idxs, disb_idxs, ls_phfixed_WL, store_handle, antenna_handles, sol_name, baselines,\
-                            n_ao_state, baseline_handles, phase_delay, phase_only, phase_clock_idxs, phase_disb_idxs, use_phase_weights, afixed)
+                       phase_clock_idxs, phase_disb_idxs, combination_type, afixed)
+            ls_phfixed_WL = least_squares(calc_residuals, state_WL, jac=jac, method='trf',\
+                max_nfev=100, bounds=bounds_WL, verbose=2, x_scale = 'jac', xtol=1e-15, args=ls_args_WL)
+
+            # phase-only wide-lane solution: weight adjustment, outlier removal, weight adjustment, as in the fixed
+            # phase-only solution (the weight adjustment handles phase-only solutions only). The outliers stay removed;
+            # the wide-lane weights, process noise and stochastic state layout are restored afterwards for the IF stage
+            weights_held = hold_weights(antenna_handles, baseline_handles)
+            state_WL_po, bounds_WL_po, ls_args_WL_po = phase_only_state(ls_phfixed_WL.x, bounds_WL, ls_args_WL, n_ao_state, n_grav_state)
+            print('Executing phase-only widelane fixed ambiguity solution:', flush=True)
+            ls_phfixed_WL_po = least_squares(calc_residuals, state_WL_po, jac=jac, method='trf',\
+                max_nfev=100, bounds=bounds_WL_po, verbose=2, x_scale = 'jac', xtol=1e-15, args=ls_args_WL_po)
+            if covariance_kernel_phase is None:
+                print('running iterative weight adjustment')
+                print('\n')
+                ls_phfixed_WL_po = weight_adjust_phase(store_handle, ls_phfixed_WL_po, bounds_WL_po, ls_args_WL_po, jac, sol_type, no_PSD=True)
+            print('iteratively removing outliers')
+            print('\n')
+            ls_phfixed_WL_po, ls_args_WL_po, bounds_WL_po = iterative_remove_outliers(store_handle, ls_phfixed_WL_po, bounds_WL_po, \
+                    ls_args_WL_po, calc_residuals, jac, sol_type, n_ao_state, n_grav_state, True, phase_delay)
+            if covariance_kernel_phase is None:
+                print('re-running iterative weight adjustment')
+                print('\n')
+                ls_phfixed_WL_po = weight_adjust_phase(store_handle, ls_phfixed_WL_po, bounds_WL_po, ls_args_WL_po, jac, sol_type)
+            sol_name = 'amb_fixed_WL_phase_only'
+            analyze_ls_solution(sol_type, plot_intermediate_results, ref_antenna, ls_args_WL_po[4], ls_args_WL_po[6], ls_args_WL_po[8], \
+                            ls_phfixed_WL_po, store_handle, antenna_handles, sol_name, baselines, n_ao_state, baseline_handles, phase_delay, \
+                            True, ls_args_WL_po[17], ls_args_WL_po[18], use_phase_weights, afixed)
+            restore_weights(antenna_handles, baseline_handles, weights_held)
+            if store_handle.stochastic_clock or store_handle.stochastic_trop:
+                # the outliers removed above change the epochs with phase data: re-sample the stochastic states of the
+                # (restored) float layout to them, as after the float solution's outlier removal, and resize the bounds
+                phfloat_state, end_range_state, clock_idxs, trop_idxs, disb_idxs, phase_clock_idxs, phase_disb_idxs, amb_state_idxs = \
+                        adjust_stoch_params(store_handle, antenna_handles, baseline_handles, baselines, ref_antenna, phfloat_state, \
+                        clock_idxs, trop_idxs, disb_idxs, n_ao_state, n_grav_state, phase_delay, phase_clock_idxs, phase_disb_idxs, \
+                        amb_state_idxs)
+                state_WL = phfloat_state[:amb_state_idxs.start]
+                bound_low_expanded = np.full(len(phfloat_state), -np.inf)
+                bound_high_expanded = np.full(len(phfloat_state), np.inf)
+                bound_low_expanded[:rxpos_state_length] = phfloat_state[:rxpos_state_length] - pos_bound
+                bound_high_expanded[:rxpos_state_length] = phfloat_state[:rxpos_state_length] + pos_bound
         else:
             print(f'{n_unresolved} wide-lane ambiguities unresolved -- skipping the widelane fixed solution', flush=True)
 
@@ -1739,6 +1999,7 @@ def lstsq_estimation(sol_type, plot_intermediate_results, ref_antenna, store_han
         for idx, baseline in enumerate(baselines):
             baseline_handle =  baseline_handles[idx]
             afixed_baseline = afixed[n_amb:n_amb+baseline_handle.n_amb_state]
+            widelane_integers = baseline_handle.total_widelane_integers(afixed_baseline) # before the IF combination
             baseline_handle.resolve_widelane_amb(afixed_baseline) 
 
             # now do IF combination
@@ -1759,12 +2020,26 @@ def lstsq_estimation(sol_type, plot_intermediate_results, ref_antenna, store_han
             N_float = construct_float_amb(baseline_handle.cp_combination, \
                         baseline_handle.cp_model_combination, baseline_handle.comb_wavelength)
             n_amb = n_amb + baseline_handle.n_amb_state
-            for idx, slip_slice in enumerate(baseline_handle.slip_slices_arr):
-                N_idxs = N_float[slip_slice]
-                N_good = N_idxs[~np.isnan(N_idxs)]
-                N_interval = np.mean(N_good)
-                state_NL = np.append(state_NL, N_interval)
+            # narrow-lane (N1) ambiguities per satellite arc, split at the detector slips and any slips left by the
+            # wide-lane fix -- the slices of the recursive wide-lane fix span satellites, so they do not carry over
+            source_array = [source_map(baseline_handle, store_handle)[time] for time in baseline_handle.datetime_array]
+            widelane_mw_check(baseline_handle, widelane_integers, source_array)
+            arc_slips = np.union1d(getattr(baseline_handle, 'detector_slips', []), baseline_handle.slips).astype(int)
+            slices_NL = []
+            for arc in source_arcs(source_array, arc_slips):
+                N_good = N_float[arc][~np.isnan(N_float[arc])]
+                if len(N_good) >= max(MIN_SLICE, 1):
+                    slices_NL.append(arc)
+                    state_NL = np.append(state_NL, np.mean(N_good))
+                else:
+                    baseline_handle.phase_data_idxs = np.setdiff1d(baseline_handle.phase_data_idxs, arc)
+            baseline_handle.hold_slip_slices(slices_NL, len(slices_NL))
+            baseline_handle.save_phase_slips(arc_slips)
 
+        amb_state_start = amb_state_idxs.start
+        amb_state_idxs = slice(amb_state_start, len(state_NL))
+        bound_low_expanded = np.concatenate((bound_low_expanded[:amb_state_start], np.full(len(state_NL)-amb_state_start, -np.inf)))
+        bound_high_expanded = np.concatenate((bound_high_expanded[:amb_state_start], np.full(len(state_NL)-amb_state_start, np.inf)))
         combination_type = 'IF'
         store_handle.hold_state(state_NL+1e-9)
         print('Executing ionosphere-free float ambiguity solution:', flush=True)
@@ -1804,9 +2079,17 @@ def lstsq_estimation(sol_type, plot_intermediate_results, ref_antenna, store_han
                        phase_disb_idxs, combination_type)
         afixed, ls_phfloat_NL, phfloat_NL_state, n_unresolved, z_fixed, iZt, phase_only_res = resolve_float_amb(store_handle, state_NL, bounds, n_ao_state, n_grav_state, ls_args, \
                 calc_residuals, jac, sol_type, recursive_amb)
+        if recursive_amb:
+            fixed_solution, state_NL, amb_state_idxs, bounds = recursive_amb_resolution(\
+                    (afixed, ls_phfloat_NL, phfloat_NL_state, n_unresolved, z_fixed, iZt, phase_only_res), state_NL, bounds, ls_args, \
+                    sol_type, jac, rxpos_state_length, pos_bound, CLOCK_BOUND, end_range_state, n_ao_state, n_grav_state)
+            afixed, ls_phfloat_NL, phfloat_NL_state, n_unresolved, z_fixed, iZt, phase_only_res = fixed_solution
+            bound_low_expanded, bound_high_expanded = bounds
         sol_name = 'amb_float_NL'
-        analyze_ls_solution(sol_type, plot_intermediate_results, ref_antenna, clock_idxs, trop_idxs, disb_idxs, ls_phfloat_NL, store_handle, antenna_handles, sol_name, baselines,\
-                        n_ao_state, baseline_handles, phase_delay, phase_only_res, phase_clock_idxs, phase_disb_idxs)
+        if phase_only_res is False:
+            # a phase-only ls_phfloat_NL (iterative LAMBDA) has the phase-only state layout and was analyzed there
+            analyze_ls_solution(sol_type, plot_intermediate_results, ref_antenna, clock_idxs, trop_idxs, disb_idxs, ls_phfloat_NL, store_handle, antenna_handles, sol_name, baselines,\
+                            n_ao_state, baseline_handles, phase_delay, phase_only_res, phase_clock_idxs, phase_disb_idxs)
     
     # start preparing fixed ambiguity solution
     end_range_state = len(grdel_state)
@@ -2282,6 +2565,10 @@ if __name__ == '__main__':
             print('Using iono-free combination with L1/L2')
         elif args.iono_freq == 'L5':
             print('Using iono-free combination with L1/L5')
+        elif args.iono_freq == 'E6':
+            if args.freq_select != 'L1':
+                raise ValueError('--iono_freq E6 pairs with --freq_select L1 (E1), got ' + args.freq_select)
+            print('Using iono-free combination with E1/E6 (Galileo only)')
         elif args.iono_freq == 'preferred':
             if args.freq_select != 'L1':
                 raise ValueError('--iono_freq preferred pairs with --freq_select L1, got ' + args.freq_select)

@@ -241,6 +241,32 @@ def transmitter_antex_code(frequency_hz, system_char):
     """
     return _TX_FREQ_HZ[str(system_char).upper()][float(frequency_hz)]
 
+# receiver calibrations missing a frequency: nearest calibrated carrier (Galileo E6 1278.75 MHz -> L2 1227.60 MHz)
+RECEIVER_ANTEX_FALLBACK = {'E06': 'G02', 'C06': 'G02', 'E07': 'G05', 'E08': 'G05'}
+_receiver_antex_cache = {}
+def receiver_antex_code(antenna_pco, freq_code):
+    """ ANTEX frequency code to use for a receiver antenna calibration: freq_code if the calibration has it,
+        otherwise its RECEIVER_ANTEX_FALLBACK (with a warning, once per antenna and code).
+
+        args:
+            antenna_pco: gnsstk AntexData of the receiver antenna
+            freq_code: ANTEX frequency code, e.g. 'E06'
+        returns:
+            frequency code present in the calibration
+    """
+    key = (id(antenna_pco), freq_code)
+    if key not in _receiver_antex_cache:
+        code = freq_code
+        try:
+            antenna_pco.getPhaseCenterOffset(freq_code)
+        except Exception:
+            if freq_code not in RECEIVER_ANTEX_FALLBACK:
+                raise
+            code = RECEIVER_ANTEX_FALLBACK[freq_code]
+            print(f'warning: no {freq_code} receiver antenna calibration -- using {code} PCO/PCV')
+        _receiver_antex_cache[key] = (antenna_pco, code) # hold the object so its id is not reused
+    return _receiver_antex_cache[key][1]
+
 _ANT_FREQS = np.array(sorted(FREQ_TO_RINEX_ANT))
 _ANT_CODES = [FREQ_TO_RINEX_ANT[freq] for freq in _ANT_FREQS]
 def nearest_rinex_ant_code(frequency_hz):
@@ -943,24 +969,47 @@ def read_thermal_deformation_coeffs(ant_info_file, antenna_handles):
                         antenna_handle.save_thermal_coeffs(thermal_coeffs)
     return 
 
-def get_spanning_tree(antenna_handles, maximize):
+# separation (m) below which two antennas are a local tie (same site) for the Ties-* baseline strategies
+LOCAL_TIE_MAX_LENGTH = 10e3
+BASELINE_STRATEGIES = ('Obs-Max', 'Shortest', 'Ties-GNSS', 'Ties-VLBI')
+
+def get_spanning_tree(antenna_handles, strategy='Obs-Max'):
     """
     Spanning-tree baseline set over antenna_handles.
 
-    maximize=True  -> OBS-MAX : maximum spanning tree weighted by the number of
-                      common (epoch, satellite) observations the two receivers
-                      share (i.e. the SD-able observations, pr_data finite).
-    maximize=False -> SHORTEST: minimum spanning tree weighted by geometric
-                      ECEF baseline length (from the 'position' attribute).
+    strategy:
+        'Obs-Max'   : maximum spanning tree weighted by the number of common (epoch, satellite) observations the
+                      two receivers share (i.e. the SD-able observations, pr_data finite).
+        'Shortest'  : minimum spanning tree weighted by geometric baseline length.
+        'Ties-GNSS' : local ties first (antennas closer than LOCAL_TIE_MAX_LENGTH, shortest first), then the
+                      sites joined by GNSS-GNSS baselines (shortest first), other pairs only if no GNSS-GNSS
+                      baseline joins two sites (then VLBI-VLBI, then mixed). With phase not connected between scans
+                      at the VLBI antennas, this carries the long baselines on the continuous phase of the GNSS
+                      receivers.
+        'Ties-VLBI' : local ties first, then the sites joined by VLBI-VLBI baselines (maser clocks at both ends),
+                      then GNSS-GNSS, then mixed.
+        A bool is accepted for backward compatibility (True: 'Obs-Max', False: 'Shortest').
 
     Returns `baselines`: list of (i, j) index pairs (i < j) into
     antenna_handles, length len(antenna_handles) - 1.
     """
+    if isinstance(strategy, (bool, np.bool_)):
+        strategy = 'Obs-Max' if strategy else 'Shortest'
+    if strategy not in BASELINE_STRATEGIES:
+        raise ValueError(f'Unknown baseline strategy {strategy}; options: {", ".join(BASELINE_STRATEGIES)}')
+    maximize = strategy == 'Obs-Max'
     n = len(antenna_handles)
     if n < 2:
         return []
 
     datasets = [h.antenna_data for h in antenna_handles]
+
+    def antenna_position(idx):
+        """ a priori position (--rxpos), else the RINEX header position """
+        ref_pos = getattr(antenna_handles[idx], 'ref_pos', None)
+        if ref_pos is not None:
+            return np.asarray(ref_pos, dtype=float)
+        return np.asarray(datasets[idx].attrs['position'], dtype=float)
 
     if maximize:
         # OBS-MAX: set of (time_ns, sv) keys with valid pr_data, per antenna
@@ -976,13 +1025,27 @@ def get_spanning_tree(antenna_handles, maximize):
         def weight(edge):
             i, j = edge
             return len(keys[i] & keys[j])              # common-obs count
-    else:
-        # SHORTEST: ECEF position per antenna
-        pos = [np.asarray(ds.attrs['position'], dtype=float) for ds in datasets]
+    elif strategy == 'Shortest':
+        pos = [antenna_position(idx) for idx in range(n)]
 
         def weight(edge):
             i, j = edge
             return float(np.linalg.norm(pos[i] - pos[j]))  # baseline length
+    else:
+        # Ties-*: rank (class, length) -- class 0 local ties; long baselines 1 preferred type, 2 the other
+        # same-type pair, 3 mixed VLBI-GNSS (phase not connected between scans at the VLBI end, and no maser at the other)
+        pos = [antenna_position(idx) for idx in range(n)]
+        is_vlbi = [bool(getattr(handle, 'is_VLBI', False)) for handle in antenna_handles]
+        long_vlbi = strategy == 'Ties-VLBI'
+
+        def weight(edge):
+            i, j = edge
+            length = float(np.linalg.norm(pos[i] - pos[j]))
+            if length < LOCAL_TIE_MAX_LENGTH:
+                return (0, length)
+            if is_vlbi[i] != is_vlbi[j]:
+                return (3, length)
+            return (1 if is_vlbi[i] == long_vlbi else 2, length)
 
     # Complete graph, sorted by the chosen weight. Python's sort is stable, so
     # equal-weight edges keep itertools' lexicographic order -> deterministic.
@@ -2767,6 +2830,14 @@ def gen_key(rinex_files, full_data, start_date, end_date, eph_sats, iono_free, i
                     obs_dual = obs_time['P2'].dropna(dim='sv',how='all')
                 elif iono_freq == 'L5':
                     obs_dual = obs_time['C5'].dropna(dim='sv',how='all')
+                elif iono_freq == 'E6':
+                    obs_dual = None
+                    for var in CODE_PREF_ORDER['E6']:
+                        if var in obs_time:
+                            da = obs_time[var].dropna(dim='sv',how='all')
+                            obs_dual = da if obs_dual is None else obs_dual.combine_first(da)
+                    if obs_dual is None:
+                        obs_dual = xr.DataArray([], coords={'sv': []}, dims='sv')
                 elif iono_freq == 'preferred':
                     # each system on its own second band (PREFERRED_IONO_BAND)
                     svs_dual = [sv for band, var in (('L2', 'P2'), ('L5', 'C5')) if var in obs_time \
@@ -4650,18 +4721,28 @@ class BaselineInfo(object):
            self.comb_wavelength = const.c/(self.f1+self.f2)
            self.combination_type = 'IF'
     
+    def total_widelane_integers(self, fixed_amb):
+        """Wide-lane integer of every observation: the integers already assimilated into cp_combination by the
+           recursive fix (assimilate_amb_state) plus the final fixed ambiguity of the observation's slice
+        """
+        cp_combination_raw = (self.f1*self.cp_diff - self.f2*self.cp_dual)/(self.f1 - self.f2)
+        widelane_integers = np.rint((self.cp_combination - cp_combination_raw)/self.comb_wavelength)
+        for idx, slip_slice in enumerate(self.slip_slices_arr):
+            widelane_integers[slip_slice] += fixed_amb[idx]
+        return widelane_integers
+
     def resolve_widelane_amb(self, fixed_amb):
-        """Hold a final widelane ambiguity correction to be applied to the IF combination 
+        """Hold a final widelane ambiguity correction to be applied to the IF combination
         """
         if self.combination_type == 'WL':
-            self.narrowlane_correction = np.zeros_like(self.cp_combination)
             # ambiguity in IF sol. is lambda_N*(N_1 + lambda_W/lambda_2*N_W)
             # where N_1 : L1 integer amb., lambda_W : wide lane wavelength,
             # lambda_2: L2 wavelength, N_W: wide lane integer amb.
             # the data carry -corr_wavelength*N_W, so it is removed by adding corr_wavelength * N_W
-            corr_wavelength = const.c*self.f2/(self.f1**2-self.f2**2)  
-            for idx, slip_slice in enumerate(self.slip_slices_arr):
-                self.narrowlane_correction[slip_slice] = wavelength_at(corr_wavelength, slip_slice)*fixed_amb[idx] # data + lambda*a = model convention
+            # (data + lambda*a = model convention). N_W is per observation: the recursive fix leaves part of it in
+            # cp_combination, and its final slices span satellites, so the per-slice fix alone is not N_W.
+            corr_wavelength = const.c*self.f2/(self.f1**2-self.f2**2)
+            self.narrowlane_correction = corr_wavelength*self.total_widelane_integers(fixed_amb)
         else:
             raise ValueError('Combination type must be WL for resolve_widelane_amb')
 
@@ -4925,6 +5006,10 @@ class AntennaInfo(object):
             self.f2 = None if iono_freq == 'preferred' else BAND_FREQ[iono_freq]
             pr_dual, snr_dual, band_dual = self.select_dual_obs_with_snr(CODE_PREF_ORDER, iono_freq)
             pr, pr_dual = xr.align(pr, pr_dual, join='inner')
+            if pr.size == 0:
+                bands = 'by system ' + str(PREFERRED_IONO_BAND) if iono_freq == 'preferred' else iono_freq
+                raise ValueError(f'{self.antenna_name}: no epochs with both {freq_select} and second-frequency '
+                                 f'({bands}) observations for the ionosphere-free combination')
             snr, snr_dual, band_dual = snr.sel(time=pr.time), snr_dual.sel(time=pr.time), band_dual.sel(time=pr.time)
             f2 = np.array([BAND_FREQ[band] for band in band_dual.values]) # by epoch (system) for 'preferred'
             gamma = self.f1**2 / f2**2
@@ -4973,6 +5058,10 @@ class AntennaInfo(object):
             self.f2 = None if iono_freq == 'preferred' else BAND_FREQ[iono_freq]
             cp_dual, snr_dual, band_dual = self.select_dual_obs_with_snr(PHASE_PREF_ORDER, iono_freq)
             cp, cp_dual = xr.align(cp, cp_dual, join='inner')
+            if cp.size == 0:
+                bands = 'by system ' + str(PREFERRED_IONO_BAND) if iono_freq == 'preferred' else iono_freq
+                raise ValueError(f'{self.antenna_name}: no epochs with both {freq_select} and second-frequency '
+                                 f'({bands}) observations for the ionosphere-free combination')
             snr, snr_dual, band_dual = snr.sel(time=cp.time), snr_dual.sel(time=cp.time), band_dual.sel(time=cp.time)
             f2 = np.array([BAND_FREQ[band] for band in band_dual.values]) # by epoch (system) for 'preferred'
             wavelength_2 = const.c/f2
@@ -5573,7 +5662,7 @@ class AntennaInfo(object):
     def get_pco(self, freq_code):
         """ Receiver antenna PCO (NEU, m) for an ANTEX frequency code, cached per code """
         if freq_code not in self.pco_cache:
-            offset = self.antenna_PCO.getPhaseCenterOffset(freq_code)
+            offset = self.antenna_PCO.getPhaseCenterOffset(receiver_antex_code(self.antenna_PCO, freq_code))
             self.pco_cache[freq_code] = np.array([offset[0], offset[1], offset[2]])/1e3 # convert to m
         return self.pco_cache[freq_code]
 
@@ -6353,7 +6442,7 @@ class GNSSTKStores(object):
 
                 rxpos_L1 = rxpos + ROT@offset_f1 - PCV_L1*1e-3*rx2sat
                 if self.iono_free:
-                    PCV_dual = antennaPCOData.getPhaseCenterVariation(freq2_ant, azimuth, elevation)
+                    PCV_dual = antennaPCOData.getPhaseCenterVariation(receiver_antex_code(antennaPCOData, freq2_ant), azimuth, elevation)
                     rxpos_dual = rxpos + ROT@antenna_handle.get_pco(freq2_ant) - PCV_dual*1e-3*rx2sat
 
             try:
@@ -6776,7 +6865,7 @@ class GNSSTKStores(object):
                 PCV_L1 = antennaPCOData1.getPhaseCenterVariation(freq1_ant, azimuth, elevation)
                 rxpos1_L1 = rxpos1 + ROT@offset1_L1 - PCV_L1*1e-3*rx2sat1
                 if self.iono_free:
-                    PCV_dual = antennaPCOData1.getPhaseCenterVariation(freq2_ant, azimuth, elevation)
+                    PCV_dual = antennaPCOData1.getPhaseCenterVariation(receiver_antex_code(antennaPCOData1, freq2_ant), azimuth, elevation)
                     rxpos1_dual = rxpos1 + ROT@antenna1_handle.get_pco(freq2_ant) - PCV_dual*1e-3*rx2sat1
 
             if antenna2_handle.is_VLBI is True: 
@@ -6814,7 +6903,7 @@ class GNSSTKStores(object):
                 PCV_L1 = antennaPCOData2.getPhaseCenterVariation(freq1_ant, azimuth, elevation)
                 rxpos2_L1 = rxpos2 + ROT@offset2_L1 - PCV_L1*1e-3*rx2sat2
                 if self.iono_free:
-                    PCV_dual = antennaPCOData2.getPhaseCenterVariation(freq2_ant, azimuth, elevation)
+                    PCV_dual = antennaPCOData2.getPhaseCenterVariation(receiver_antex_code(antennaPCOData2, freq2_ant), azimuth, elevation)
                     rxpos2_dual = rxpos2 + ROT@antenna2_handle.get_pco(freq2_ant) - PCV_dual*1e-3*rx2sat2
             if sat_id[0] != 'L': # LEO
                 sat_pos_L1 = self.sat_adj_PC(freq1, sat_antenna, times_gps[idx], eph_time, sat_xvt.x, 0, noPCV=True)
@@ -7118,7 +7207,7 @@ class GNSSTKStores(object):
             offset1_L1 = antennaPCOData1.getPhaseCenterOffset(freq1_ant)
             offset1_L1 = np.array([offset1_L1[0],offset1_L1[1],offset1_L1[2]])/1e3 # convert to m
             if self.iono_free is True:
-                offset1_dual = antennaPCOData.getPhaseCenterOffset(freq2_ant)
+                offset1_dual = antennaPCOData.getPhaseCenterOffset(receiver_antex_code(antennaPCOData, freq2_ant))
                 offset1_dual = np.array([offset_dual[0],offset_dual[1],offset_dual[2]])/1e3 # convert to m
 
         if antenna2_handle.is_VLBI is False:
@@ -7127,7 +7216,7 @@ class GNSSTKStores(object):
             offset2_L1 = antennaPCOData2.getPhaseCenterOffset(freq1_ant)
             offset2_L1 = np.array([offset2_L1[0],offset2_L1[1],offset2_L1[2]])/1e3 # convert to m
             if self.iono_free is True:
-                offset2_dual = antennaPCOData.getPhaseCenterOffset(freq2_ant)
+                offset2_dual = antennaPCOData.getPhaseCenterOffset(receiver_antex_code(antennaPCOData, freq2_ant))
                 offset2_dual = np.array([offset2_dual[0],offset2_dual[1],offset2_dual[2]])/1e3 # convert to m
 
         if phase is True: # need to account for carrier phase windup
@@ -7261,7 +7350,7 @@ class GNSSTKStores(object):
                 PCV_L1 = antennaPCOData1.getPhaseCenterVariation(freq1_ant, azimuth1, elevation1)
                 rxpos1_f1 = rxpos1 + ROT@offset1_L1 - PCV_L1*1e-3*s_ecef1
                 if self.iono_free:
-                    PCV_dual = antennaPCOData1.getPhaseCenterVariation(freq2_ant, azimuth2, elevation2)
+                    PCV_dual = antennaPCOData1.getPhaseCenterVariation(receiver_antex_code(antennaPCOData1, freq2_ant), azimuth2, elevation2)
                     rxpos1_dual = rxpos1 + ROT@(offset1_dual) - PCV_dual*1e-3*s_ecef1
 
             if antenna2_handle.is_VLBI is True: 
@@ -7301,7 +7390,7 @@ class GNSSTKStores(object):
                 PCV_L1 = antennaPCOData2.getPhaseCenterVariation(freq1_ant, azimuth2, elevation2)
                 rxpos2_f1 = rxpos2 + ROT@offset2_L1 - PCV_L1*1e-3*s_ecef2
                 if self.iono_free:
-                    PCV_dual = antennaPCOData2.getPhaseCenterVariation(freq2_ant, azimuth2, elevation2)
+                    PCV_dual = antennaPCOData2.getPhaseCenterVariation(receiver_antex_code(antennaPCOData2, freq2_ant), azimuth2, elevation2)
                     rxpos2_dual = rxpos2 + ROT@(offset2_dual) - PCV_dual*1e-3*s_ecef2
            
 
@@ -7529,7 +7618,7 @@ class GNSSTKStores(object):
             offset_f1 = antennaPCOData.getPhaseCenterOffset(freq1_ant)
             offset_f1 = np.array([offset_f1[0],offset_f1[1],offset_f1[2]])/1e3 # convert to m
             if self.iono_free is True:
-                offset_dual = antennaPCOData.getPhaseCenterOffset(freq2_ant)
+                offset_dual = antennaPCOData.getPhaseCenterOffset(receiver_antex_code(antennaPCOData, freq2_ant))
                 offset_dual = np.array([offset_dual[0],offset_dual[1],offset_dual[2]])/1e3 # convert to m
 
         if antenna_handle.offset_NEU is not None:
@@ -7627,7 +7716,7 @@ class GNSSTKStores(object):
                     PCV_L1 = 0
                 rxpos_L1 = rxpos + ROT@(offset_f1) - PCV_L1*1e-3*rx2sat
                 if self.iono_free:
-                    PCV_dual = antennaPCOData.getPhaseCenterVariation(freq2_ant, azimuth, elevation)
+                    PCV_dual = antennaPCOData.getPhaseCenterVariation(receiver_antex_code(antennaPCOData, freq2_ant), azimuth, elevation)
                     rxpos_dual = rxpos + ROT@(offset_dual) - PCV_dual*1e-3*rx2sat
            
             sat_pos_L1 = self.sat_adj_PC(freq1, sat_antenna, times_adj[idx], eph_time, sat_xvt.x, rx2sat)
@@ -8656,7 +8745,7 @@ class GNSSTKStores(object):
                 except: PCV_L1 = np.zeros(3)
                 rxpos_L1 = rxpos + ROT@(offset_f1) - PCV_L1*1e-3*rx2sat
                 if self.iono_free:
-                    PCV_dual = antennaPCOData.getPhaseCenterVariation(freq2_ant, azimuth, elevation)
+                    PCV_dual = antennaPCOData.getPhaseCenterVariation(receiver_antex_code(antennaPCOData, freq2_ant), azimuth, elevation)
                     rxpos_dual = rxpos + ROT@antenna_handle.get_pco(freq2_ant) - PCV_dual*1e-3*rx2sat
 
             sat_pos_L1 = self.sat_adj_PC(freq1, sat_antenna, times_gps[idx], eph_time, sat_xvt.x, rx2sat)
@@ -8870,7 +8959,7 @@ class GNSSTKStores(object):
                 PCV_L1 = antennaPCOData1.getPhaseCenterVariation(freq1_ant, azimuth1, elevation1)
                 rxpos1_L1 = rxpos1 + ROT@(offset1_L1) - PCV_L1*1e-3*rx2sat1
                 if self.iono_free:
-                    PCV_dual = antennaPCOData1.getPhaseCenterVariation(freq2_ant, azimuth1, elevation1)
+                    PCV_dual = antennaPCOData1.getPhaseCenterVariation(receiver_antex_code(antennaPCOData1, freq2_ant), azimuth1, elevation1)
                     rxpos1_dual = rxpos1 + ROT@antenna1_handle.get_pco(freq2_ant) - PCV_dual*1e-3*rx2sat1
 
             elevation2 = rxpos2_gnsstk.elevationGeodetic(sat_pos_gnsstk)
@@ -8895,7 +8984,7 @@ class GNSSTKStores(object):
                 PCV_L1 = antennaPCOData2.getPhaseCenterVariation(freq1_ant, azimuth2, elevation2)
                 rxpos2_L1 = rxpos2 + ROT@(offset2_L1) - PCV_L1*1e-3*rx2sat2
                 if self.iono_free:
-                    PCV_dual = antennaPCOData2.getPhaseCenterVariation(freq2_ant, azimuth2, elevation2)
+                    PCV_dual = antennaPCOData2.getPhaseCenterVariation(receiver_antex_code(antennaPCOData2, freq2_ant), azimuth2, elevation2)
                     rxpos2_dual = rxpos2 + ROT@antenna2_handle.get_pco(freq2_ant) - PCV_dual*1e-3*rx2sat2
             
             if sat_id[0] != 'L':
@@ -9094,7 +9183,7 @@ class GNSSTKStores(object):
             offset1_L1 = antennaPCOData1.getPhaseCenterOffset(freq1_ant)
             offset1_L1 = np.array([offset1_L1[0],offset1_L1[1],offset1_L1[2]])/1e3 # convert to m
             if self.iono_free is True:
-                offset1_dual = antennaPCOData.getPhaseCenterOffset(freq2_ant)
+                offset1_dual = antennaPCOData.getPhaseCenterOffset(receiver_antex_code(antennaPCOData, freq2_ant))
                 offset1_dual = np.array([offset_dual[0],offset_dual[1],offset_dual[2]])/1e3 # convert to m
 
         if antenna2_handle.is_VLBI is False:
@@ -9103,7 +9192,7 @@ class GNSSTKStores(object):
             offset2_L1 = antennaPCOData2.getPhaseCenterOffset(freq1_ant)
             offset2_L1 = np.array([offset2_L1[0],offset2_L1[1],offset2_L1[2]])/1e3 # convert to m
             if self.iono_free is True:
-                offset2_dual = antennaPCOData.getPhaseCenterOffset(freq2_ant)
+                offset2_dual = antennaPCOData.getPhaseCenterOffset(receiver_antex_code(antennaPCOData, freq2_ant))
                 offset2_dual = np.array([offset2_dual[0],offset2_dual[1],offset2_dual[2]])/1e3 # convert to m
 
         if phase is True: # need to account for carrier phase windup
@@ -9211,7 +9300,7 @@ class GNSSTKStores(object):
                 PCV_L1 = antennaPCOData1.getPhaseCenterVariation(freq1_ant, azimuth1, elevation1)
                 rxpos1_L1 = rxpos1 + ROT@offset1_L1 - PCV_L1*1e-3*s_ecef1
                 if self.iono_free:
-                    PCV_dual = antennaPCOData1.getPhaseCenterVariation(freq2_ant, azimuth1, elevation1)
+                    PCV_dual = antennaPCOData1.getPhaseCenterVariation(receiver_antex_code(antennaPCOData1, freq2_ant), azimuth1, elevation1)
                     rxpos1_dual = rxpos1 + ROT@(offset1_dual) - PCV_dual*1e-3*s_ecef1
 
             if antenna2_handle.is_VLBI is True: 
@@ -9235,7 +9324,7 @@ class GNSSTKStores(object):
                 PCV_L1 = antennaPCOData2.getPhaseCenterVariation(freq1_ant, azimuth2, elevation2)
                 rxpos2_L1 = rxpos2 + ROT@offset2_L1 - PCV_L1*1e-3*s_ecef2
                 if self.iono_free:
-                    PCV_dual = antennaPCOData2.getPhaseCenterVariation(freq2_ant, azimuth2, elevation2)
+                    PCV_dual = antennaPCOData2.getPhaseCenterVariation(receiver_antex_code(antennaPCOData2, freq2_ant), azimuth2, elevation2)
                     rxpos2_dual = rxpos2 + ROT@(offset2_dual) - PCV_dual*1e-3*s_ecef2
 
             delay = self.get_delay_farfield(s_vec, eph_time, rxpos1_L1, rxpos2_L1)
