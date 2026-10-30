@@ -42,17 +42,14 @@ import numpy as np
 import re
 from collections import namedtuple, defaultdict
 import struct
-
+from pathlib import Path
 import os
 use_custom_version = os.getenv('USE_CUSTOM_GEORINEX', 'false').lower() == 'true'
 if use_custom_version:
     import sys
-    sys.path.insert(0, '/sgl/ceph/work/jskeens')
-    try: 
-        from georinex_custom import load
-    except: 
-        sys.path.insert(0, '/home/jskeens/oscar_dir/scratch/jskeens')
-        from georinex_custom import load
+    module_path = str(Path("~/georinex/src").expanduser())
+    sys.path.insert(0, module_path)
+    from georinex import load
 else:
     from georinex import load
 
@@ -86,7 +83,7 @@ from typing import List, Dict, Tuple, Optional
 from gnsstk import std_vector_string, Position, AntennaStore, AntexData, OceanLoadTides, PoleTides, \
                   AtmLoadTides, SolarSystem, GlobalTropModel, SaasTropModel, NeillTropModel, RinexSatID
 
-from single_diff_tools import import_key_gnss, import_data_vlbi, import_data_vlbi_farfield, import_data_vlbi_ngs, import_data_vlbi_vgosdb, \
+from single_diff_tools import import_key_gnss, import_data_vlbi, import_data_vlbi_farfield, import_data_vlbi_vgosdb, \
                   import_data_vlbi_vda, write_SINEX, datetime64_to_mjd, map_datasets, import_data_nc_sim,\
                   find_common_epochs, BaselineInfo, AntennaInfo, GNSSTKStores, ECEF2ECI, slip_detect_MW, slip_detect_single_freq,\
                   slip_detect_phase_delay, sample_poly_at_interval, trim_amb_Zdom, trim_amb_state, gen_phase_clock_state, adjust_stoch_params, thin_data,\
@@ -995,8 +992,8 @@ def plot_sip_diagnostic(sip_files, baseline_objs, out_prefix="sip_diag"):
             ax.plot(s.time.values, s.values, ".", ms=1.5, label=str(int(sv)))
         ax.set_title(f"{sta} : raw absolute STEC per satellite")
         ax.set_ylabel("STEC [TECU]"); ax.grid(alpha=0.3)
-        ax.legend(title="PRN", fontsize=6, ncol=2, loc="center left",
-                  bbox_to_anchor=(1.0, 0.5))
+        #ax.legend(title="PRN", fontsize=6, ncol=2, loc="center left",
+        #          bbox_to_anchor=(1.0, 0.5))
         ax.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d %H:%M"))
     axes[-1][0].set_xlabel("time (UTC)")
     fig.autofmt_xdate(); fig.tight_layout()
@@ -1015,8 +1012,8 @@ def plot_sip_diagnostic(sip_files, baseline_objs, out_prefix="sip_diag"):
                 ax.plot(s.time.values, s.values, ".", ms=1.5, label=str(int(sv)))
             ax.set_title(f"{bo.baseline_name} : single-difference STEC per satellite")
             ax.set_ylabel("dSTEC [TECU]"); ax.grid(alpha=0.3)
-            ax.legend(title="PRN", fontsize=6, ncol=2, loc="center left",
-                      bbox_to_anchor=(1.0, 0.5))
+            #ax.legend(title="PRN", fontsize=6, ncol=2, loc="center left",
+            #          bbox_to_anchor=(1.0, 0.5))
             ax.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d %H:%M"))
         axes[-1][0].set_xlabel("time (UTC)")
         fig.autofmt_xdate(); fig.tight_layout()
@@ -1158,9 +1155,9 @@ def correct_iono(antenna_handles, nav_store, baseline_objs, ionex_store, iono_fi
             fig_ts.autofmt_xdate(rotation=30)
 
             # legend outside if there are many satellites
-            if n_sv:
-                ax_ts.legend(ncol=2, fontsize=7, loc='center left',
-                             bbox_to_anchor=(1.005, 0.5), title='PRN', framealpha=0.9)
+            #if n_sv:
+            #    ax_ts.legend(ncol=2, fontsize=7, loc='center left',
+            #                 bbox_to_anchor=(1.005, 0.5), title='PRN', framealpha=0.9)
 
             ts_png = f"{bl}_STEC_timeseries.png"
             fig_ts.savefig(ts_png, bbox_inches='tight')
@@ -1213,9 +1210,9 @@ def correct_iono(antenna_handles, nav_store, baseline_objs, ionex_store, iono_fi
             ax_d.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d %H:%M'))
             ax_d.xaxis.set_minor_locator(mdates.HourLocator(interval=1))
             fig_d.autofmt_xdate(rotation=30)
-            if n_sv:
-                ax_d.legend(ncol=2, fontsize=7, loc='center left',
-                            bbox_to_anchor=(1.005, 0.5), title='PRN', framealpha=0.9)
+            #if n_sv:
+            #    ax_d.legend(ncol=2, fontsize=7, loc='center left',
+            #                bbox_to_anchor=(1.005, 0.5), title='PRN', framealpha=0.9)
             d_png = f"{bl}_dSTEC_minus_IONEX.png"
             fig_d.savefig(d_png, bbox_inches='tight')
             plt.close(fig_d)
@@ -1267,9 +1264,9 @@ def correct_iono(antenna_handles, nav_store, baseline_objs, ionex_store, iono_fi
                 a.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d %H:%M'))
                 a.xaxis.set_minor_locator(mdates.HourLocator(interval=1))
             fig_vg.autofmt_xdate(rotation=30)
-            if n_sv:
-                ax_o.legend(ncol=2, fontsize=7, loc='center left',
-                            bbox_to_anchor=(1.005, 0.5), title='PRN', framealpha=0.9)
+            #if n_sv:
+            #    ax_o.legend(ncol=2, fontsize=7, loc='center left',
+            #                bbox_to_anchor=(1.005, 0.5), title='PRN', framealpha=0.9)
             vg_png = f"{bl}_dSTEC_vs_GIM.png"
             fig_vg.savefig(vg_png, bbox_inches='tight')
             plt.close(fig_vg)
@@ -1412,7 +1409,7 @@ def sip_sign_test(sip_files, antenna_names, rxpos_by_name,
             ax.set_title(f"{sta} PRN{sv}: per-station absolute STEC reconstruction")
             ax.set_ylabel("STEC [TECU]")
             ax.grid(alpha=0.3)
-            ax.legend(fontsize=8, loc='best')
+            #ax.legend(fontsize=8, loc='best')
             ax.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d %H:%M'))
         axes[-1][0].set_xlabel("time (UTC)")
         fig.autofmt_xdate()

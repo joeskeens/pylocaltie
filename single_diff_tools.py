@@ -227,6 +227,33 @@ _TX_FREQ_HZ = {
     'S': {1575.42e6: 'S01', 1176.45e6: 'S05'},
 }
 
+def owns_trop_states(antenna_handle):
+    """ True if the antenna estimates ZWD with its own states; False if it does not estimate ZWD, or uses the
+        states of another antenna at the same site (trop_owner, set by assign_trop_estimation) """
+    return bool(getattr(antenna_handle, 'estimate_trop', False)) and \
+        getattr(antenna_handle, 'trop_owner', antenna_handle.antenna_name) == antenna_handle.antenna_name
+
+def trop_site_members(antenna_handles, antenna_handle):
+    """ Indices of the antennas that use the ZWD states of antenna_handle's owner (its site), owner included """
+    owner = getattr(antenna_handle, 'trop_owner', antenna_handle.antenna_name)
+    return [idx for idx, handle in enumerate(antenna_handles) if getattr(handle, 'trop_owner', handle.antenna_name) == owner]
+
+def share_site_troposphere(antenna_handles):
+    """ Point every site member's ZWD slice, epochs and samples at its owner's: the members carry no states of their
+        own, and their observations take the owner's ZWD at their epochs (the owner's epochs are their union) """
+    handles_by_name = {handle.antenna_name: handle for handle in antenna_handles}
+    for handle in antenna_handles:
+        owner_name = getattr(handle, 'trop_owner', handle.antenna_name)
+        if owner_name == handle.antenna_name or not getattr(handle, 'estimate_trop', False):
+            continue
+        owner = handles_by_name[owner_name]
+        if hasattr(owner, 'trop_idxs'):
+            handle.trop_idxs = owner.trop_idxs
+        if hasattr(owner, 'trop_times'):
+            handle.trop_times = owner.trop_times
+        if hasattr(owner, 'trop_samples'):
+            handle.trop_samples = owner.trop_samples
+
 def transmitter_antex_code(frequency_hz, system_char):
     """ ANTEX frequency code for a transmitting satellite antenna.
 
@@ -241,12 +268,16 @@ def transmitter_antex_code(frequency_hz, system_char):
     """
     return _TX_FREQ_HZ[str(system_char).upper()][float(frequency_hz)]
 
-# receiver calibrations missing a frequency: nearest calibrated carrier (Galileo E6 1278.75 MHz -> L2 1227.60 MHz)
-RECEIVER_ANTEX_FALLBACK = {'E06': 'G02', 'C06': 'G02', 'E07': 'G05', 'E08': 'G05'}
+# receiver calibrations missing a frequency: the GPS calibration of the same carrier, else the nearest calibrated
+# carrier (Galileo E6 1278.75 MHz -> L2 1227.60 MHz; L5 -> L2 as a last resort). Followed as a chain
+RECEIVER_ANTEX_FALLBACK = {'E01': 'G01', 'C01': 'G01', 'J01': 'G01', 'S01': 'G01', 'J02': 'G02',
+                           'E05': 'G05', 'C05': 'G05', 'J05': 'G05', 'S05': 'G05', 'E06': 'G02', 'C06': 'G02',
+                           'J06': 'G02', 'E07': 'G05', 'E08': 'G05', 'C07': 'G05', 'C08': 'G05', 'G05': 'G02'}
 _receiver_antex_cache = {}
 def receiver_antex_code(antenna_pco, freq_code):
     """ ANTEX frequency code to use for a receiver antenna calibration: freq_code if the calibration has it,
-        otherwise its RECEIVER_ANTEX_FALLBACK (with a warning, once per antenna and code).
+        otherwise the first code of its RECEIVER_ANTEX_FALLBACK chain that it has (with a warning, once per antenna
+        and code), e.g. E01 -> G01 for an antenna calibrated for GPS only.
 
         args:
             antenna_pco: gnsstk AntexData of the receiver antenna
@@ -257,12 +288,15 @@ def receiver_antex_code(antenna_pco, freq_code):
     key = (id(antenna_pco), freq_code)
     if key not in _receiver_antex_cache:
         code = freq_code
-        try:
-            antenna_pco.getPhaseCenterOffset(freq_code)
-        except Exception:
-            if freq_code not in RECEIVER_ANTEX_FALLBACK:
-                raise
-            code = RECEIVER_ANTEX_FALLBACK[freq_code]
+        while True:
+            try:
+                antenna_pco.getPhaseCenterOffset(code)
+                break
+            except Exception:
+                if code not in RECEIVER_ANTEX_FALLBACK:
+                    raise
+                code = RECEIVER_ANTEX_FALLBACK[code]
+        if code != freq_code:
             print(f'warning: no {freq_code} receiver antenna calibration -- using {code} PCO/PCV')
         _receiver_antex_cache[key] = (antenna_pco, code) # hold the object so its id is not reused
     return _receiver_antex_cache[key][1]
@@ -4286,6 +4320,7 @@ TECU_COEFF = 40.3 * 1e16
 FILL_VTEC = 999.9
 _FIELDS_PER_LINE = 16
 _FIELD_W = 5
+_LINE_W = _FIELDS_PER_LINE * _FIELD_W   # chars per IONEX data line (80)
 class IonexFile(object):
     """
     Reader/interpolator for IONEX TEC maps.
@@ -4424,7 +4459,7 @@ class IonexFile(object):
             elif in_map and label == 'END OF TEC MAP':
                 raw = np.frombuffer(''.join(block).encode('latin-1'),
                                     dtype='S{}'.format(_FIELD_W))
-                grid = raw.reshape(n_lat, -1)[:, :n_lon].astype(np.float32)
+                grid = raw.reshape(n_lat, n_pad // _FIELD_W)[:, :n_lon].astype(np.float32)
                 grid *= scale
                 if flip:
                     grid = grid[::-1]
@@ -4440,7 +4475,7 @@ class IonexFile(object):
             elif in_map and label == 'LAT/LON1/LON2/DLON/H':
                 # Fixed width: fields run together for negative values
                 ht = float(line[26:32])
-                block.extend(l.ljust(n_pad)[:n_pad] for l in lines[i + 1:i + 1 + n_dl])
+                block.extend(l.ljust(_LINE_W)[:_LINE_W] for l in lines[i + 1:i + 1 + n_dl])
                 i += n_dl
             elif label == 'EXPONENT':
                 scale = 10.0 ** int(line[:60].split()[0])
@@ -6435,10 +6470,7 @@ class GNSSTKStores(object):
                 # compute antenna PCV
                 dt_therm = 0
                 ROT = antenna_handle.R_mat # rotation from NEU to XYZ (ECEF)
-                try: PCV_L1 = antennaPCOData.getPhaseCenterVariation(freq1, azimuth, elevation)
-                except:
-                    if freq1=='E06':
-                        PCV_L1 = antennaPCOData.getPhaseCenterVariation('G02', azimuth, elevation)
+                PCV_L1 = antennaPCOData.getPhaseCenterVariation(receiver_antex_code(antennaPCOData, freq1), azimuth, elevation)
 
                 rxpos_L1 = rxpos + ROT@offset_f1 - PCV_L1*1e-3*rx2sat
                 if self.iono_free:
@@ -12509,9 +12541,22 @@ def adjust_stoch_params(store_handle, antenna_handles, baseline_handles, baselin
             else:
                 continue
 
+        if store_handle.stochastic_trop is True and owns_trop_states(antenna_handle):
+            # antennas sharing this antenna's ZWD (same site) add their observation epochs to its ZWD epochs
+            for member_idx in trop_site_members(antenna_handles, antenna_handle):
+                if member_idx == idx:
+                    continue
+                for jdx, baseline in enumerate(baselines):
+                    if member_idx in baseline:
+                        baseline_handle = baseline_handles[jdx]
+                        if phase_only is False:
+                            times_full_trop = np.union1d(times_full_trop, baseline_handle.datetime_array[baseline_handle.range_data_idxs])
+                        if phase is True:
+                            times_full_trop = np.union1d(times_full_trop, baseline_handle.datetime_array[baseline_handle.phase_data_idxs])
+
         if ref_antenna == antenna_handle.antenna_name: 
             # no clock/position/DISB states; ZWD states only in absolute troposphere mode
-            if store_handle.estimate_trop is True and antenna_handle.estimate_trop is True:
+            if store_handle.estimate_trop is True and owns_trop_states(antenna_handle):
                 trop_state_ant = trop_states[antenna_handle.trop_idxs]
                 if store_handle.stochastic_trop is True:
                     trop_state_ant = sample_stoch_params_at_times(trop_state_ant, antenna_handle.trop_times, times_full_trop)
@@ -12585,7 +12630,7 @@ def adjust_stoch_params(store_handle, antenna_handles, baseline_handles, baselin
                     antenna_phase_clock_idxs = slice(len(phase_clock_state_new), len(phase_clock_state_new) + len(phase_clock_state_ant))
                     antenna_handle.hold_phase_clock_params(times_full_phase[0], times_full_phase[-1], antenna_phase_clock_idxs, times_full_phase)
 
-            if store_handle.estimate_trop is True and antenna_handle.estimate_trop is True:
+            if store_handle.estimate_trop is True and owns_trop_states(antenna_handle):
                 trop_state_ant = trop_states[antenna_handle.trop_idxs]
                 #if phase is True:
                 #    breakpoint()
@@ -12602,7 +12647,7 @@ def adjust_stoch_params(store_handle, antenna_handles, baseline_handles, baselin
                     clock_state_new = np.append(clock_state_new, clock_state_ant)
                 if phase is True:
                     phase_clock_state_new = np.append(phase_clock_state_new, phase_clock_state_ant)
-            if store_handle.estimate_trop is True and antenna_handle.estimate_trop is True:
+            if store_handle.estimate_trop is True and owns_trop_states(antenna_handle):
                 trop_state_new = np.append(trop_state_new, trop_state_ant)
      
     if store_handle.stochastic_clock is True and phase_only is False:
@@ -12636,6 +12681,8 @@ def adjust_stoch_params(store_handle, antenna_handles, baseline_handles, baselin
         state_expanded = np.append(state_expanded, phase_disb_states)
     else:
         phase_disb_idxs = slice(len(state_expanded), len(state_expanded))
+
+    share_site_troposphere(antenna_handles) # members follow their owner's re-sampled ZWD states
 
     first_amb = len(state_expanded)
     if amb_state_idxs is not None:
@@ -13182,7 +13229,9 @@ def analyze_ls_solution(sol_type, plot_results, ref_antenna, clock_idxs, trop_id
 
         if ref_antenna == antenna_handle.antenna_name: # compute corrected ranges once
             ref_idx = idx
-            if len(trop_states)>0 and antenna_handle.estimate_trop is True:
+            if len(trop_states)>0 and antenna_handle.estimate_trop is True and not owns_trop_states(antenna_handle):
+                print(antenna_handle.antenna_name + ' (reference antenna): ZWD shared with ' + antenna_handle.trop_owner)
+            if len(trop_states)>0 and owns_trop_states(antenna_handle):
                 trop_state = trop_states[antenna_handle.trop_idxs]
                 sigmas_trop = np.sqrt(np.diag(cov_matrix_trop[antenna_handle.trop_idxs,antenna_handle.trop_idxs]))
                 print(antenna_handle.antenna_name + ' (reference antenna):')
@@ -13235,7 +13284,9 @@ def analyze_ls_solution(sol_type, plot_results, ref_antenna, clock_idxs, trop_id
             if phase_delay is True: 
                 print('bulk clock offset (phase): ' + str(np.round(antenna_handle.phase_clock_samples[0]*1e9/const.c,6)) + ' ns')
                 print('sigma_clock (phase): ' + str(np.round(sigmas_phase_clock[0],6)))
-            if len(trop_states)>0 and antenna_handle.estimate_trop is True:
+            if len(trop_states)>0 and antenna_handle.estimate_trop is True and not owns_trop_states(antenna_handle):
+                print('ZWD shared with ' + antenna_handle.trop_owner)
+            elif len(trop_states)>0 and antenna_handle.estimate_trop is True:
                 trop_state = trop_states[antenna_handle.trop_idxs]
                 cov_trop = cov_matrix_trop[antenna_handle.trop_idxs,antenna_handle.trop_idxs]
                 sigmas_trop = np.sqrt(np.diag(cov_trop))
@@ -16662,7 +16713,7 @@ def iterative_weight_adjust_ls_vce(
     observable="range",
     no_PSD=False,
 ):
-    max_iter, tol_var = 30, 1e-4
+    max_iter, tol_var = 5, 1e-4
     FIT_IRW = True
 
     ref_antenna, baselines = ls_args[0], ls_args[1]
@@ -16738,7 +16789,7 @@ def iterative_weight_adjust_ls_vce(
         # ---------------- Stochastic troposphere ------------------------
         if store_handle.stochastic_trop:
             for ant in antenna_handles:
-                if not getattr(ant, "estimate_trop", False):
+                if not owns_trop_states(ant):
                     continue
                 pv = get_process_variance_times(store_handle, ant, "trop")
                 sig = np.sqrt(pv)
@@ -16803,7 +16854,7 @@ def iterative_weight_adjust_ls_vce(
 
             if store_handle.stochastic_trop is True:
                 for idx, antenna_handle in enumerate(antenna_handles):
-                    if antenna_handle.estimate_trop is True:
+                    if owns_trop_states(antenna_handle):
                         Q_full_rw = np.zeros(m)
                         Q_trop = get_process_variance_times(store_handle, antenna_handle, 'trop', only_mat=True)
                         Q_full_rw[num_samples:num_samples+len(antenna_handle.trop_times)-1] = Q_trop
@@ -16877,7 +16928,7 @@ def iterative_weight_adjust_ls_vce(
                     idx += 1
         if not no_PSD and store_handle.stochastic_trop:
             for ant in antenna_handles:
-                if not getattr(ant, "estimate_trop", False):
+                if not owns_trop_states(ant):
                     continue
                 sig_hat[idx] = max(sig_hat[idx], 1e-2)
                 idx += 1
@@ -16938,7 +16989,7 @@ def iterative_weight_adjust_ls_vce(
 
         if not no_PSD and store_handle.stochastic_trop:
             for ant in antenna_handles:
-                if not getattr(ant, "estimate_trop", False):
+                if not owns_trop_states(ant):
                     continue
                 print(f'for antenna {ant.antenna_name}:')
                 #ant.trop_psd_rw = min(max(sig_hat[idx], 1e-3), 30)
@@ -17057,7 +17108,7 @@ def iterative_weight_adjust_ls_vce_alt(store_handle, state_expanded, bounds, ls_
 
         if store_handle.stochastic_trop is True:
             for idx, antenna_handle in enumerate(antenna_handles):
-                if antenna_handle.estimate_trop is True:
+                if owns_trop_states(antenna_handle):
                     process_variance_trop = get_process_variance_times(store_handle, antenna_handle, 'trop')
                     weights[num_samples:num_samples + len(antenna_handle.trop_times)-1,\
                             num_samples:num_samples + len(antenna_handle.trop_times)-1] =\
@@ -17133,7 +17184,7 @@ def iterative_weight_adjust_ls_vce_alt(store_handle, state_expanded, bounds, ls_
 
             if store_handle.stochastic_trop is True:
                 for idx, antenna_handle in enumerate(antenna_handles):
-                    if antenna_handle.estimate_trop is True:
+                    if owns_trop_states(antenna_handle):
                         Q_trop_full = np.zeros_like(weights)
                         Q_trop = get_process_variance_times(store_handle, antenna_handle, 'trop', only_mat=True)
                         Q_trop_full[num_samples:num_samples + len(antenna_handle.trop_times)-1,\
@@ -17196,7 +17247,7 @@ def iterative_weight_adjust_ls_vce_alt(store_handle, state_expanded, bounds, ls_
 
             if store_handle.stochastic_trop is True:
                 for idx, antenna_handle in enumerate(antenna_handles):
-                    if antenna_handle.estimate_trop is True:
+                    if owns_trop_states(antenna_handle):
                         antenna_handle.trop_psd_rw = max(sig_hat[sig_count], 1e-3)
                         sig_count += 1
                         print('trop psd rw: ' + str(antenna_handle.trop_psd_rw) + ' cm^2/day')
@@ -17934,7 +17985,7 @@ def calc_residuals(state, ref_antenna, baselines, store_handle, antenna_handles,
 
     if store_handle.stochastic_trop is True:
         for antenna_handle in antenna_handles:
-            if antenna_handle.estimate_trop is True:
+            if owns_trop_states(antenna_handle): # site members share the owner's states and their constraints
                 process_variance_trop = get_process_variance_times(store_handle, antenna_handle, 'trop')
                 residuals = np.concatenate((residuals, 1/np.sqrt(process_variance_trop)*np.diff(antenna_handle.trop_samples)))
 
@@ -18260,11 +18311,11 @@ def calc_jac(state, ref_antenna, baselines, store_handle, antenna_handles, \
                                 range_rows = ant_idxs[baseline_handle.range_data_idxs]
                                 phase_rows = ant_idxs[baseline_handle.phase_data_idxs]
                             if phase_only is False:
-                                analytical_jac[num_samples:num_samples + len(baseline_handle.range_data_idxs), antenna_trop_idxs] = \
+                                analytical_jac[num_samples:num_samples + len(baseline_handle.range_data_idxs), antenna_trop_idxs] += \
                                         sign*antenna_jac[range_rows, trop_cols]
                             analytical_jac[num_samples + (len(baseline_handle.range_data_idxs) if phase_only is False else 0):\
                                     num_samples + (len(baseline_handle.range_data_idxs) if phase_only is False else 0) + \
-                                    len(baseline_handle.phase_data_idxs), antenna_trop_idxs] = sign*antenna_jac[phase_rows, trop_cols]
+                                    len(baseline_handle.phase_data_idxs), antenna_trop_idxs] += sign*antenna_jac[phase_rows, trop_cols]
                         if phase_only is False:
                             num_samples += len(baseline_handle.range_data_idxs)
                         num_samples += len(baseline_handle.phase_data_idxs)
@@ -18283,7 +18334,7 @@ def calc_jac(state, ref_antenna, baselines, store_handle, antenna_handles, \
                             analytical_jac[num_samples:num_samples + len(baseline_handle.range_data_idxs), antenna_clock_idxs] = \
                                     sign*antenna_jac[baseline_handle.range_data_idxs,3:3+len(clock_state)]
                             if store_handle.estimate_trop is True and antenna_handle.estimate_trop is True:
-                                analytical_jac[num_samples:num_samples + len(baseline_handle.range_data_idxs), antenna_trop_idxs] = \
+                                analytical_jac[num_samples:num_samples + len(baseline_handle.range_data_idxs), antenna_trop_idxs] += \
                                         sign*antenna_jac[baseline_handle.range_data_idxs,3+len(clock_state)+len_ao+len_grav:3+len(clock_state)+len_ao+len_grav+len(trop_state)]  
                         elif store_handle.sol_type == 'GNSS':
                             analytical_jac[num_samples:num_samples + len(baseline_handle.range_data_idxs), count_rx*3:count_rx*3+3] = \
@@ -18291,7 +18342,7 @@ def calc_jac(state, ref_antenna, baselines, store_handle, antenna_handles, \
                             analytical_jac[num_samples:num_samples + len(baseline_handle.range_data_idxs), antenna_clock_idxs] = \
                                     sign*antenna_jac[ant_idxs[baseline_handle.range_data_idxs],3:3+len(clock_state)]
                             if store_handle.estimate_trop is True and antenna_handle.estimate_trop is True:
-                                analytical_jac[num_samples:num_samples + len(baseline_handle.range_data_idxs), antenna_trop_idxs] = \
+                                analytical_jac[num_samples:num_samples + len(baseline_handle.range_data_idxs), antenna_trop_idxs] += \
                                         sign*antenna_jac[ant_idxs[baseline_handle.range_data_idxs],3+len(clock_state)+len_ao+len_grav:3+len(clock_state)+len_ao+len_grav+len(trop_state)]
                             if store_handle.estimate_disb is True:
                                 analytical_jac[num_samples:num_samples + len(baseline_handle.range_data_idxs), antenna_disb_idxs] = \
@@ -18313,7 +18364,7 @@ def calc_jac(state, ref_antenna, baselines, store_handle, antenna_handles, \
                                 sign*antenna_jac[baseline_handle.phase_data_idxs,\
                                 3+len(clock_state)+len(trop_state)+len_ao+len_grav:3+len(clock_state)+len(trop_state)+len_ao+len_grav+len(phase_clock_state)]
                         if store_handle.estimate_trop is True and antenna_handle.estimate_trop is True:
-                            analytical_jac[num_samples:num_samples + len(baseline_handle.phase_data_idxs), antenna_trop_idxs] = \
+                            analytical_jac[num_samples:num_samples + len(baseline_handle.phase_data_idxs), antenna_trop_idxs] += \
                                     sign*antenna_jac[baseline_handle.phase_data_idxs,3+len(clock_state)+len_ao+len_grav:3+len(clock_state)+len_ao+len_grav+len(trop_state)]  
                     elif store_handle.sol_type == 'GNSS':
                         analytical_jac[num_samples:num_samples + len(baseline_handle.phase_data_idxs), count_rx*3:count_rx*3+3] = \
@@ -18322,7 +18373,7 @@ def calc_jac(state, ref_antenna, baselines, store_handle, antenna_handles, \
                                 sign*antenna_jac[ant_idxs[baseline_handle.phase_data_idxs],\
                                 3+len(clock_state)+len(trop_state)+len_ao+len_grav+len(disb_state):3+len(clock_state)+len(trop_state)+len_ao+len_grav+len(disb_state)+len(phase_clock_state)]
                         if store_handle.estimate_trop is True and antenna_handle.estimate_trop is True:
-                            analytical_jac[num_samples:num_samples + len(baseline_handle.phase_data_idxs), antenna_trop_idxs] = \
+                            analytical_jac[num_samples:num_samples + len(baseline_handle.phase_data_idxs), antenna_trop_idxs] += \
                                     sign*antenna_jac[ant_idxs[baseline_handle.phase_data_idxs],3+len(clock_state)+len_ao+len_grav:3+len(clock_state)+len_ao+len_grav+len(trop_state)]
                         if store_handle.estimate_phase_disb is True:
                             analytical_jac[num_samples:num_samples + len(baseline_handle.phase_data_idxs), antenna_phase_disb_idxs] = \
@@ -18384,7 +18435,7 @@ def calc_jac(state, ref_antenna, baselines, store_handle, antenna_handles, \
                             jac_rows = ant_idxs
                         if len(trop_state) > 0:
                             antenna_trop_idxs = trop_idxs_list[antenna_handle.trop_idxs]
-                            analytical_jac[num_samples:num_samples + n_rows, antenna_trop_idxs] = \
+                            analytical_jac[num_samples:num_samples + n_rows, antenna_trop_idxs] += \
                                     sign*antenna_jac[jac_rows, 3+len_ao+len_grav:3+len_ao+len_grav+len(trop_state)]
                         num_samples += n_rows
                         continue
@@ -18402,7 +18453,7 @@ def calc_jac(state, ref_antenna, baselines, store_handle, antenna_handles, \
                             analytical_jac[num_samples:num_samples + len(baseline_handle.range_data_idxs), antenna_clock_idxs] = \
                                     sign*antenna_jac[baseline_handle.range_data_idxs,3:3+len(clock_state)] 
                             if store_handle.estimate_trop is True and antenna_handle.estimate_trop is True:
-                                analytical_jac[num_samples:num_samples + len(baseline_handle.range_data_idxs), antenna_trop_idxs] = \
+                                analytical_jac[num_samples:num_samples + len(baseline_handle.range_data_idxs), antenna_trop_idxs] += \
                                         sign*antenna_jac[baseline_handle.range_data_idxs,3+len(clock_state)+len_ao+len_grav:3+len(clock_state)+len_ao+len_grav+len(trop_state)]  
                         elif store_handle.sol_type == 'GNSS':
                             analytical_jac[num_samples:num_samples + len(baseline_handle.range_data_idxs), count_rx*3:count_rx*3+3] = \
@@ -18410,7 +18461,7 @@ def calc_jac(state, ref_antenna, baselines, store_handle, antenna_handles, \
                             analytical_jac[num_samples:num_samples + len(baseline_handle.range_data_idxs), antenna_clock_idxs] = \
                                     sign*antenna_jac[ant_idxs[baseline_handle.range_data_idxs],3:3+len(clock_state)]
                             if store_handle.estimate_trop is True and antenna_handle.estimate_trop is True:
-                                analytical_jac[num_samples:num_samples + len(baseline_handle.range_data_idxs), antenna_trop_idxs] = \
+                                analytical_jac[num_samples:num_samples + len(baseline_handle.range_data_idxs), antenna_trop_idxs] += \
                                         sign*antenna_jac[ant_idxs[baseline_handle.range_data_idxs],3+len(clock_state)+len_ao+len_grav:3+len(clock_state)+len_ao+len_grav+len(trop_state)]
                             if store_handle.estimate_disb is True:
                                 analytical_jac[num_samples:num_samples + len(baseline_handle.range_data_idxs), antenna_disb_idxs] = \
@@ -18430,7 +18481,7 @@ def calc_jac(state, ref_antenna, baselines, store_handle, antenna_handles, \
                         analytical_jac[num_samples:num_samples + len(datetime_array), antenna_clock_idxs] = \
                                 sign*antenna_jac[ant_idxs,3:3+len(clock_state)]
                         if store_handle.estimate_trop is True and antenna_handle.estimate_trop is True:
-                            analytical_jac[num_samples:num_samples + len(datetime_array), antenna_trop_idxs] = \
+                            analytical_jac[num_samples:num_samples + len(datetime_array), antenna_trop_idxs] += \
                                     sign*antenna_jac[ant_idxs,3+len(clock_state)+len_ao+len_grav:3+len(clock_state)+len_ao+len_grav+len(trop_state)]
 
                         if store_handle.estimate_disb is True:
@@ -18521,7 +18572,7 @@ def calc_jac(state, ref_antenna, baselines, store_handle, antenna_handles, \
 
     if store_handle.stochastic_trop is True:
         for idx, antenna_handle in enumerate(antenna_handles):
-            if antenna_handle.estimate_trop is True:
+            if owns_trop_states(antenna_handle):
                 # random-walk pseudo-observations on this antenna's ZWD block (same order as calc_residuals)
                 trop_cols = np.arange(trop_idxs.start, trop_idxs.stop)[antenna_handle.trop_idxs]
                 inv_sigma = 1/np.sqrt(get_process_variance_times(store_handle, antenna_handle, 'trop'))
