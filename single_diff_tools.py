@@ -5583,18 +5583,31 @@ class AntennaInfo(object):
         #self.clock_interp_fcn = interp1d(time_sec_of_day, cb_data_m)
         self.ppp_clock_active = True
         
+    def ppp_sec_of_day(self, times):
+        """ Seconds of day (float) of the epochs, on the day convention of the PPP clock file """
+        times = np.asarray(times).astype('datetime64[ns]')
+        sec_of_day = (times - times[0].astype('datetime64[D]')) / np.timedelta64(1, 's')
+        if self.ref_time_clock > 86400.0/2 and sec_of_day[0] < 86400.0/4:
+            # disagreement on starting day -- add a day for agreement (FDV2 in US008B)
+            sec_of_day = sec_of_day + 86400.0
+        return sec_of_day
+
+    def ppp_clock_at(self, times):
+        """ PPP clock (m) at the given epochs, zeros if the antenna has no PPP clock. Unlike interp_ppp_clock, the
+            held ppp_clock_samples are left unchanged, so this can be used wherever a clock is rebuilt from the state.
+        """
+        if not self.ppp_clock_active or len(times) == 0:
+            return np.zeros(len(times))
+        return self.clock_interp_fcn(self.ppp_sec_of_day(times))
+
     def interp_ppp_clock(self, times = []):
         """ Interpolate the PPP clock function  """
         # correct reference data for PPP clock
-        if len(times)>0:
-            sec_of_day_data = (times - times[0].astype('datetime64[D]')).astype('timedelta64[s]').astype(float)
-        else:
-            sec_of_day_data = (self.times_gps - self.times_gps[0].astype('datetime64[D]')).astype('timedelta64[s]').astype(float)
-        if self.ref_time_clock > 86400.0/2 and sec_of_day_data[0]<86400.0/4:
-            # disagreement on starting day -- add a day for agreement (FDV2 in US008B)
-            sec_of_day_data += 86400.0
+        if len(times) == 0:
+            times = self.times_gps
+        sec_of_day_data = self.ppp_sec_of_day(times)
         self.ppp_clock_samples = self.clock_interp_fcn(sec_of_day_data)
-        if True:
+        if False: # diagnostic plot -- slow, this is called at every residual evaluation
             plt.figure(dpi=300)
             plt.plot(sec_of_day_data, self.ppp_clock_samples)
             plt.xlabel('sec of day')
@@ -9612,6 +9625,22 @@ class VMF3Model:
             if station is None:
                 raise ValueError('Need to supply a station name to use station-based VMF3')
             self.station = station
+        # surface pressure (hPa) from weather calibration data (setWeather), when available: replaces the VMF3 zenith
+        # hydrostatic delay (Saastamoinen); the VMF3 mapping functions, wet delay and gradients are kept
+        self.pressure_hpa = None
+        self._measured_zhd_reported = False
+
+    def measured_zhd(self, zhd_vmf3, lat_deg, h_ell):
+        """ Zenith hydrostatic delay (m) from the measured surface pressure (Saastamoinen, Davis et al. 1985) in place
+            of the VMF3 value, if a pressure has been set; otherwise the VMF3 value. Reports the first replacement. """
+        if self.pressure_hpa is None:
+            return zhd_vmf3
+        zhd = 0.0022768*self.pressure_hpa/(1.0 - 0.00266*np.cos(2.0*np.deg2rad(lat_deg)) - 0.28e-6*h_ell)
+        if not self._measured_zhd_reported:
+            print(f'VMF3 {getattr(self, "station", self.vmf3_type)}: zenith hydrostatic delay from measured pressure '
+                  f'({self.pressure_hpa:.1f} hPa): {zhd:.4f} m (VMF3 {zhd_vmf3:.4f} m, difference {zhd - zhd_vmf3:+.4f} m)')
+            self._measured_zhd_reported = True
+        return zhd
 
     def correction(self, rx_gnsstk, tx_gnsstk, common_time):
         """ get full correction for time, receiver position, transmitter position (matches GNSSTk function signature) """
@@ -9634,6 +9663,7 @@ class VMF3Model:
             Gn_h, Ge_h, Gn_w, Ge_w = self.interpolate_station_grad(MJD)
             mfh, mfw, zhd, zwd = self.interpolate_station_vmf3(lat, lon, ht_el, MJD, elev)
 
+        zhd = self.measured_zhd(zhd, lat, ht_el)
         self.mfw = mfw # save for dZWD
         self.elev = elev
         self.mfh = mfh
@@ -9668,6 +9698,7 @@ class VMF3Model:
             Gn_h, Ge_h, Gn_w, Ge_w = self.interpolate_station_grad(MJD)
             mfh, mfw, zhd, zwd = self.interpolate_station_vmf3(lat, lon, ht_el, MJD, elev)
 
+        zhd = self.measured_zhd(zhd, lat, ht_el)
         self.mfw = mfw # save for dZWD
         self.elev = elev
         self.mfh = mfh
@@ -9932,7 +9963,10 @@ class VMF3Model:
             f"Hint: provide the GRAD_YYYYMMDD.HHH files for the two surrounding 6h epochs."
         )
     def setWeather(self, T, P, H):
-        """ VMF3 uses numerical weather model, nothing to do here """
+        """ Measured weather (weather calibration files): the pressure (hPa) replaces the VMF3 zenith hydrostatic delay
+            (measured_zhd); temperature and humidity are not used (VMF3 wet delay and mapping functions kept) """
+        if P is not None and np.isfinite(P) and P > 0:
+            self.pressure_hpa = float(P)
         return
     def setHumidity(self, H):
         """ VMF3 uses numerical weather model, nothing to do here """
@@ -10260,6 +10294,8 @@ class VMF3Model:
                 station = splt_line[0]
                 if station == self.station:
                     self.ref_ht = float(splt_line[3])
+        if not hasattr(self, 'ref_ht'):
+            raise ValueError(f'VMF3 station {self.station} not in station position file {sta_pos_file}')
 
     def load_station_grad_files(self, grad_files):
         """ Load station-based VMF3 gradient parameters for self.station """
@@ -10337,6 +10373,19 @@ class VMF3Model:
         a_ht = 2.53e-5
         b_ht = 5.49e-3
         c_ht = 1.14e-3
+        # the site values are scaled from the reference height to the antenna: more than a couple of km apart means
+        # the wrong VMF3 station, a bad station-file height, or a position far from the a priori (a trial step of the
+        # optimizer, or a runaway estimate). Warn (once per station and run) and clamp the offset, so the barometric
+        # scaling cannot go complex and the model stays finite for the optimizer to reject the step
+        VMF3_MAX_HEIGHT_OFFSET = 2000.0
+        if not np.isfinite(h_ell) or abs(h_ell - self.ref_ht) > VMF3_MAX_HEIGHT_OFFSET:
+            if not getattr(self, '_height_offset_reported', False):
+                print(f'WARNING VMF3 station {self.station}: antenna height {h_ell:.1f} m vs station-file height '
+                      f'{self.ref_ht:.1f} m at lat {lat_deg:.4f} lon {lon_deg:.4f} -- offset clamped to '
+                      f'{VMF3_MAX_HEIGHT_OFFSET:.0f} m (wrong VMF3 station or station file, or a position far from the '
+                      'a priori); reported once')
+                self._height_offset_reported = True
+            h_ell = self.ref_ht + np.clip(np.nan_to_num(h_ell - self.ref_ht), -VMF3_MAX_HEIGHT_OFFSET, VMF3_MAX_HEIGHT_OFFSET)
         h_ell_km     = (h_ell-self.ref_ht)/1000
         ht_corr_coef = 1/np.sin(el) - (1+(a_ht/(1+b_ht/(1+c_ht)))) / (np.sin(el)+(a_ht/(np.sin(el)+b_ht/(np.sin(el)+c_ht))))
         ht_corr      = ht_corr_coef * h_ell_km
@@ -11606,10 +11655,12 @@ def sample_stoch_params_at_times(vals, prev_times, new_times):
         returns:
             new_vals: numpy.ndarray of values at new_times
     """
+    # both epoch sets on one time origin: referencing new_times to its own first epoch shifted the samples in time
+    # by new_times[0]-prev_times[0] whenever the first epoch changed (e.g. an antenna's first epoch not on a baseline)
     times_sec = (prev_times-prev_times[0])/np.timedelta64(1,'s')
     interp_fcn = interp1d(times_sec, vals, fill_value='extrapolate')
 
-    times_sec_new = (new_times-new_times[0])/np.timedelta64(1,'s')
+    times_sec_new = (new_times-prev_times[0])/np.timedelta64(1,'s')
     new_vals = interp_fcn(times_sec_new)
     return new_vals
 
@@ -12447,6 +12498,7 @@ def gen_phase_clock_state(store_handle, antenna_handles, baseline_handles, basel
             else:
                 # only global clock model
                 phase_clock_samples += phase_clock_state_ant[idx_start]
+            phase_clock_samples += antenna_handle.ppp_clock_at(antenna_handle.times_gps)
 
             antenna_handle.hold_clock(phase_clock_samples, phase_delay=True)
 
@@ -12606,6 +12658,7 @@ def adjust_stoch_params(store_handle, antenna_handles, baseline_handles, baselin
                         clock_state_adj[:idx_start] = clock_state_ant[:idx_start]
                     clock_state_ant = clock_state_adj
                     clock_samples += clock_state_adj[idx_start:] 
+                    clock_samples += antenna_handle.ppp_clock_at(times_full_range)
 
                     antenna_clock_idxs = slice(len(clock_state_new), len(clock_state_new) + len(clock_state_adj))
                     antenna_handle.hold_clock(clock_samples)
@@ -12625,6 +12678,7 @@ def adjust_stoch_params(store_handle, antenna_handles, baseline_handles, baselin
                         # phase clock initialized as range clock state
                         phase_clock_samples += clock_state_ant[idx_start:]
                         phase_clock_state_ant = clock_state_ant.copy()
+                    phase_clock_samples += antenna_handle.ppp_clock_at(times_full_phase)
 
                     antenna_handle.hold_clock(phase_clock_samples, phase_delay=True)
                     antenna_phase_clock_idxs = slice(len(phase_clock_state_new), len(phase_clock_state_new) + len(phase_clock_state_ant))

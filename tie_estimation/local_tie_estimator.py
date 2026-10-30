@@ -1118,9 +1118,10 @@ def assign_trop_estimation(antenna_handles, store_handle, ref_antenna):
         estimates its own ZWD -- the common mode is fixed by the elevation difference on the long baselines.
         Relative mode (short-baseline network): only ZWD differences are observable, so the reference carries
         none and antennas within MIN_TROP_DIST of it share its (a priori) troposphere.
-        Sites (absolute mode, stochastic troposphere, GNSS solutions): antennas within MIN_TROP_DIST of each other share one ZWD
-        series, carried by the site's owner (the reference if it is at the site, else the antenna with the most
-        epochs) on the union of their epochs; trop_owner names it. Over a local tie the ZWD difference is the
+        Sites (stochastic troposphere, GNSS solutions; absolute or relative mode): antennas estimating ZWD within
+        MIN_TROP_DIST of each other share one ZWD series, carried by the site's owner (the reference if it estimates ZWD
+        and is at the site, else the antenna with the most epochs) on the union of their epochs; trop_owner names it.
+        In relative mode the reference and the antennas near it estimate none, so sites form among the others. Over a local tie the ZWD difference is the
         height scaling the a priori model at each antenna already has, and a free difference would trade against
         the tie's height. """
     for antenna_handle in antenna_handles:
@@ -1131,18 +1132,19 @@ def assign_trop_estimation(antenna_handles, store_handle, ref_antenna):
         return
     ref_handle = [antenna_handle for antenna_handle in antenna_handles if antenna_handle.antenna_name == ref_antenna][0]
     dist_to_ref = [np.linalg.norm(np.array(antenna_handle.ref_pos) - np.array(ref_handle.ref_pos)) for antenna_handle in antenna_handles]
-    absolute_trop = max(dist_to_ref) >= MIN_ABS_TROP_DIST
+    absolute_trop = bool(max(dist_to_ref) >= MIN_ABS_TROP_DIST)
     for antenna_handle, dist in zip(antenna_handles, dist_to_ref):
         if absolute_trop:
             antenna_handle.estimate_trop = True
         elif antenna_handle.antenna_name == ref_antenna:
             antenna_handle.estimate_trop = False
         else:
-            antenna_handle.estimate_trop = dist >= MIN_TROP_DIST
-    if absolute_trop and store_handle.stochastic_trop and getattr(store_handle, 'sol_type', 'GNSS') == 'GNSS':
-        # owners first: the reference, then the antennas with the most epochs
-        order = sorted(range(len(antenna_handles)), key=lambda idx: (antenna_handles[idx].antenna_name != ref_antenna,
-                                                                     -len(antenna_handles[idx].times_gps)))
+            # Python bool: the models test `estimate_trop is True`, which a numpy bool from the distance comparison fails
+            antenna_handle.estimate_trop = bool(dist >= MIN_TROP_DIST)
+    if store_handle.stochastic_trop and getattr(store_handle, 'sol_type', 'GNSS') == 'GNSS':
+        # owners first: the reference, then the antennas with the most epochs; only antennas that estimate ZWD
+        order = sorted([idx for idx in range(len(antenna_handles)) if antenna_handles[idx].estimate_trop],
+                       key=lambda idx: (antenna_handles[idx].antenna_name != ref_antenna, -len(antenna_handles[idx].times_gps)))
         assigned = set()
         for owner_idx in order:
             if owner_idx in assigned:
@@ -1723,17 +1725,17 @@ def lstsq_estimation(sol_type, plot_intermediate_results, ref_antenna, store_han
                   f'{length/1e3:.3f} km ({baseline_strategy})')
         # baseline epochs/sources are needed for the group delay solution (sub-arrays); data are added after it
         baseline_handles = define_baseline_epochs_gnss(store_handle, antenna_handles, baselines)
-        for ah in antenna_handles:
-            d = ah.antenna_data
-            eps = (d.pr_data - d.pr_model).values
-            med = np.nanmedian(eps)
-            print(f'{ah.antenna_name}: n={np.sum(np.isfinite(eps))}  O-C median {med:.1f}  '
-                  f'MAD {np.nanmedian(np.abs(eps-med)):.1f}  p2p {np.nanmax(eps)-np.nanmin(eps):.1f} m')
-            bad = np.where(np.abs(eps - np.nanmedian(eps)) > 1e4)[0]
-            print(ah.antenna_name, 'bad rows:', len(bad))
-            for i in bad:
-                print(f'  {ah.times_gps[i]}  {str(d.sv.values[i]):4s}  pr_data {float(d.pr_data.values[i]):15.3f}  '
-                      f'pr_model {float(d.pr_model.values[i]):15.3f}')
+        #for ah in antenna_handles:
+        #    d = ah.antenna_data
+        #    eps = (d.pr_data - d.pr_model).values
+        #    med = np.nanmedian(eps)
+        #    print(f'{ah.antenna_name}: n={np.sum(np.isfinite(eps))}  O-C median {med:.1f}  '
+        #          f'MAD {np.nanmedian(np.abs(eps-med)):.1f}  p2p {np.nanmax(eps)-np.nanmin(eps):.1f} m')
+        #    bad = np.where(np.abs(eps - np.nanmedian(eps)) > 1e4)[0]
+        #    print(ah.antenna_name, 'bad rows:', len(bad))
+        #    for i in bad:
+        #        print(f'  {ah.times_gps[i]}  {str(d.sv.values[i]):4s}  pr_data {float(d.pr_data.values[i]):15.3f}  '
+        #              f'pr_model {float(d.pr_model.values[i]):15.3f}')
 
     count_ao = 0
     if estimate_AO:
@@ -2027,6 +2029,10 @@ def lstsq_estimation(sol_type, plot_intermediate_results, ref_antenna, store_han
                     clock_samples += sample_poly_at_interval(clock_state_ant, clock_poly_length, times_gps)
                 elif store_handle.stochastic_clock:
                     clock_samples += clock_state_ant
+                # the PPP clock is not part of the state: add it as calc_residuals does, or the phase model used to
+                # initialize the ambiguities (define_amb_state_gnss) is off by the whole PPP clock
+                clock_samples = clock_samples + antenna_handle.ppp_clock_at(
+                        antenna_handle.clock_times if store_handle.stochastic_clock else times_gps)
                 antenna_handle.hold_clock(clock_samples)
                 antenna_handle.phase_clock_times = antenna_handle.clock_times
                 antenna_handle.hold_clock(clock_samples, phase_delay=True)
@@ -2857,13 +2863,13 @@ if __name__ == '__main__':
                 rinex_data = map_datasets(rinex_data) 
            
             # any MEO/IGSO/GEO pseudorange is 1.9e7-4.2e7 m (plus receiver clock up to a few hundred km)
-            for code in ('C1', 'P2'):
-                if code in rinex_data:
-                    bad = (rinex_data[code] < 1.5e7) | (rinex_data[code] > 4.5e7)
-                    if bad.any():
-                        print(f'{rinex_file}: {int(bad.sum())} implausible {code} values set to NaN '
-                              f'(SVs: {sorted(set(rinex_data.sv.values[bad.any("time").values]))})')
-                    rinex_data[code] = rinex_data[code].where(~bad) 
+            for code in [var for var in rinex_data.data_vars if len(var) >= 2 and var[0] in 'CP' and var[1].isdigit()]:
+                missing = rinex_data[code] == 0
+                bad = ~missing & ((rinex_data[code] < 1.5e7) | (rinex_data[code] > 4.5e7))
+                if bad.any():
+                    print(f'{rinex_file}: {int(bad.sum())} implausible {code} values set to NaN '
+                          f'(SVs: {sorted(set(rinex_data.sv.values[bad.any("time").values]))})')
+                    rinex_data[code] = rinex_data[code].where(~bad)
 
             full_data[rinex_file] = rinex_data
             
