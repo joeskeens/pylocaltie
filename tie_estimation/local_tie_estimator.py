@@ -75,7 +75,7 @@ MIN_TROP_DIST = 0.5e3 # 1 km
 # Longest baseline above which every antenna (reference included) carries absolute ZWD states. Below it the
 # wet mapping functions at the two ends are nearly equal, so only ZWD differences w.r.t. the reference are
 # observable: m_w(e) changes by ~0.5 per degree at 10 deg elevation and the elevation difference is ~b/R_E.
-MIN_ABS_TROP_DIST = 100e3
+MIN_ABS_TROP_DIST = 1000e3
 MU_EARTH = 3.9860044188e14
 #TK_LAMBDA = 1e-9
 #TK_LAMBDA = 1e-9
