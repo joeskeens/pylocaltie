@@ -68,7 +68,9 @@ from single_diff_tools import import_key_gnss, import_vex_gnss, import_data_vlbi
                   iterative_weight_adjust_LS_VCE_full, sample_global_poly_at_interval, gen_key, VMF3Model, TropTestModel, get_spanning_tree, \
                   read_thermal_deformation_coeffs, get_obs_weights, find_cont_penalty, mcmc_correlation, ls_correlation, load_kernel_parameters, vlbi_transform_data,\
                   write_vda_phase, NavStore, fit_phase_clock_params_grdel, nearest_rinex_ant_code, source_map, \
-                  wavelength_at, PREFERRED_IONO_BAND, owns_trop_states, share_site_troposphere
+                  wavelength_at, PREFERRED_IONO_BAND, owns_trop_states, share_site_troposphere, \
+                  antenna_noise_params, clock_leader, linked_stochastic_clock, merge_linked_clock_times, num_clock_states, \
+                  unwrap_clock_cycles
 
 MIN_SLICE = 0
 MIN_TROP_DIST = 0.5e3 # 1 km
@@ -298,6 +300,20 @@ def add_args_to_parser(parser_in):
                          default=0,
                          help="Length of interval for piecewise-linear troposepher wet zenith delay model (min), 0=disabled.",
                          )
+    parser.add_argument("--antenna_covariance",
+                         action="store_true",
+                         default=False,
+                         help="Antenna-based observation covariance: each antenna's noise floor (range and phase) is independent "
+                              "between antennas, so baselines sharing an antenna correlate; the variance-component estimation fits "
+                              "per-antenna floors instead of per-baseline q. The SNR term (GNSS: C/N0 variances per antenna, VLBI: fringe "
+                              "formal errors per baseline) is kept at its a priori scale unless --antenna_cov_snr_scale",
+                         )
+    parser.add_argument("--antenna_cov_snr_scale",
+                         action="store_true",
+                         default=False,
+                         help="With --antenna_covariance, also estimate the scale of the SNR term (GNSS: per antenna; VLBI: one "
+                              "fringe formal error scale per observable)",
+                         )
     parser.add_argument("--stochastic_clock",
                          action="store_true",
                          default=False,
@@ -464,7 +480,7 @@ def add_args_to_parser(parser_in):
                         action='append')
     parser.add_argument("--linked_clock", 
                         dest="linked_clocks",
-                        help="Specify pairs of antennas that have feeds from the same clock as --linked_clocks \"ANT1--ANT2\" . Important for stochastic clock modeling.", 
+                        help="Specify pairs of antennas that have feeds from the same clock as --linked_clock \"ANT1--ANT2\" (repeatable; links are transitive): they share one stochastic clock (--stochastic_clock) and differ only by a constant offset and their global clock polynomials",
                         default=[], 
                         action='append')
     parser.add_argument("--sta_code", 
@@ -588,8 +604,14 @@ WEIGHT_ATTRS_ANTENNA = ('clock_psd_rw', 'clock_psd_irw', 'phase_clock_psd_rw', '
 
 def hold_weights(antenna_handles, baseline_handles):
     """ Snapshot of the observation weights, process noise and stochastic state layout of a solution """
+    held_antennas = []
+    for handle in antenna_handles:
+        held = {attr: getattr(handle, attr) for attr in WEIGHT_ATTRS_ANTENNA if hasattr(handle, attr)}
+        for noise_type in ('range', 'phase'): # antenna-based covariance (a priori values until estimated)
+            held['noise_scale_' + noise_type], held['noise_floor_' + noise_type] = antenna_noise_params(handle, noise_type)
+        held_antennas.append(held)
     return ([{attr: getattr(handle, attr) for attr in WEIGHT_ATTRS_BASELINE if hasattr(handle, attr)} for handle in baseline_handles],
-            [{attr: getattr(handle, attr) for attr in WEIGHT_ATTRS_ANTENNA if hasattr(handle, attr)} for handle in antenna_handles])
+            held_antennas)
 
 def restore_weights(antenna_handles, baseline_handles, weights_held):
     """ Restore a snapshot from hold_weights """
@@ -1112,6 +1134,43 @@ def update_baseline_handles_vlbi(store_handle, antenna_handles, baseline_handles
 
     return baseline_handles
 
+def assign_clock_links(antenna_handles, ref_antenna, stochastic_clock):
+    """ Leader/members of each group of --linked_clock antennas (links are transitive: A--B and B--C put A, B and C on
+        one clock): the reference leads when it is in the group, else the antenna listed first (--antenna_name order).
+        Members share the leader's stochastic clock (single_diff_tools: linked clocks) and keep a constant offset and
+        their global clock polynomials """
+    names = [antenna_handle.antenna_name for antenna_handle in antenna_handles]
+    for antenna_handle in antenna_handles:
+        antenna_handle.clock_leader = None
+        antenna_handle.clock_leader_ref = False
+    groups = [] # sets of linked antenna names
+    for antenna_handle in antenna_handles:
+        for other in antenna_handle.linked_clocks:
+            if other not in names:
+                raise ValueError(f'--linked_clock: {other} is not one of the antennas')
+            touching = [group for group in groups if antenna_handle.antenna_name in group or other in group]
+            merged = {antenna_handle.antenna_name, other}.union(*touching)
+            groups = [group for group in groups if group not in touching] + [merged]
+    if not stochastic_clock:
+        if groups:
+            print('Clock links have no effect without --stochastic_clock')
+        return
+    for group in groups:
+        leader = ref_antenna if ref_antenna in group else min(group, key=names.index)
+        leader_handle = antenna_handles[names.index(leader)]
+        for member in sorted(group - {leader}, key=names.index):
+            member_handle = antenna_handles[names.index(member)]
+            member_handle.clock_leader = leader_handle
+            member_handle.clock_leader_ref = leader == ref_antenna
+            print(f'Clock link: {member} shares the stochastic clock of {leader} (own offset and global polynomial)')
+
+def initial_clock_offset(antenna_handle):
+    """ Initial stochastic clock value: the bulk clock, or for a linked member its offset from the leader's """
+    leader = clock_leader(antenna_handle)
+    if leader is None or antenna_handle.clock_leader_ref:
+        return antenna_handle.bulk_clock
+    return antenna_handle.bulk_clock - leader.bulk_clock
+
 def assign_trop_estimation(antenna_handles, store_handle, ref_antenna):
     """ Decide which antennas carry zenith wet delay states.
         Absolute mode (some antenna >= MIN_ABS_TROP_DIST from the reference): every antenna, reference included,
@@ -1278,6 +1337,8 @@ def find_clock_trop_params(sol_type, antenna_handles, store_handle, trop_poly_le
             if ref_antenna == antenna_handle.antenna_name:
                 ref_handle = antenna_handle
 
+    if store_handle.stochastic_clock:
+        merge_linked_clock_times(antenna_handles) # leaders carry their linked members' clock epochs
     assign_trop_estimation(antenna_handles, store_handle, ref_antenna)
     if store_handle.estimate_trop and store_handle.stochastic_trop:
         merge_site_trop_times(antenna_handles)
@@ -1298,7 +1359,7 @@ def find_clock_trop_params(sol_type, antenna_handles, store_handle, trop_poly_le
             if store_handle.stochastic_clock is False and clock_poly_length >0:
                 nclock = 1+int(np.ceil(exp_length/clock_poly_length)) # number of piecewise-linear intervals
             elif store_handle.stochastic_clock:
-                nclock = len(antenna_handle.clock_times)
+                nclock = num_clock_states(antenna_handle, 0, len(antenna_handle.clock_times)) # linked member: offset
             else:
                 # only global clock model
                 nclock = 1
@@ -1516,7 +1577,9 @@ def lstsq_estimation(sol_type, plot_intermediate_results, ref_antenna, store_han
         for antenna_handle in antenna_handles:
             antenna_handle.clock_times = antenna_handle.times_gps
             antenna_handle.phase_clock_times = antenna_handle.times_gps
-            n_clock_tot += len(antenna_handle.clock_times)
+        merge_linked_clock_times(antenna_handles)
+        for antenna_handle in antenna_handles:
+            n_clock_tot += num_clock_states(antenna_handle, 0, len(antenna_handle.clock_times))
 
     # set up first rxpos series
     for antenna_handle in antenna_handles:
@@ -1573,7 +1636,7 @@ def lstsq_estimation(sol_type, plot_intermediate_results, ref_antenna, store_han
             if store_handle.stochastic_clock is False and clock_poly_length > 0:
                 nclock = 1+int(np.ceil(exp_length/clock_poly_length)) # number of piecewise-linear intervals
             elif store_handle.stochastic_clock:
-                nclock = len(antenna_handle.clock_times)
+                nclock = num_clock_states(antenna_handle, 0, len(antenna_handle.clock_times)) # linked member: offset
             else:
                 nclock = 1
             if store_handle.global_linear_clock:
@@ -1586,7 +1649,7 @@ def lstsq_estimation(sol_type, plot_intermediate_results, ref_antenna, store_han
                 idx_start = 0
             rxpos = antenna_handle.ref_pos
             state[count*3:count*3+3] = rxpos
-            state[n_rxpos+n_clock_loop+idx_start] = antenna_handle.bulk_clock
+            state[n_rxpos+n_clock_loop+idx_start] = initial_clock_offset(antenna_handle)
 
             if store_handle.stochastic_clock is False:
                 antenna_handle.hold_range_clock_params(slice(n_clock_loop,n_clock_loop + nclock), antenna_handle.times_gps)
@@ -1681,7 +1744,7 @@ def lstsq_estimation(sol_type, plot_intermediate_results, ref_antenna, store_han
                 if store_handle.stochastic_clock is False and clock_poly_length > 0:
                     nclock = 1+int(np.ceil(exp_length/clock_poly_length)) # number of piecewise-linear intervals
                 elif store_handle.stochastic_clock:
-                    nclock = len(antenna_handle.clock_times)
+                    nclock = num_clock_states(antenna_handle, 0, len(antenna_handle.clock_times)) # linked member: offset
                 else:
                     nclock = 1
                 if store_handle.global_linear_clock:
@@ -1696,9 +1759,9 @@ def lstsq_estimation(sol_type, plot_intermediate_results, ref_antenna, store_han
                 state[count*3:count*3+3] = rxpos
                 #state[n_rxpos+n_clock_loop+idx_start] = antenna_handle.bulk_clock
                 if store_handle.stochastic_clock:
-                    state[n_rxpos+n_clock_loop+idx_start:n_rxpos+n_clock_loop+nclock] += antenna_handle.bulk_clock
+                    state[n_rxpos+n_clock_loop+idx_start:n_rxpos+n_clock_loop+nclock] += initial_clock_offset(antenna_handle)
                 else:
-                    state[n_rxpos+n_clock_loop+idx_start] = antenna_handle.bulk_clock
+                    state[n_rxpos+n_clock_loop+idx_start] = initial_clock_offset(antenna_handle)
                 antenna_handle.hold_range_clock_params(slice(n_clock_loop,n_clock_loop + nclock), antenna_handle.clock_times)
                 n_clock_loop += nclock
                 count += 1 
@@ -1929,7 +1992,7 @@ def lstsq_estimation(sol_type, plot_intermediate_results, ref_antenna, store_han
                 antenna_handle.hold_grdel_clock(antenna_handle.clock_samples, antenna_handle.clock_times, getattr(store_handle, 'grdel_clock_apriori', False))
                 continue
             clock_state_ant = clock_states_grdel[antenna_handle.range_clock_idxs]
-            clock_fcn = clock_state_ant[idx_start_clk:].copy()
+            clock_fcn = np.array(linked_stochastic_clock(antenna_handle, clock_state_ant[idx_start_clk:], clock_states_grdel, idx_start_clk), dtype=float)
             if idx_start_clk > 0:
                 clock_fcn = clock_fcn + sample_global_poly_at_interval(
                         clock_state_ant[:idx_start_clk], antenna_handle.clock_times,
@@ -2028,7 +2091,7 @@ def lstsq_estimation(sol_type, plot_intermediate_results, ref_antenna, store_han
                 if store_handle.stochastic_clock is False and clock_poly_length > 0:
                     clock_samples += sample_poly_at_interval(clock_state_ant, clock_poly_length, times_gps)
                 elif store_handle.stochastic_clock:
-                    clock_samples += clock_state_ant
+                    clock_samples += linked_stochastic_clock(antenna_handle, clock_state_ant, clock_state, idx_start)
                 # the PPP clock is not part of the state: add it as calc_residuals does, or the phase model used to
                 # initialize the ambiguities (define_amb_state_gnss) is off by the whole PPP clock
                 clock_samples = clock_samples + antenna_handle.ppp_clock_at(
@@ -2480,6 +2543,14 @@ def lstsq_estimation(sol_type, plot_intermediate_results, ref_antenna, store_han
     ls_phfixed_phaseonly_first = least_squares(calc_residuals, state_phfinal, jac=jac, method='trf',\
             max_nfev=100, bounds=bounds, verbose=2, x_scale = 'jac', xtol=1e-15,\
             args=ls_args)
+    if store_handle.stochastic_clock:
+        # one-cycle clock steps -> integer ambiguities (integer_amb changed in place), before the clock PSDs are estimated
+        state_unwrapped, n_steps = unwrap_clock_cycles(store_handle, ls_phfixed_phaseonly_first.x, ls_args, calc_residuals, bounds)
+        if n_steps > 0:
+            print('Re-executing initial phase-only fixed ambiguity solution with the clock cycles unwrapped:', flush=True)
+            ls_phfixed_phaseonly_first = least_squares(calc_residuals, state_unwrapped, jac=jac, method='trf',\
+                    max_nfev=100, bounds=bounds, verbose=2, x_scale = 'jac', xtol=1e-15,\
+                    args=ls_args)
 
     if covariance_kernel_phase is None:
         print('running iterative weight adjustment')
@@ -2997,6 +3068,12 @@ if __name__ == '__main__':
             args.global_quadratic_clock, args.estimate_disb, args.estimate_phase_disb)
     store_handle.grdel_clock_apriori = args.grdel_clock_apriori
     store_handle.mw_widelane = not args.no_mw_widelane
+    store_handle.antenna_covariance = args.antenna_covariance
+    store_handle.antenna_cov_snr_scale = args.antenna_cov_snr_scale
+    if args.antenna_covariance and (args.load_covariance_kernel_range is not None or args.load_covariance_kernel_phase is not None):
+        raise ValueError('--antenna_covariance cannot be combined with covariance kernels')
+    if args.antenna_cov_snr_scale and not args.antenna_covariance:
+        raise ValueError('--antenna_cov_snr_scale requires --antenna_covariance')
     if args.trop_poly_length > 0:
         store_handle.estimate_trop = True
 
@@ -3140,7 +3217,6 @@ if __name__ == '__main__':
             antenna_handle.save_offset(antenna_offset)
 
         if len(args.linked_clocks)>0:
-            # currently a stub
             for clock_link in args.linked_clocks:
                 ant_args = clock_link.split('--')
                 if antenna_name in ant_args:
@@ -3202,8 +3278,12 @@ if __name__ == '__main__':
         if antenna_name in ppp_clock_antennas:
             idx_clock = [i for i, val in enumerate(ppp_clock_antennas) if val == antenna_name][0]
             antenna_handle.load_ppp_clock(ppp_clock_files[idx_clock])
-        if antenna_handle.ppp_clock_active: antenna_handle.interp_ppp_clock()
+        if antenna_handle.ppp_clock_active: antenna_handle.interp_ppp_clock([],True)
         antenna_handles.append(antenna_handle)
+
+    assign_clock_links(antenna_handles, args.ref_antenna, args.stochastic_clock)
+    if args.grdel_clock_apriori and any(clock_leader(antenna_handle) is not None for antenna_handle in antenna_handles):
+        raise ValueError('--linked_clock cannot be combined with --grdel_clock_apriori')
 
     # build the IONEX ionosphere store
     # build the OBX satellite attitude store

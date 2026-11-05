@@ -45,6 +45,8 @@ from scipy.stats import median_abs_deviation as mad
 from scipy.spatial.transform import Rotation as rot
 from scipy.spatial.transform import Slerp
 from scipy.linalg import pinv, solve_triangular
+from scipy.linalg import qr as scipy_qr
+import scipy.sparse as scipy_sparse
 import scipy.constants as const
 from copy import deepcopy
 import argparse
@@ -253,6 +255,209 @@ def share_site_troposphere(antenna_handles):
             handle.trop_times = owner.trop_times
         if hasattr(owner, 'trop_samples'):
             handle.trop_samples = owner.trop_samples
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Linked clocks (--linked_clock A--B): antennas fed by the same frequency standard share one stochastic clock. The
+# leader (the reference if it is in the pair) carries the stochastic clock samples, on the union of both antennas'
+# epochs; the member's clock block is only [global polynomial coefficients, offset], and its clock at its epochs is
+#       global polynomial + offset + leader's stochastic samples at those epochs (zero for a reference leader)
+# The member has no clock process rows of its own.
+# ---------------------------------------------------------------------------------------------------------------------
+def clock_leader(antenna_handle):
+    """ Antenna whose stochastic clock this antenna shares (--linked_clock), or None """
+    return getattr(antenna_handle, 'clock_leader', None)
+
+def clock_members(antenna_handles, antenna_handle):
+    """ Antennas that share antenna_handle's stochastic clock """
+    return [handle for handle in antenna_handles if clock_leader(handle) is antenna_handle]
+
+def linked_clock_epoch_indices(antenna_handle, phase=False):
+    """ Index of each of a member's (phase) clock epochs in its leader's (which hold their union) """
+    leader = clock_leader(antenna_handle)
+    times = np.asarray(antenna_handle.phase_clock_times if phase else antenna_handle.clock_times)
+    leader_times = np.asarray(leader.phase_clock_times if phase else leader.clock_times)
+    idxs = np.clip(np.searchsorted(leader_times, times), 0, max(len(leader_times) - 1, 0))
+    if len(times) > 0 and (len(leader_times) == 0 or np.any(leader_times[idxs] != times)):
+        raise ValueError(f'linked clock: epochs of {antenna_handle.antenna_name} missing from {leader.antenna_name}')
+    return idxs
+
+def linked_stochastic_clock(antenna_handle, stochastic_state, clock_states, idx_start, phase=False):
+    """ Stochastic part of an antenna's clock at its epochs: its own samples, or for a linked member its offset plus
+        the leader's samples (clock_states: the full (phase) clock block of the state) """
+    leader = clock_leader(antenna_handle)
+    if leader is None:
+        return stochastic_state
+    clock = np.full(len(antenna_handle.phase_clock_times if phase else antenna_handle.clock_times), float(stochastic_state[0]))
+    if not getattr(antenna_handle, 'clock_leader_ref', False):
+        leader_state = clock_states[leader.phase_clock_idxs if phase else leader.range_clock_idxs][idx_start:]
+        clock += leader_state[linked_clock_epoch_indices(antenna_handle, phase)]
+    return clock
+
+def linked_clock_partials(antenna_handle, partials, own_cols, leader_cols, idx_start, phase=False):
+    """ (columns, partials) to add to the full Jacobian for an antenna's clock: partials are w.r.t. its global
+        coefficients and one sample per clock epoch; a member's per-epoch partials go to its offset (summed) and to
+        the leader's samples at its epochs (leader_cols: the leader's stochastic columns; None for the reference) """
+    if clock_leader(antenna_handle) is None:
+        return own_cols, partials
+    per_epoch = partials[:, idx_start:]
+    cols = [np.asarray(own_cols[:idx_start + 1])]
+    vals = [partials[:, :idx_start], per_epoch.sum(axis=1, keepdims=True)]
+    if leader_cols is not None and not getattr(antenna_handle, 'clock_leader_ref', False):
+        cols.append(np.asarray(leader_cols)[linked_clock_epoch_indices(antenna_handle, phase)])
+        vals.append(per_epoch)
+    return np.concatenate(cols), np.hstack(vals)
+
+def linked_clock_samples(store_handle, antenna_handle, clock_states, idx_start, phase=False):
+    """ An antenna's (phase) clock at its clock epochs from the clock block of the state: global polynomial, stochastic
+        part (for a linked member: offset + leader's samples) and PPP clock """
+    times = antenna_handle.phase_clock_times if phase else antenna_handle.clock_times
+    block = clock_states[antenna_handle.phase_clock_idxs if phase else antenna_handle.range_clock_idxs]
+    samples = linked_stochastic_clock(antenna_handle, block[idx_start:], clock_states, idx_start, phase) + antenna_handle.ppp_clock_at(times)
+    if idx_start > 0:
+        samples = samples + sample_global_poly_at_interval(block[:idx_start], times, antenna_handle.times_gps[0], antenna_handle.times_gps[-1])
+    return samples
+
+def add_clock_partials(jacobian, rows, antenna_handle, partials, own_cols, leader_cols, idx_start, phase=False):
+    """ Add an antenna's clock partials to the full Jacobian rows (see linked_clock_partials) """
+    cols, vals = linked_clock_partials(antenna_handle, partials, own_cols, leader_cols, idx_start, phase)
+    jacobian[rows, cols] += vals
+
+def merge_linked_clock_times(antenna_handles):
+    """ Stochastic clock epochs of each (non-reference) leader: the union of its members' epochs; held samples are
+        interpolated onto them """
+    for leader in antenna_handles:
+        members = [member for member in clock_members(antenna_handles, leader) if not getattr(member, 'clock_leader_ref', False)]
+        for times_attr, samples_attr in (('clock_times', 'clock_samples'), ('phase_clock_times', 'phase_clock_samples')):
+            if len(members) == 0 or getattr(leader, times_attr, None) is None:
+                continue
+            old_times = np.asarray(getattr(leader, times_attr))
+            new_times = old_times
+            for member in members:
+                new_times = np.union1d(new_times, np.asarray(getattr(member, times_attr)))
+            samples = getattr(leader, samples_attr, None)
+            if samples is not None and np.ndim(samples) > 0 and len(samples) == len(old_times) and len(old_times) > 0:
+                old_sec = (old_times - old_times[0])/np.timedelta64(1, 's')
+                new_sec = (new_times - old_times[0])/np.timedelta64(1, 's')
+                setattr(leader, samples_attr, np.interp(new_sec, old_sec, np.asarray(samples, dtype=float)))
+            setattr(leader, times_attr, new_times)
+
+def num_clock_states(antenna_handle, idx_start, n_epochs):
+    """ Clock states of a non-reference antenna: global coefficients plus a sample per epoch, or plus one offset for a
+        linked member """
+    return idx_start + (1 if clock_leader(antenna_handle) is not None else n_epochs)
+
+CLOCK_CYCLE_TOL = 0.1 #unwrap_clock_cycles: a step of 1 +/- this many cycles between consecutive clock samples
+
+def amb_wavelength(store_handle, baseline_handle):
+    """ Wavelength the baseline's ambiguities are in (scalar or per observation) """
+    return baseline_handle.comb_wavelength if store_handle.iono_free else baseline_handle.wavelength
+
+def unwrap_clock_cycles(store_handle, state, ls_args, res_fcn, bounds=None):
+    """ Move one-cycle steps of the stochastic phase clocks into the fixed integer ambiguities (--unwrap_clock_cycles).
+
+        A step of +-lambda between consecutive samples u_k, u_k+1 of an antenna's clock, with a -+1 cycle shift of the
+        integers of every later arc on the baselines with one end on that clock, leaves the data residuals unchanged
+        when no arc spans the step. Only the clock process rows see the step, and the PSD estimation reads it as
+        clock noise. Steps with |du|/lambda within 1 +/- CLOCK_CYCLE_TOL and no spanning arc are removed from the
+        leader's samples (and so from its linked members' clocks); a step that an arc spans is constrained by the data
+        and left alone. The data rows of the residuals are checked to be unchanged, otherwise nothing is changed.
+
+        args:
+            state: phase-only fixed-ambiguity state
+            ls_args: its residual arguments, all ambiguities fixed (integer_amb = ls_args[20], changed in place)
+            res_fcn: calc_residuals
+            bounds: (low, high) of the state; a clock whose unwrapped samples leave them is left alone
+        returns:
+            state with the steps removed (a copy), number of steps removed
+    """
+    if store_handle.stochastic_clock is False or len(ls_args) != 21 or bool(ls_args[12]):
+        print('unwrap_clock_cycles: needs --stochastic_clock and all ambiguities fixed -- skipped')
+        return state, 0
+    ref_antenna, baselines, antenna_handles, baseline_handles = ls_args[0], ls_args[1], ls_args[3], ls_args[9]
+    phase_only, phase_clock_idxs, integer_amb = ls_args[11], ls_args[17], ls_args[20]
+    idx_start = 1 if store_handle.global_linear_clock else (2 if store_handle.global_quadratic_clock else 0)
+    amb_offsets = np.cumsum([0] + [baseline_handle.n_amb_state for baseline_handle in baseline_handles])
+    phase_clock_cols = np.arange(len(state))[phase_clock_idxs]
+    state_new = np.array(state, dtype=float)
+    amb_new = np.array(integer_amb, dtype=float)
+    n_removed = 0
+    for leader in antenna_handles:
+        if leader.antenna_name == ref_antenna or clock_leader(leader) is not None or leader.ppp_clock_active:
+            continue
+        group = {leader.antenna_name} | {member.antenna_name for member in clock_members(antenna_handles, leader)
+                                         if not getattr(member, 'clock_leader_ref', False)}
+        # arcs with data on the baselines with one end on this clock: (ambiguity index, sign of the clock in the
+        # baseline clock difference, data epochs)
+        arcs = []
+        wavelengths = []
+        for jdx, baseline in enumerate(baselines):
+            clock_sign = int(antenna_handles[baseline[1]].antenna_name in group) - int(antenna_handles[baseline[0]].antenna_name in group)
+            if clock_sign == 0:
+                continue
+            baseline_handle = baseline_handles[jdx]
+            for arc_idx, slip_slice in enumerate(baseline_handle.slip_slices_arr):
+                used = np.intersect1d(slip_slice, baseline_handle.phase_data_idxs)
+                if len(used) == 0:
+                    continue
+                arcs.append((amb_offsets[jdx] + arc_idx, clock_sign, np.asarray(baseline_handle.datetime_array)[used]))
+                wavelengths.append(np.atleast_1d(wavelength_at(amb_wavelength(store_handle, baseline_handle), used)))
+        if len(arcs) == 0:
+            continue
+        wavelengths = np.concatenate(wavelengths)
+        wavelength = np.median(wavelengths)
+        if np.max(np.abs(wavelengths - wavelength)) > 1e-9*wavelength:
+            print(f'unwrap_clock_cycles: {leader.antenna_name} arcs have more than one wavelength -- skipped')
+            continue
+
+        times = np.asarray(leader.phase_clock_times)
+        cols = phase_clock_cols[leader.phase_clock_idxs][idx_start:]
+        process = state_new[cols].copy() # what the clock process rows difference
+        if getattr(leader, 'grdel_clock_active', False):
+            leader.interp_grdel_clock(leader.phase_clock_times)
+            process -= leader.grdel_clock_samples
+        step_cycles = np.diff(process)/wavelength
+        cumulative = np.zeros(len(times))
+        n_leader = 0
+        for step_idx in np.where(np.abs(np.abs(step_cycles) - 1) <= CLOCK_CYCLE_TOL)[0]:
+            step_time = times[step_idx + 1]
+            spanning = sum(1 for _, _, arc_times in arcs if arc_times[0] < step_time <= arc_times[-1])
+            label = f'{leader.antenna_name} clock step {step_cycles[step_idx]:+.3f} cycles {times[step_idx]} -> {step_time}'
+            if spanning > 0:
+                print(f'{label}: spanned by {spanning} arc(s), kept')
+                continue
+            cumulative[step_idx + 1:] += np.round(step_cycles[step_idx])
+            n_leader += 1
+            print(f'{label}: to be moved to the ambiguities')
+        if n_leader == 0:
+            continue
+        unwrapped = state_new[cols] - wavelength*cumulative
+        if bounds is not None and (np.any(unwrapped < bounds[0][cols]) or np.any(unwrapped > bounds[1][cols])):
+            print(f'unwrap_clock_cycles: {leader.antenna_name} unwrapped clock outside its bounds -- left alone')
+            continue
+        state_new[cols] = unwrapped
+        n_removed += n_leader
+        for amb_idx, clock_sign, arc_times in arcs:
+            epoch_idx = max(np.searchsorted(times, arc_times[0], side='right') - 1, 0)
+            amb_new[amb_idx] -= clock_sign*cumulative[epoch_idx]
+
+    if n_removed == 0:
+        return state, 0
+    n_data = sum(len(baseline_handle.phase_data_idxs) + (0 if phase_only else len(baseline_handle.range_data_idxs))
+                 for baseline_handle in baseline_handles)
+    amb_old = np.array(integer_amb, copy=True)
+    residuals_old = np.asarray(res_fcn(state, *ls_args))
+    integer_amb[:] = amb_new
+    residuals_new = np.asarray(res_fcn(state_new, *ls_args))
+    data_change = np.max(np.abs(residuals_new[:n_data] - residuals_old[:n_data]))
+    if data_change > 1e-2:
+        integer_amb[:] = amb_old
+        res_fcn(state, *ls_args) # restore the handles
+        print(f'unwrap_clock_cycles: data residuals changed by up to {data_change:.3g} sigma -- steps not removed')
+        return state, 0
+    print(f'unwrap_clock_cycles: {n_removed} step(s) removed; data residuals unchanged (max {data_change:.1e} sigma), '
+          f'clock/ZWD row cost {0.5*residuals_old[n_data:]@residuals_old[n_data:]:.4g} -> '
+          f'{0.5*residuals_new[n_data:]@residuals_new[n_data:]:.4g}')
+    return state_new, n_removed
 
 def transmitter_antex_code(frequency_hz, system_char):
     """ ANTEX frequency code for a transmitting satellite antenna.
@@ -5600,14 +5805,14 @@ class AntennaInfo(object):
             return np.zeros(len(times))
         return self.clock_interp_fcn(self.ppp_sec_of_day(times))
 
-    def interp_ppp_clock(self, times = []):
+    def interp_ppp_clock(self, times = [], plot=False):
         """ Interpolate the PPP clock function  """
         # correct reference data for PPP clock
         if len(times) == 0:
             times = self.times_gps
         sec_of_day_data = self.ppp_sec_of_day(times)
         self.ppp_clock_samples = self.clock_interp_fcn(sec_of_day_data)
-        if False: # diagnostic plot -- slow, this is called at every residual evaluation
+        if plot:
             plt.figure(dpi=300)
             plt.plot(sec_of_day_data, self.ppp_clock_samples)
             plt.xlabel('sec of day')
@@ -6293,22 +6498,26 @@ class GNSSTKStores(object):
 
             if phase_only is False:
                 clk_times64 = antenna_handle.clock_times.astype('datetime64[ns]').view('int64')
-                idx_clk     = np.searchsorted(times64, clk_times64)
-                idx_clk = idx_clk[idx_clk<len(ns_offset)] # investigate
+                # clock epochs may include epochs without this antenna's data (a linked clock leader carries its
+                # members' epochs): use the samples at its own epochs only
+                idx_clk     = np.minimum(np.searchsorted(times64, clk_times64), max(len(times64) - 1, 0))
+                own_clk     = times64[idx_clk] == clk_times64 if len(times64) > 0 else np.zeros(len(clk_times64), dtype=bool)
+                idx_clk     = idx_clk[own_clk]
                 ns_offset[idx_clk] = -np.rint(
-                        clock_samples * 1e9 / const.c
+                        clock_samples[own_clk] * 1e9 / const.c
                     ).astype(np.int64)
-                full_offset[idx_clk] = -clock_samples/const.c
+                full_offset[idx_clk] = -clock_samples[own_clk]/const.c
 
             # phase last so it overwrites the range values where present
             if phase is True and len(phase_clock_samples)>0:
                 ph_times64  = antenna_handle.phase_clock_times.astype('datetime64[ns]').view('int64')
-                idx_ph      = np.searchsorted(times64, ph_times64)
-                idx_ph = idx_ph[idx_ph<len(ns_offset)] # investigate
+                idx_ph      = np.minimum(np.searchsorted(times64, ph_times64), max(len(times64) - 1, 0))
+                own_ph      = times64[idx_ph] == ph_times64 if len(times64) > 0 else np.zeros(len(ph_times64), dtype=bool)
+                idx_ph      = idx_ph[own_ph]
                 ns_offset[idx_ph] = -np.rint(
-                    phase_clock_samples * 1e9 / const.c
+                    phase_clock_samples[own_ph] * 1e9 / const.c
                 ).astype(np.int64)
-                full_offset[idx_ph] = -phase_clock_samples/const.c
+                full_offset[idx_ph] = -phase_clock_samples[own_ph]/const.c
         else:
             # --- dense, arrays already match times_gps ----------------------
             if phase and len(phase_clock_samples)>0:
@@ -12129,6 +12338,10 @@ def get_snr_variance(store_handle, antenna1_handle, antenna2_handle, obs_type, u
 
 def get_obs_weights(store_handle, antenna1_handle, antenna2_handle, obs_type='range', use_idxs=[], baseline_handle=None, use_phase_weights=False):
     """ Calculate weights for observations """
+    if antenna_covariance_active(store_handle):
+        # marginal (diagonal) weights; calc_residuals/calc_jac whiten with the full antenna-based covariance
+        return np.diag(1/np.sqrt(antenna_marginal_variance(store_handle, antenna1_handle, antenna2_handle, obs_type, use_idxs, \
+                                                           baseline_handle, use_phase_weights)))
     if baseline_handle is not None:
         times_gps, ant1_idxs, _ = np.intersect1d(antenna1_handle.times_gps, baseline_handle.datetime_array[use_idxs], return_indices=True)
         _, ant2_idxs, _ = np.intersect1d(antenna2_handle.times_gps, baseline_handle.datetime_array[use_idxs], return_indices=True)
@@ -12276,7 +12489,7 @@ def iterative_remove_outliers(store_handle, ls_sol, bounds, ls_args, res_fcn, ja
     antenna_handles = ls_args[3]
     baseline_handles = ls_args[9]
     while np.abs(delta_samples)>0:
-        residuals = ls_sol.fun
+        residuals = antenna_cov_marginal_residuals(store_handle, ls_args, ls_sol.fun)
         len_pts = 0
         num_samples = 0
         delta_range = 0
@@ -12593,6 +12806,18 @@ def adjust_stoch_params(store_handle, antenna_handles, baseline_handles, baselin
             else:
                 continue
 
+        if store_handle.stochastic_clock is True:
+            # antennas sharing this antenna's stochastic clock (--linked_clock) add their epochs to its clock epochs
+            for member in clock_members(antenna_handles, antenna_handle):
+                member_idx = antenna_handles.index(member)
+                for jdx, baseline in enumerate(baselines):
+                    if member_idx in baseline:
+                        baseline_handle = baseline_handles[jdx]
+                        if phase_only is False:
+                            times_full_range = np.union1d(times_full_range, baseline_handle.datetime_array[baseline_handle.range_data_idxs])
+                        if phase is True:
+                            times_full_phase = np.union1d(times_full_phase, baseline_handle.datetime_array[baseline_handle.phase_data_idxs])
+
         if store_handle.stochastic_trop is True and owns_trop_states(antenna_handle):
             # antennas sharing this antenna's ZWD (same site) add their observation epochs to its ZWD epochs
             for member_idx in trop_site_members(antenna_handles, antenna_handle):
@@ -12652,10 +12877,13 @@ def adjust_stoch_params(store_handle, antenna_handles, baseline_handles, baselin
 
             if store_handle.stochastic_clock is True:
                 if phase_only is False:
-                    clock_state_adj = np.zeros(len(times_full_range)+idx_start)
-                    clock_state_adj[idx_start:] = sample_stoch_params_at_times(clock_state_ant[idx_start:], antenna_handle.clock_times, times_full_range)
-                    if idx_start>0:
-                        clock_state_adj[:idx_start] = clock_state_ant[:idx_start]
+                    if clock_leader(antenna_handle) is not None:
+                        clock_state_adj = clock_state_ant # linked member: [global, offset]; leader's samples added below
+                    else:
+                        clock_state_adj = np.zeros(len(times_full_range)+idx_start)
+                        clock_state_adj[idx_start:] = sample_stoch_params_at_times(clock_state_ant[idx_start:], antenna_handle.clock_times, times_full_range)
+                        if idx_start>0:
+                            clock_state_adj[:idx_start] = clock_state_ant[:idx_start]
                     clock_state_ant = clock_state_adj
                     clock_samples += clock_state_adj[idx_start:] 
                     clock_samples += antenna_handle.ppp_clock_at(times_full_range)
@@ -12666,7 +12894,9 @@ def adjust_stoch_params(store_handle, antenna_handles, baseline_handles, baselin
 
                 if phase is True:
                     # do the same for phase clock state
-                    if phase_clock_idxs is not None:
+                    if phase_clock_idxs is not None and clock_leader(antenna_handle) is not None:
+                        pass # linked member: [global, offset] kept; leader's samples added below
+                    elif phase_clock_idxs is not None:
                         # interpolate w/ interp1d to get new phase clock state
                         phase_clock_state_adj = np.zeros(len(times_full_phase)+idx_start)
                         phase_clock_state_adj[idx_start:] = sample_stoch_params_at_times(phase_clock_state_ant[idx_start:], antenna_handle.phase_clock_times, times_full_phase)
@@ -12703,6 +12933,17 @@ def adjust_stoch_params(store_handle, antenna_handles, baseline_handles, baselin
                     phase_clock_state_new = np.append(phase_clock_state_new, phase_clock_state_ant)
             if store_handle.estimate_trop is True and owns_trop_states(antenna_handle):
                 trop_state_new = np.append(trop_state_new, trop_state_ant)
+
+    if store_handle.stochastic_clock is True:
+        # linked members' held clocks follow their leaders' re-sampled clocks
+        for antenna_handle in antenna_handles:
+            if clock_leader(antenna_handle) is None:
+                continue
+            if phase_only is False:
+                antenna_handle.hold_clock(linked_clock_samples(store_handle, antenna_handle, clock_state_new, idx_start))
+            if phase is True:
+                antenna_handle.hold_clock(linked_clock_samples(store_handle, antenna_handle, phase_clock_state_new, idx_start, True),
+                                          phase_delay=True)
      
     if store_handle.stochastic_clock is True and phase_only is False:
         state_expanded = np.append(pos_state, clock_state_new)
@@ -12987,9 +13228,12 @@ def set_bounds_phase_clock(bound_low, bound_high, clock_bound, store_handle, ant
         phase_times = np.array([], dtype=np.datetime64) 
         begin_date = np.datetime64('2200-01-01T00:00:00.0')
         end_date = np.datetime64('1900-01-01T00:00:00.0')
+        # a clock leader's epochs include its linked members' (merge_linked_clock_times)
+        clock_group = [idx] + [antenna_handles.index(member) for member in clock_members(antenna_handles, antenna_handle)
+                               if not getattr(member, 'clock_leader_ref', False)]
         for jdx, baseline in enumerate(baselines):
             # get location of earliest phase datapoint
-            if idx in baseline:
+            if any(group_idx in baseline for group_idx in clock_group):
                 baseline_handle = baseline_handles[jdx]
                 begin_date = min(begin_date, baseline_handle.datetime_array[baseline_handle.phase_data_idxs[0]])
                 end_date = max(end_date, baseline_handle.datetime_array[baseline_handle.phase_data_idxs[-1]])
@@ -12999,6 +13243,11 @@ def set_bounds_phase_clock(bound_low, bound_high, clock_bound, store_handle, ant
 
         if ref_antenna == antenna_handle.antenna_name: 
             continue
+        elif clock_leader(antenna_handle) is not None:
+            # linked member: [global, offset], unbounded (its stochastic clock is the leader's)
+            n_member = len(phase_clock_states[antenna_handle.phase_clock_idxs])
+            bound_low_pc = np.append(bound_low_pc, -np.inf*np.ones(n_member))
+            bound_high_pc = np.append(bound_high_pc, np.inf*np.ones(n_member))
         else:
             #phase_exp_length = (end_date-begin_date)/np.timedelta64(1, 's')
             #nclock_phase_antenna = int(np.ceil(phase_exp_length/clock_poly_length)) # number of piecewise-linear intervals
@@ -13115,9 +13364,19 @@ def baseline_clock_fcn_sigma(cov_matrix_full, clock_idxs, antenna1_handle, anten
                 global_poly_jac_at_epoch(np.zeros(num_global), epoch,
                                          times_gps[0], times_gps[-1])
                 for epoch in eval_times])
-            design = np.hstack([global_partials, sample_matrix])
         else:
-            design = sample_matrix
+            global_partials = np.zeros((len(eval_times), 0))
+        leader = clock_leader(antenna_handle)
+        if leader is not None:
+            # linked member: [global, offset] plus the leader's samples at its epochs
+            state_columns.append(clock_columns[antenna_columns])
+            design_blocks.append(sign * np.hstack([global_partials, sample_matrix.sum(axis=1, keepdims=True)]))
+            if not antenna_handle.clock_leader_ref:
+                leader_columns = clock_columns[leader.phase_clock_idxs if phase else leader.range_clock_idxs][num_global:]
+                state_columns.append(leader_columns[linked_clock_epoch_indices(antenna_handle, phase)])
+                design_blocks.append(sign * sample_matrix)
+            continue
+        design = np.hstack([global_partials, sample_matrix])
 
         state_columns.append(clock_columns[antenna_columns])
         design_blocks.append(sign * design)
@@ -13153,7 +13412,8 @@ def analyze_ls_solution(sol_type, plot_results, ref_antenna, clock_idxs, trop_id
     clock_states = final_state[clock_idxs]
     trop_states = final_state[trop_idxs]
 
-    residuals = ls_sol.fun  # Residuals of the solution
+    residuals = antenna_cov_marginal(store_handle, antenna_handles, baselines, baseline_handles, phase_delay, phase_only, \
+                                     use_phase_weights, ls_sol.fun) # residuals of the solution
     if phase_delay is True:
         if phase_only is False:
             residuals_range, residuals_phase = get_residuals(residuals, baseline_handles, phase_delay, phase_only) 
@@ -13469,8 +13729,7 @@ def analyze_ls_solution(sol_type, plot_results, ref_antenna, clock_idxs, trop_id
                             baseline_handle.range_data_idxs, baseline_handle)
                 residuals_range = np.linalg.inv(range_weight_mat)@residuals_range
                 if baseline_handle.use_cov_kernel_range is False:
-                    print(f'q_range (m): {baseline_handle.q_range:.5f}')
-                    print(f'q_range (ps): {baseline_handle.q_range/const.c*1e12:.5f}')
+                    print_baseline_q(store_handle, baseline_handle, antenna1_handle, antenna2_handle, 'range')
             dt_range = to_datetime(times_gps)
             times_clock = times_gps
             dc_range = diff_clock
@@ -13495,12 +13754,10 @@ def analyze_ls_solution(sol_type, plot_results, ref_antenna, clock_idxs, trop_id
             dc_range = diff_clock[baseline_handle.range_data_idxs]
             times_clock = times_gps[baseline_handle.range_data_idxs]
             if baseline_handle.use_cov_kernel_range is False:
-                print(f'q_range (m): {baseline_handle.q_range:.5f}')
-                print(f'q_range (ps): {baseline_handle.q_range/const.c*1e12:.5f}')
+                print_baseline_q(store_handle, baseline_handle, antenna1_handle, antenna2_handle, 'range')
 
             if baseline_handle.use_cov_kernel_phase is False:
-                print(f'q_phase (m): {baseline_handle.q_phase:.5f}')
-                print(f'q_phase (ps): {baseline_handle.q_phase/const.c*1e12:.5f}')
+                print_baseline_q(store_handle, baseline_handle, antenna1_handle, antenna2_handle, 'phase')
         else:
             baseline_handle = baseline_handles[jdx]
             times_gps = baseline_handle.datetime_array
@@ -13512,8 +13769,7 @@ def analyze_ls_solution(sol_type, plot_results, ref_antenna, clock_idxs, trop_id
             phase_weight_mat = get_obs_weights(store_handle, antenna1_handle, antenna2_handle, 'phase', baseline_handle.phase_data_idxs, baseline_handle, use_phase_weights)
             residuals_phase = np.linalg.inv(phase_weight_mat)@residuals_phase
             if baseline_handle.use_cov_kernel_phase is False:
-                print(f'q_phase (m): {baseline_handle.q_phase:.5f}')
-                print(f'q_phase (ps): {baseline_handle.q_phase/const.c*1e12:.5f}')
+                print_baseline_q(store_handle, baseline_handle, antenna1_handle, antenna2_handle, 'phase')
         
         time_deltas_full = (times_gps - times_gps[0])/np.timedelta64(1, 's')
         full_time_hr = np.round(time_deltas_full[-1]/3600) 
@@ -15462,7 +15718,7 @@ def plot_time_units(ref_antenna, ls_sol_grdel, ls_sol_phdel, sol_type, store_han
                 phase_clock_state_ant1 = phase_clock_state_ant1[idx_start:]
             else:
                 if store_handle.stochastic_clock is True:
-                    phase_clock_samples_ant1 = np.zeros(len(phase_clock_state_ant1))
+                    phase_clock_samples_ant1 = np.zeros(len(antenna1_handle.phase_clock_times))
                 else:
                     clock_samples_ant1 = np.zeros(len(antenna1_handle.times_gps))
                     phase_clock_samples_ant1 = np.zeros(len(antenna1_handle.times_gps))
@@ -15472,7 +15728,7 @@ def plot_time_units(ref_antenna, ls_sol_grdel, ls_sol_phdel, sol_type, store_han
                 phase_clock_samples_ant1 += sample_poly_at_interval(phase_clock_state_ant1,\
                                 clock_poly_length, antenna1_handle.times_gps, antenna1_handle.phase_clock_start)
             elif store_handle.stochastic_clock is True:
-                phase_clock_samples_ant1 += phase_clock_state_ant1
+                phase_clock_samples_ant1 += linked_stochastic_clock(antenna1_handle, phase_clock_state_ant1, phase_clock_state, idx_start, True)
             else:
                 # only global clock model
                 clock_samples_ant1 += clock_state_ant1[0] # bulk offset
@@ -15498,7 +15754,7 @@ def plot_time_units(ref_antenna, ls_sol_grdel, ls_sol_phdel, sol_type, store_han
                 phase_clock_state_ant2 = phase_clock_state_ant2[idx_start:]
             else:
                 if store_handle.stochastic_clock is True:
-                    phase_clock_samples_ant2 = np.zeros(len(phase_clock_state_ant2))
+                    phase_clock_samples_ant2 = np.zeros(len(antenna2_handle.phase_clock_times))
                 else:
                     clock_samples_ant2 = np.zeros(len(antenna2_handle.times_gps))
                     phase_clock_samples_ant2 = np.zeros(len(antenna2_handle.times_gps))
@@ -15508,7 +15764,7 @@ def plot_time_units(ref_antenna, ls_sol_grdel, ls_sol_phdel, sol_type, store_han
                 phase_clock_samples_ant2 = sample_poly_at_interval(phase_clock_state_ant2,\
                                 clock_poly_length, antenna2_handle.times_gps, antenna2_handle.phase_clock_start)
             elif store_handle.stochastic_clock is True:
-                phase_clock_samples_ant2 = phase_clock_state_ant2
+                phase_clock_samples_ant2 += linked_stochastic_clock(antenna2_handle, phase_clock_state_ant2, phase_clock_state, idx_start, True)
             else:
                 clock_samples_ant2 += clock_state_ant2[0]
                 phase_clock_samples_ant2 += phase_clock_state_ant2[0]
@@ -16767,6 +17023,8 @@ def iterative_weight_adjust_ls_vce(
     observable="range",
     no_PSD=False,
 ):
+    if antenna_covariance_active(store_handle):
+        return iterative_weight_adjust_antenna_vce(store_handle, state_expanded, bounds, ls_args, res_fcn, jac, sol_type, observable, no_PSD)
     max_iter, tol_var = 5, 1e-4
     FIT_IRW = True
 
@@ -16799,7 +17057,7 @@ def iterative_weight_adjust_ls_vce(
         clock_ops = []
         if store_handle.stochastic_clock:
             for ant in antenna_handles:
-                if ant.antenna_name == ref_antenna:
+                if ant.antenna_name == ref_antenna or clock_leader(ant) is not None: # members: no clock rows
                     continue
                 clock_ops.append(clock_process_expansion(clock_process_operator(store_handle, ant, ref_handle, phase_delay)))
         fun_e, J_e = expand_clock_rows(ls_sol.fun, ls_sol.jac, n_data, clock_ops)
@@ -16973,7 +17231,7 @@ def iterative_weight_adjust_ls_vce(
             idx += 1
         if not no_PSD and store_handle.stochastic_clock:
             for ant in antenna_handles:
-                if ant.antenna_name == ref_antenna:
+                if ant.antenna_name == ref_antenna or clock_leader(ant) is not None: # members: no clock rows
                     continue
                 sig_hat[idx] = max(sig_hat[idx], 1e-2)
                 idx += 1
@@ -17007,7 +17265,7 @@ def iterative_weight_adjust_ls_vce(
 
         if not no_PSD and store_handle.stochastic_clock:
             for ant in antenna_handles:
-                if ant.antenna_name == ref_antenna:
+                if ant.antenna_name == ref_antenna or clock_leader(ant) is not None: # members: no clock rows
                     continue
                 print(f'for antenna {ant.antenna_name}:')
                 if observable == 'range':
@@ -17353,6 +17611,8 @@ def vh_operator(A):
 def iterative_weight_adjust(store_handle, state_expanded, bounds, ls_args, res_fcn, jac, sol_type, observable='range'):
     """Implement chi-squared fitting based on expectation value of residuals as shown at https://astrogeo.org/progs/psolve_20241125/doc/upwei_02.pdf.
     """
+    if antenna_covariance_active(store_handle):
+        return iterative_weight_adjust_antenna_vce(store_handle, state_expanded, bounds, ls_args, res_fcn, jac, sol_type, observable, no_PSD=True)
     max_iter = 5
     #tol_var = 1e-3
     tol_var = 1e-2
@@ -17492,6 +17752,8 @@ def iterative_weight_adjust_LS_VCE_full(store_handle, state_expanded, bounds, ls
        sigma^2_eta -- inter-satellite noise term (one draw from dist. for every satellite switch)
        sigma^2_epsilon -- intra-satellite noise term (random for every observation)
     """
+    if antenna_covariance_active(store_handle):
+        return iterative_weight_adjust_antenna_vce(store_handle, state_expanded, bounds, ls_args, res_fcn, jac, sol_type, observable, no_PSD=True)
     max_iter = 30
     tol_var = 1e-6
     n_iter = 0
@@ -17687,6 +17949,531 @@ def find_baselines_indices_for_triplet(baselines, triplet):
             baselines_indices_in_triplet.append(jdx)
     return baselines_indices_in_triplet
 
+# ---------------------------------------------------------------------------------------------------------------------
+# Antenna-based observation covariance (--antenna_covariance)
+#   Each antenna's observation noise is independent between antennas and epochs, with variance f_a (floor [m^2]),
+#   plus an SNR term: GNSS  s_a * sigma_C/N0,a(t)^2 per antenna (s_a: C/N0 scale of the antenna),
+#                     VLBI  s * sigma_fringe(row)^2 per baseline observation (the fringe fit's formal error, one scale
+#                           for all baselines) -- in correlated data the thermal noise is the baseline's own.
+#   Range and phase are separate. The SNR scales are estimated only with --antenna_cov_snr_scale, else held at 1.
+#   The single differences inherit the antenna part: an antenna on two baselines at the same epoch correlates them,
+#   Cov(A-B, A-C) = v_A. Rows only couple within an epoch, so the covariance is block diagonal in (observable, epoch)
+#   groups and is whitened group by group. get_obs_weights returns the marginal (diagonal) weights of this model, so
+#   calc_residuals/calc_jac keep their per-baseline weighting and convert it to the full whitening at the end.
+#   Phase rows weighted from the range before ambiguity fixing (get_obs_weights' use_phase_weights False case) use
+#   100 x the range model.
+# ---------------------------------------------------------------------------------------------------------------------
+ANTENNA_NOISE_TYPES = ('range', 'phase')
+ANTENNA_COV_COLLINEAR = 0.98 # |corr(scale, floor)| above which an antenna's C/N0 scale is held (C/N0 nearly constant)
+# a priori floors: half the baseline guesses q_range = 0.5 m, q_phase = 5 mm per antenna, so the starting single
+# difference variances match the per-baseline model's
+ANTENNA_FLOOR_APRIORI = {'range': 0.5**2/2, 'phase': 0.005**2/2}
+
+def antenna_covariance_active(store_handle):
+    """ Antenna-based observation covariance in use (--antenna_covariance) """
+    return bool(getattr(store_handle, 'antenna_covariance', False))
+
+def antenna_noise_params(antenna_handle, noise_type):
+    """ (C/N0 scale, floor variance [m^2]) of an antenna's range or phase noise (the scale is GNSS only) """
+    return float(getattr(antenna_handle, 'noise_scale_' + noise_type, 1.0)), \
+           float(getattr(antenna_handle, 'noise_floor_' + noise_type, ANTENNA_FLOOR_APRIORI[noise_type]))
+
+def fringe_noise_scale(store_handle, noise_type):
+    """ Scale of the VLBI fringe-fit formal variances (all baselines) """
+    return float(getattr(store_handle, 'noise_scale_' + noise_type, 1.0))
+
+def antenna_epoch_indices(antenna_handle, times):
+    """ Index of each time in the antenna's epochs (times_gps) """
+    times_gps = np.asarray(antenna_handle.times_gps)
+    order = np.argsort(times_gps, kind='stable')
+    pos = np.searchsorted(times_gps[order], np.asarray(times))
+    pos = np.clip(pos, 0, len(order)-1)
+    idxs = order[pos]
+    if np.any(times_gps[idxs] != np.asarray(times)):
+        raise ValueError(f'antenna covariance: epochs not observed at {antenna_handle.antenna_name}')
+    return idxs
+
+def antenna_row_kind(store_handle, obs_type, baseline_handle, use_phase_weights):
+    """ 0: range, 1: phase, 2: phase weighted as 100 x range (as get_obs_weights does before ambiguity fixing) """
+    if obs_type == 'range':
+        return 0
+    if store_handle.sol_type == 'VLBI':
+        return 2 if use_phase_weights is False else 1
+    if (baseline_handle is None or getattr(baseline_handle, 'pr_diff', None) is None) and use_phase_weights is False:
+        return 2
+    return 1
+
+def kind_noise_type(kind):
+    return 'phase' if kind == 1 else 'range'
+
+def antenna_end_variance(store_handle, antenna_handle, kind, epoch_idxs):
+    """ Antenna part v_a of the rows of one kind: floor, plus the C/N0 term for GNSS """
+    scale, floor = antenna_noise_params(antenna_handle, kind_noise_type(kind))
+    variance = np.full(len(epoch_idxs), floor)
+    if store_handle.sol_type == 'GNSS':
+        errors = antenna_handle.cp_errors if kind == 1 else antenna_handle.pr_errors
+        variance = variance + scale*np.asarray(errors)[epoch_idxs]**2
+    return 100*variance if kind == 2 else variance
+
+def fringe_row_variance(store_handle, baseline_handle, kind, data_idxs):
+    """ Baseline part of the rows of one kind: VLBI fringe-fit formal variance (scaled); zero for GNSS """
+    if store_handle.sol_type != 'VLBI':
+        return np.zeros(len(data_idxs))
+    errors = baseline_handle.phdel_err if kind == 1 else baseline_handle.grdel_err
+    variance = fringe_noise_scale(store_handle, kind_noise_type(kind))*np.asarray(errors)[data_idxs]**2
+    return 100*variance if kind == 2 else variance
+
+def baseline_row_times(antenna1_handle, antenna2_handle, use_idxs, baseline_handle):
+    """ Epochs of a baseline's rows, in get_obs_weights' order """
+    if baseline_handle is not None:
+        return np.asarray(baseline_handle.datetime_array)[use_idxs]
+    return np.intersect1d(antenna1_handle.times_gps, antenna2_handle.times_gps)
+
+def row_epochs(store_handle, antenna_handle, times):
+    """ Antenna epoch indices of the rows (GNSS: C/N0 lookup); unused for VLBI """
+    if store_handle.sol_type == 'GNSS':
+        return antenna_epoch_indices(antenna_handle, times)
+    return np.zeros(len(times), dtype=int)
+
+def antenna_marginal_variance(store_handle, antenna1_handle, antenna2_handle, obs_type, use_idxs, baseline_handle, use_phase_weights):
+    """ Diagonal of the antenna-based covariance for one baseline's rows (the marginal per-row variance) """
+    times = baseline_row_times(antenna1_handle, antenna2_handle, use_idxs, baseline_handle)
+    kind = antenna_row_kind(store_handle, obs_type, baseline_handle, use_phase_weights)
+    return antenna_end_variance(store_handle, antenna1_handle, kind, row_epochs(store_handle, antenna1_handle, times)) \
+         + antenna_end_variance(store_handle, antenna2_handle, kind, row_epochs(store_handle, antenna2_handle, times)) \
+         + fringe_row_variance(store_handle, baseline_handle, kind, use_idxs)
+
+def antenna_cov_layout(store_handle, antenna_handles, baselines, baseline_handles, phase_delay, phase_only, use_phase_weights):
+    """ Data rows in calc_residuals order, grouped by (row kind, epoch); cached on the index arrays """
+    parts = [store_handle.sol_type.encode(), np.array([phase_delay, phase_only, use_phase_weights], dtype=np.int64).tobytes()]
+    for antenna_handle in antenna_handles:
+        parts.append(np.asarray(antenna_handle.times_gps).astype('datetime64[ns]').astype(np.int64).tobytes())
+    for jdx, baseline in enumerate(baselines):
+        parts.append(np.asarray(baseline, dtype=np.int64).tobytes())
+        if len(baseline_handles) > 0:
+            baseline_handle = baseline_handles[jdx]
+            parts.append(np.asarray(baseline_handle.datetime_array).astype('datetime64[ns]').astype(np.int64).tobytes())
+            # phase rows are defined only after the range solution
+            parts.append(np.asarray(getattr(baseline_handle, 'range_data_idxs', []), dtype=np.int64).tobytes())
+            parts.append(b'|' + np.asarray(getattr(baseline_handle, 'phase_data_idxs', []), dtype=np.int64).tobytes())
+            parts.append(bytes([getattr(baseline_handle, 'pr_diff', None) is None]))
+    key = sha256(b''.join(parts)).hexdigest()
+    cache = getattr(antenna_cov_layout, 'cache', None)
+    if cache is not None and cache[0] == key:
+        return cache[1]
+
+    kinds, times, ants, signs, epochs, bls, data_idxs = [], [], [], [], [], [], []
+    def add_rows(jdx, obs_type, use_idxs):
+        baseline = baselines[jdx]
+        baseline_handle = baseline_handles[jdx] if len(baseline_handles) > 0 else None
+        antenna1_handle, antenna2_handle = antenna_handles[baseline[0]], antenna_handles[baseline[1]]
+        row_times = baseline_row_times(antenna1_handle, antenna2_handle, use_idxs, baseline_handle)
+        kinds.append(np.full(len(row_times), antenna_row_kind(store_handle, obs_type, baseline_handle, use_phase_weights)))
+        times.append(row_times)
+        ants.append(np.tile([baseline[0], baseline[1]], (len(row_times), 1)))
+        signs.append(np.tile([1.0, -1.0], (len(row_times), 1)))
+        epochs.append(np.column_stack((row_epochs(store_handle, antenna1_handle, row_times),
+                                       row_epochs(store_handle, antenna2_handle, row_times))))
+        bls.append(np.full(len(row_times), jdx))
+        data_idxs.append(np.asarray(use_idxs, dtype=int) if baseline_handle is not None else np.arange(len(row_times)))
+    for jdx in range(len(baselines)):
+        if phase_delay is True:
+            if phase_only is False:
+                add_rows(jdx, 'range', baseline_handles[jdx].range_data_idxs)
+            add_rows(jdx, 'phase', baseline_handles[jdx].phase_data_idxs)
+        else:
+            add_rows(jdx, 'range', baseline_handles[jdx].range_data_idxs if len(baseline_handles) > 0 else [])
+    kinds, times = np.concatenate(kinds), np.concatenate(times)
+    ants, signs, epochs = np.vstack(ants), np.vstack(signs), np.vstack(epochs)
+
+    # (kind, epoch) groups, batched by size for vectorized Cholesky factors; range and phase rows never share a group
+    order = np.lexsort((times.astype('datetime64[ns]').astype(np.int64), kinds))
+    keys = np.column_stack((kinds[order], times[order].astype('datetime64[ns]').astype(np.int64)))
+    starts = np.concatenate(([0], np.where(np.any(np.diff(keys, axis=0) != 0, axis=1))[0] + 1, [len(order)]))
+    batches = {}
+    for start, stop in zip(starts[:-1], starts[1:]):
+        batches.setdefault(stop - start, []).append(order[start:stop])
+    layout = dict(key=key, kinds=kinds, ants=ants, signs=signs, epochs=epochs, bls=np.concatenate(bls),
+                  data_idxs=np.concatenate(data_idxs), n_rows=len(kinds), batches=[np.array(rows) for rows in batches.values()])
+    antenna_cov_layout.cache = (key, layout)
+    return layout
+
+def antenna_cov_blocks(layout, end_fcn, row_fcn=None):
+    """ Group covariance blocks (one array per batch, shape (groups, k, k)): sum_a sign_i sign_j w_a over the row ends
+        sharing an antenna, end_fcn(antenna_idx, kind, epoch_idxs) giving w per row end, plus the diagonal per-row
+        term row_fcn(baseline_idx, kind, data_idxs) """
+    ends = np.zeros((layout['n_rows'], 2))
+    for antenna_idx in np.unique(layout['ants']):
+        for kind in np.unique(layout['kinds']):
+            for end in range(2):
+                mask = (layout['ants'][:, end] == antenna_idx) & (layout['kinds'] == kind)
+                if np.any(mask):
+                    ends[mask, end] = end_fcn(antenna_idx, kind, layout['epochs'][mask, end])
+    diag = np.zeros(layout['n_rows'])
+    if row_fcn is not None:
+        for baseline_idx in np.unique(layout['bls']):
+            for kind in np.unique(layout['kinds']):
+                mask = (layout['bls'] == baseline_idx) & (layout['kinds'] == kind)
+                if np.any(mask):
+                    diag[mask] = row_fcn(baseline_idx, kind, layout['data_idxs'][mask])
+    blocks = []
+    for rows in layout['batches']:
+        ants, signs, w = layout['ants'][rows], layout['signs'][rows], ends[rows] # (groups, k, 2)
+        block = np.zeros((len(rows), rows.shape[1], rows.shape[1]))
+        for end_i in range(2):
+            for end_j in range(2):
+                same = ants[:, :, None, end_i] == ants[:, None, :, end_j]
+                block += same*signs[:, :, None, end_i]*signs[:, None, :, end_j]*w[:, :, None, end_i]
+        block[:, np.arange(rows.shape[1]), np.arange(rows.shape[1])] += diag[rows]
+        blocks.append(block)
+    return blocks
+
+def antenna_cov_factor(store_handle, antenna_handles, baselines, baseline_handles, phase_delay, phase_only, use_phase_weights):
+    """ (layout, Cholesky factors per batch, marginal sigma per row) of the antenna-based covariance, cached """
+    layout = antenna_cov_layout(store_handle, antenna_handles, baselines, baseline_handles, phase_delay, phase_only, use_phase_weights)
+    values = tuple(antenna_noise_params(antenna_handle, noise_type) for antenna_handle in antenna_handles for noise_type in ANTENNA_NOISE_TYPES) \
+           + tuple(fringe_noise_scale(store_handle, noise_type) for noise_type in ANTENNA_NOISE_TYPES)
+    errors = tuple((id(getattr(handle, 'pr_errors', None)), id(getattr(handle, 'cp_errors', None))) for handle in antenna_handles) \
+           + tuple((id(getattr(handle, 'grdel_err', None)), id(getattr(handle, 'phdel_err', None))) for handle in baseline_handles)
+    key = (layout['key'], values, errors)
+    cache = getattr(store_handle, '_antenna_cov_factor', None)
+    if cache is not None and cache[0] == key:
+        return cache[1]
+    blocks = antenna_cov_blocks(layout,
+                                lambda antenna_idx, kind, epoch_idxs: antenna_end_variance(store_handle, antenna_handles[antenna_idx], kind, epoch_idxs),
+                                lambda baseline_idx, kind, data_idxs: fringe_row_variance(store_handle, baseline_handles[baseline_idx], kind, data_idxs))
+    chols = [np.linalg.cholesky(block) for block in blocks]
+    sigma = np.zeros(layout['n_rows'])
+    for rows, block in zip(layout['batches'], blocks):
+        sigma[rows] = np.sqrt(np.diagonal(block, axis1=1, axis2=2))
+    result = (layout, chols, sigma)
+    store_handle._antenna_cov_factor = (key, result)
+    return result
+
+def antenna_cov_whiten_marginal(store_handle, antenna_handles, baselines, baseline_handles, phase_delay, phase_only, use_phase_weights, values):
+    """ Data rows (vector or Jacobian) weighted with the marginal weights of get_obs_weights -> fully whitened """
+    layout, chols, sigma = antenna_cov_factor(store_handle, antenna_handles, baselines, baseline_handles, phase_delay, phase_only, use_phase_weights)
+    values = np.asarray(values, dtype=float)
+    unweighted = values*(sigma if values.ndim == 1 else sigma[:, None])
+    whitened = np.empty_like(unweighted)
+    for rows, chol in zip(layout['batches'], chols):
+        block = unweighted[rows] # (groups, k) or (groups, k, n_col)
+        if block.ndim == 2:
+            whitened[rows] = np.linalg.solve(chol, block[..., None])[..., 0]
+        else:
+            whitened[rows] = np.linalg.solve(chol, block)
+    return whitened
+
+def antenna_cov_marginal_residuals(store_handle, ls_args, residuals):
+    """ antenna_cov_marginal with the solution's ls_args """
+    if not antenna_covariance_active(store_handle):
+        return residuals
+    phase_delay = ls_args[10] if len(ls_args) > 10 else False
+    phase_only = ls_args[11] if len(ls_args) > 11 else False
+    use_phase_weights = ls_args[14] if len(ls_args) > 14 else False
+    return antenna_cov_marginal(store_handle, ls_args[3], ls_args[1], ls_args[9], phase_delay, phase_only, use_phase_weights, residuals)
+
+def antenna_cov_marginal(store_handle, antenna_handles, baselines, baseline_handles, phase_delay, phase_only, use_phase_weights, residuals):
+    """ Fully whitened residuals -> per-row standardized residuals (data rows; other rows unchanged), the form the
+        per-baseline code (outlier removal, unweighting with get_obs_weights, plots) expects """
+    if not antenna_covariance_active(store_handle):
+        return residuals
+    layout, chols, sigma = antenna_cov_factor(store_handle, antenna_handles, baselines, baseline_handles, phase_delay, phase_only, use_phase_weights)
+    residuals = np.array(residuals, dtype=float)
+    n_data = layout['n_rows']
+    unweighted = np.empty(n_data)
+    for rows, chol in zip(layout['batches'], chols):
+        unweighted[rows] = (chol @ residuals[rows][..., None])[..., 0]
+    residuals[:n_data] = unweighted/sigma
+    return residuals
+
+def print_antenna_noise(store_handle, antenna_handles, noise_types):
+    """ Per-antenna floors (and SNR scales) of the antenna-based covariance """
+    for antenna_handle in antenna_handles:
+        text = []
+        for noise_type in noise_types:
+            scale, floor = antenna_noise_params(antenna_handle, noise_type)
+            scale_text = f'C/N0 scale {scale:.4g}, ' if store_handle.sol_type == 'GNSS' else ''
+            text.append(f'{noise_type}: {scale_text}floor {np.sqrt(floor):.5f} m ({np.sqrt(floor)/const.c*1e12:.2f} ps)')
+        print(f'  {antenna_handle.antenna_name:10s} ' + '; '.join(text))
+    if store_handle.sol_type == 'VLBI':
+        print('  fringe formal error scale: ' + ', '.join(f'{noise_type} {fringe_noise_scale(store_handle, noise_type):.4g}' for noise_type in noise_types))
+
+def print_baseline_q(store_handle, baseline_handle, antenna1_handle, antenna2_handle, noise_type):
+    """ Print q_range/q_phase: the baseline's additive sigma, or under the antenna-based covariance its equivalent
+        sqrt(f_1 + f_2) from the two antennas' floors (with their breakdown) """
+    if not antenna_covariance_active(store_handle):
+        q_value = baseline_handle.q_range if noise_type == 'range' else baseline_handle.q_phase
+        print(f'q_{noise_type} (m): {q_value:.5f}')
+        print(f'q_{noise_type} (ps): {q_value/const.c*1e12:.5f}')
+        return
+    floors, scales = [], []
+    for antenna_handle in (antenna1_handle, antenna2_handle):
+        scale, floor = antenna_noise_params(antenna_handle, noise_type)
+        floors.append(floor)
+        scales.append(scale)
+    q_value = np.sqrt(sum(floors))
+    print(f'q_{noise_type} (m): {q_value:.5f} (antenna floors)')
+    print(f'q_{noise_type} (ps): {q_value/const.c*1e12:.5f} (antenna floors)')
+    for antenna_handle, floor, scale in zip((antenna1_handle, antenna2_handle), floors, scales):
+        scale_text = f', C/N0 scale {scale:.4g}' if store_handle.sol_type == 'GNSS' else ''
+        print(f'  {antenna_handle.antenna_name}: floor {np.sqrt(floor):.5f} m ({np.sqrt(floor)/const.c*1e12:.2f} ps){scale_text}')
+    if store_handle.sol_type == 'VLBI':
+        print(f'  fringe formal error scale ({noise_type}): {fringe_noise_scale(store_handle, noise_type):.4g}')
+
+def antenna_vce_normal(components, basis, fun):
+    """ LS-VCE normal equations N_kl = 1/2 tr(R A_k R A_l), l_k = 1/2 e' A_k e with R = I - U U' (U = basis) and A_k
+        symmetric sparse (rows S_k). Uses whichever form needs less memory:
+          dense R:  tr(R A_k R A_l) = sum(X_k[:, S_l] * X_l[:, S_k]'),  X_k = A_k[S_k] R
+          basis U:  tr(A_k A_l) - 2 tr(U' A_k A_l U) + tr((U' A_k U)(U' A_l U))
+    """
+    m, rank = basis.shape
+    n_comp = len(components)
+    normal = np.zeros((n_comp, n_comp))
+    rhs = np.array([0.5*fun @ (component[4] @ fun) for component in components])
+    sizes = np.array([len(component[3]) for component in components])
+    if m*m + np.sum(sizes)*m <= np.sum(sizes)*rank + n_comp*rank*rank:
+        proj = -basis @ basis.T
+        proj[np.diag_indices(m)] += 1.0
+        products = [component[4][component[3]] @ proj for component in components]
+        for k in range(n_comp):
+            for l in range(k, n_comp):
+                rows_k, rows_l = components[k][3], components[l][3]
+                normal[k, l] = normal[l, k] = 0.5*np.sum(products[k][:, rows_l]*products[l][:, rows_k].T)
+        return normal, rhs
+    a_basis = [component[4][component[3]] @ basis for component in components]                 # (A_k U)[S_k]
+    reduced = [basis[component[3]].T @ a_basis[k] for k, component in enumerate(components)]    # U' A_k U
+    for k in range(n_comp):
+        for l in range(k, n_comp):
+            rows_k, rows_l = components[k][3], components[l][3]
+            first = components[k][4].multiply(components[l][4]).sum()
+            _, idx_k, idx_l = np.intersect1d(rows_k, rows_l, return_indices=True)
+            second = np.sum(a_basis[k][idx_k]*a_basis[l][idx_l])
+            third = np.sum(reduced[k]*reduced[l].T)
+            normal[k, l] = normal[l, k] = 0.5*(first - 2*second + third)
+    return normal, rhs
+
+def whitened_component(layout, chols, m, end_fcn, row_fcn=None):
+    """ Whitened cofactor matrix L^-1 Q L^-T of one component as a sparse m x m matrix (zero outside the data rows) """
+    blocks = antenna_cov_blocks(layout, end_fcn, row_fcn)
+    row_idx, col_idx, vals = [], [], []
+    for rows, block, chol in zip(layout['batches'], blocks, chols):
+        white = np.linalg.solve(chol, np.linalg.solve(chol, block).transpose(0, 2, 1)).transpose(0, 2, 1)
+        row_idx.append(np.repeat(rows[:, :, None], rows.shape[1], axis=2).ravel())
+        col_idx.append(np.repeat(rows[:, None, :], rows.shape[1], axis=1).ravel())
+        vals.append(white.ravel())
+    block_mat = scipy_sparse.coo_matrix((np.concatenate(vals), (np.concatenate(row_idx), np.concatenate(col_idx))), shape=(m, m)).tocsr()
+    block_mat.eliminate_zeros()
+    return block_mat
+
+def iterative_weight_adjust_antenna_vce(store_handle, state_expanded, bounds, ls_args, res_fcn, jac, sol_type, observable='range', no_PSD=False):
+    """ LS-VCE of the antenna-based covariance: per antenna and observable a floor variance; with
+        --antenna_cov_snr_scale the SNR scales (GNSS: C/N0 scale per antenna; VLBI: one fringe formal error scale);
+        unless no_PSD, a scale factor on each stochastic clock/troposphere pseudo-observation block, which multiplies
+        that block's PSDs. Full-matrix LS-VCE (Teunissen & Amiri-Simkooei 2008) in the whitened system:
+            N_kl = 1/2 tr(R A_k R A_l),  l_k = 1/2 e' A_k e,  R = I - U U' (U: orthonormal basis of the Jacobian),
+        A_k the whitened cofactor matrices; components held fixed (rows of known weight, SNR scales not estimated)
+        move to the right-hand side. A GNSS antenna's C/N0 scale is held when it is collinear with its floor (C/N0
+        nearly constant).
+    """
+    max_iter, tol_var = 10, 1e-2
+    ref_antenna, baselines, antenna_handles, baseline_handles = ls_args[0], ls_args[1], ls_args[3], ls_args[9]
+    phase_delay = ls_args[10] if len(ls_args) > 10 else False
+    phase_only = ls_args[11] if len(ls_args) > 11 else False
+    use_phase_weights = ls_args[14] if len(ls_args) > 14 else False
+    ref_handle = next((handle for handle in antenna_handles if handle.antenna_name == ref_antenna), None)
+    estimate_scale = bool(getattr(store_handle, 'antenna_cov_snr_scale', False))
+    if not hasattr(store_handle, 'antenna_scale_held'):
+        store_handle.antenna_scale_held = set()
+
+    prev = None
+    for n_iter in range(max_iter):
+        ls_sol = least_squares(res_fcn, state_expanded, jac=jac, method='trf', max_nfev=100, bounds=bounds,
+                               verbose=0, x_scale='jac', xtol=1e-15, args=ls_args)
+        layout, chols, _ = antenna_cov_factor(store_handle, antenna_handles, baselines, baseline_handles, phase_delay, phase_only, use_phase_weights)
+        fun, jac_w = np.asarray(ls_sol.fun), np.asarray(ls_sol.jac)
+        m, n_data = len(fun), layout['n_rows']
+
+        # orthonormal basis of the Jacobian's column space (rank-revealing QR); R = I - U U'
+        q_mat, r_mat, _ = scipy_qr(jac_w, mode='economic', pivoting=True)
+        r_diag = np.abs(np.diag(r_mat))
+        rank = int(np.sum(r_diag > r_diag[0]*max(m, jac_w.shape[1])*np.finfo(float).eps)) if len(r_diag) else 0
+        basis = q_mat[:, :rank]
+
+        # components: (label, kind, target, rows, whitened block as a sparse m x m matrix, current value, estimated)
+        # target: (handle carrying the attribute, noise type, 'held' key) for floors and scales
+        components = []
+        noise_types = sorted({kind_noise_type(kind) for kind in np.unique(layout['kinds'])})
+        def add_component(label, comp, target, block_mat, value, estimated):
+            if block_mat.nnz > 0:
+                components.append((label, comp, target, np.unique(block_mat.nonzero()[0]), block_mat, value, estimated))
+        def type_weight(kind, noise_type, weights):
+            if kind_noise_type(kind) != noise_type:
+                return np.zeros(len(weights))
+            return 100*weights if kind == 2 else weights
+        for antenna_idx, antenna_handle in enumerate(antenna_handles):
+            if antenna_idx not in layout['ants']:
+                continue
+            for noise_type in noise_types:
+                scale, floor = antenna_noise_params(antenna_handle, noise_type)
+                add_component(f'{antenna_handle.antenna_name} {noise_type} floor', 'floor', (antenna_handle, noise_type, None),
+                              whitened_component(layout, chols, m, lambda idx, kind, epoch_idxs, antenna_idx=antenna_idx, noise_type=noise_type:
+                                                 type_weight(kind, noise_type, np.full(len(epoch_idxs), float(idx == antenna_idx)))),
+                              floor, True)
+                if sol_type == 'GNSS':
+                    def cn0_weight(idx, kind, epoch_idxs, antenna_idx=antenna_idx, noise_type=noise_type):
+                        if idx != antenna_idx:
+                            return np.zeros(len(epoch_idxs))
+                        errors = antenna_handles[idx].cp_errors if kind == 1 else antenna_handles[idx].pr_errors
+                        return type_weight(kind, noise_type, np.asarray(errors)[epoch_idxs]**2)
+                    held_key = (antenna_handle.antenna_name, noise_type)
+                    add_component(f'{antenna_handle.antenna_name} {noise_type} scale', 'scale', (antenna_handle, noise_type, held_key),
+                                  whitened_component(layout, chols, m, cn0_weight), scale,
+                                  estimate_scale and held_key not in store_handle.antenna_scale_held)
+        if sol_type == 'VLBI':
+            for noise_type in noise_types:
+                def fringe_weight(baseline_idx, kind, data_idxs, noise_type=noise_type):
+                    errors = baseline_handles[baseline_idx].phdel_err if kind == 1 else baseline_handles[baseline_idx].grdel_err
+                    return type_weight(kind, noise_type, np.asarray(errors)[data_idxs]**2)
+                add_component(f'fringe {noise_type} scale', 'scale', (store_handle, noise_type, None),
+                              whitened_component(layout, chols, m, lambda idx, kind, epoch_idxs: np.zeros(len(epoch_idxs)), fringe_weight),
+                              fringe_noise_scale(store_handle, noise_type), estimate_scale)
+
+        # pseudo-observation rows in calc_residuals order: clock (range, phase) per non-reference antenna, then ZWD per owner
+        row = n_data
+        pseudo = []
+        if store_handle.stochastic_clock:
+            for antenna_handle in antenna_handles:
+                if antenna_handle.antenna_name == ref_antenna or clock_leader(antenna_handle) is not None: # members: no clock rows
+                    continue
+                for phase_clock in ([False] if phase_only is False else []) + ([True] if phase_delay is True else []):
+                    n_rows = clock_process_operator(store_handle, antenna_handle, ref_handle, phase_clock)['S'].shape[0]
+                    pseudo.append((f'{antenna_handle.antenna_name} {"phase " if phase_clock else ""}clock', 'clock', (antenna_handle, phase_clock), row, n_rows))
+                    row += n_rows
+        if store_handle.stochastic_trop:
+            for antenna_handle in antenna_handles:
+                if owns_trop_states(antenna_handle):
+                    n_rows = len(antenna_handle.trop_times) - 1
+                    pseudo.append((f'{antenna_handle.antenna_name} ZWD', 'trop', antenna_handle, row, n_rows))
+                    row += n_rows
+        if row > m:
+            print('antenna covariance VCE: pseudo-observation rows do not match the residuals; process noise held')
+            pseudo, row = [], n_data
+        known = np.arange(row if not no_PSD else n_data, m)
+        if not no_PSD:
+            for label, comp, target, start, n_rows in pseudo:
+                if n_rows > 0:
+                    rows = np.arange(start, start + n_rows)
+                    add_component(label + ' PSD factor', comp, target, scipy_sparse.csr_matrix((np.ones(n_rows), (rows, rows)), shape=(m, m)), 1.0, True)
+        if len(known) > 0:
+            add_component('known rows', 'known', None, scipy_sparse.csr_matrix((np.ones(len(known)), (known, known)), shape=(m, m)), 1.0, False)
+
+        normal, rhs = antenna_vce_normal(components, basis, fun)
+        n_comp = len(components)
+        if not (np.all(np.isfinite(fun)) and np.all(np.isfinite(normal)) and np.all(np.isfinite(rhs))):
+            print('antenna covariance LS-VCE: non-finite residuals or normal equations; weights left unchanged')
+            break
+
+        # components the adjustment absorbs carry no information (N_kk ~ 0 relative to 1/2 tr(A_k A_k)): held
+        for k, (label, comp, target, _, block_mat, value, estimated) in enumerate(components):
+            if estimated:
+                self_trace = 0.5*block_mat.multiply(block_mat).sum()
+                if not normal[k, k] > 1e-8*self_trace:
+                    components[k] = components[k][:6] + (False,)
+                    print(f'{label}: no information after the adjustment (absorbed by the estimated parameters); held at {value:.3g}')
+
+        # hold GNSS C/N0 scales that are collinear with the antenna's floor
+        index = {components[k][0]: k for k in range(n_comp)}
+        for k, (label, comp, target, _, _, _, estimated) in enumerate(components):
+            if comp == 'scale' and estimated and target[2] is not None:
+                floor_k = index.get(label[:-len('scale')] + 'floor')
+                if floor_k is not None and normal[k, k] > 0 and normal[floor_k, floor_k] > 0:
+                    corr = normal[k, floor_k]/np.sqrt(normal[k, k]*normal[floor_k, floor_k])
+                    if abs(corr) > ANTENNA_COV_COLLINEAR:
+                        store_handle.antenna_scale_held.add(target[2])
+                        components[k] = components[k][:6] + (False,)
+                        print(f'{label}: held at {components[k][5]:.3g} (correlation with floor {corr:.3f})')
+
+        est = np.array([k for k in range(n_comp) if components[k][6]], dtype=int)
+        fixed = np.array([k for k in range(n_comp) if not components[k][6]], dtype=int)
+        values = np.array([components[k][5] for k in range(n_comp)])
+        rhs_est = rhs[est] - (normal[np.ix_(est, fixed)] @ values[fixed] if len(fixed) > 0 else 0.0)
+        if len(est) == 0:
+            print('antenna covariance LS-VCE: nothing left to estimate')
+            break
+        normal_est = 0.5*(normal[np.ix_(est, est)] + normal[np.ix_(est, est)].T)
+        scaling = np.sqrt(np.diag(normal_est)) # > 0 after the information check
+        normal_scaled = normal_est/np.outer(scaling, scaling)
+        eigs = np.linalg.eigvalsh(normal_scaled)
+        cond = eigs[-1]/max(eigs[0], np.finfo(float).tiny)
+        if eigs[0] < eigs[-1]/1e12:
+            normal_scaled = normal_scaled + (eigs[-1]/1e12 - min(eigs[0], 0.0))*np.eye(len(est))
+        estimate = _nnls_quadratic(normal_scaled, rhs_est/scaling)/scaling
+
+        # floors and update (process-noise factors damped)
+        new_values = {}
+        for k, value_hat in zip(est, estimate):
+            label, comp = components[k][0], components[k][1]
+            value_hat = max(value_hat, {'scale': 1e-4, 'floor': 1e-12}.get(comp, 1e-3))
+            new_values[label] = value_hat if comp in ('scale', 'floor') else np.sqrt(value_hat) # PSD factors (relative) damped toward 1
+        # PSDs keep the absolute floors of iterative_weight_adjust_ls_vce (rw 1e-2 ps^2/hr, irw 1e-4 range / 1e-3 phase
+        # ps^2/hr^3, ZWD 1e-3 ps^2/hr); a factor pushing a PSD below its floor stops there. applied: PSD ratio used
+        applied = {}
+        for k in est:
+            label, comp, target = components[k][0], components[k][1], components[k][2]
+            value = new_values[label]
+            if comp in ('scale', 'floor'):
+                setattr(target[0], f'noise_{comp}_{target[1]}', value)
+            elif comp == 'clock':
+                antenna_handle, phase_clock = target
+                prefix = 'phase_clock_psd' if phase_clock else 'clock_psd'
+                old_rw = getattr(antenna_handle, prefix + '_rw')
+                setattr(antenna_handle, prefix + '_rw', max(old_rw*value, 1e-2))
+                setattr(antenna_handle, prefix + '_irw', max(getattr(antenna_handle, prefix + '_irw')*value, 1e-3 if phase_clock else 1e-4))
+                applied[label] = getattr(antenna_handle, prefix + '_rw')/old_rw
+            elif comp == 'trop':
+                old_rw = target.trop_psd_rw
+                target.trop_psd_rw = max(old_rw*value, 1e-3)
+                applied[label] = target.trop_psd_rw/old_rw
+
+        chi_sq = np.sum(fun**2)/(m - len(ls_sol.x))
+        print(f'antenna covariance LS-VCE ({observable}) iteration {n_iter}: chi-squared {chi_sq:.3f}, cond(N) {cond:.2e}')
+        print_antenna_noise(store_handle, [antenna_handles[idx] for idx in np.unique(layout['ants'])], noise_types)
+        for label, value in applied.items():
+            target = components[index[label]][2]
+            if components[index[label]][1] == 'clock':
+                prefix = 'phase_clock_psd' if target[1] else 'clock_psd'
+                psd_text = f'rw {getattr(target[0], prefix + "_rw"):.4g} ps^2/hr, irw {getattr(target[0], prefix + "_irw"):.4g} ps^2/hr^3'
+            else:
+                psd_text = f'rw {target.trop_psd_rw:.4g} ps^2/hr'
+            print(f'  {label}: {new_values[label]:.4g} ({psd_text})')
+        # convergence: scales relative to themselves, floors relative to max(floor, 1% of the median total row variance
+        # of that observable) -- a floor collapsing toward zero is converged -- and process-noise factors relative to 1
+        _, _, sigma = antenna_cov_factor(store_handle, antenna_handles, baselines, baseline_handles, phase_delay, phase_only, use_phase_weights)
+        median_variance = {noise_type: np.median(sigma[[kind_noise_type(kind) == noise_type for kind in layout['kinds']]]**2) for noise_type in noise_types}
+        current, reference, psd_steps = [], [], []
+        for k in est:
+            label, comp, target = components[k][0], components[k][1], components[k][2]
+            if comp == 'scale':
+                current.append(new_values[label]); reference.append(new_values[label])
+            elif comp == 'floor':
+                current.append(new_values[label]); reference.append(max(new_values[label], 0.01*median_variance[target[1]]))
+            else:
+                psd_steps.append(applied.get(label, 1.0)) # a PSD held at its floor has converged
+        current, reference, psd_steps = np.array(current), np.array(reference), np.array(psd_steps)
+        if prev is not None and len(current) == len(prev):
+            rel = np.max(np.abs(current - prev)/reference) if len(current) else 0.0
+            if psd_steps.size:
+                rel = max(rel, np.max(np.abs(np.log(psd_steps))))
+            print(f'  max relative change: {rel:.3e}')
+            if rel < tol_var:
+                break
+        prev = current
+
+    return least_squares(res_fcn, state_expanded, jac=jac, method='trf', max_nfev=100, bounds=bounds,
+                         verbose=0, x_scale='jac', xtol=1e-15, args=ls_args)
+
+
 def calc_residuals(state, ref_antenna, baselines, store_handle, antenna_handles, \
         clock_idxs, clock_poly_length, trop_idxs, trop_poly_length, disb_idxs, \
         baseline_handles=[], phase_delay=False, phase_only=False, use_amb_state=False, amb_state_idxs=[], \
@@ -17764,14 +18551,14 @@ def calc_residuals(state, ref_antenna, baselines, store_handle, antenna_handles,
                     clock_state = clock_state[idx_start:]
                 else:
                     if store_handle.stochastic_clock is True:
-                        clock_samples = np.zeros(len(clock_state))
+                        clock_samples = np.zeros(len(antenna_handle.clock_times))
                     else:
                         clock_samples = np.zeros(len(times_gps))
 
                 if store_handle.stochastic_clock is False and clock_poly_length>0:
                     clock_samples += sample_poly_at_interval(clock_state, clock_poly_length, times_gps)
                 elif store_handle.stochastic_clock is True:
-                    clock_samples += clock_state
+                    clock_samples += linked_stochastic_clock(antenna_handle, clock_state, clock_states, idx_start)
                 else:
                     # havent added in bulk clock offset yet
                     clock_samples += clock_state[0]
@@ -17805,7 +18592,7 @@ def calc_residuals(state, ref_antenna, baselines, store_handle, antenna_handles,
                     phase_clock_state = phase_clock_state[idx_start:]
                 else:
                     if store_handle.stochastic_clock is True:
-                        phase_clock_samples = np.zeros(len(phase_clock_state))
+                        phase_clock_samples = np.zeros(len(antenna_handle.phase_clock_times))
                     else:
                         phase_clock_samples = np.zeros(len(times_gps))
 
@@ -17813,7 +18600,7 @@ def calc_residuals(state, ref_antenna, baselines, store_handle, antenna_handles,
                     phase_clock_samples += sample_poly_at_interval(phase_clock_state,\
                             clock_poly_length, times_gps, antenna_handle.phase_clock_start)
                 elif store_handle.stochastic_clock is True:
-                    phase_clock_samples += phase_clock_state
+                    phase_clock_samples += linked_stochastic_clock(antenna_handle, phase_clock_state, phase_clock_states, idx_start, True)
                 else:
                     # havent added in bulk clock offset yet
                     phase_clock_samples += phase_clock_state[0]
@@ -17988,13 +18775,18 @@ def calc_residuals(state, ref_antenna, baselines, store_handle, antenna_handles,
         else:
             residuals = np.concatenate((residuals, residuals_baseline))
 
+    if antenna_covariance_active(store_handle):
+        # marginally weighted rows -> whitened with the antenna-based covariance (baselines sharing an antenna correlate)
+        residuals = antenna_cov_whiten_marginal(store_handle, antenna_handles, baselines, baseline_handles, phase_delay, \
+                                                phase_only, use_phase_weights, residuals)
+
     if store_handle.stochastic_clock is True:
         for antenna_handle in antenna_handles:
             if ref_antenna == antenna_handle.antenna_name:
                 ref_handle = antenna_handle
 
         for antenna_handle in antenna_handles:
-            if ref_antenna != antenna_handle.antenna_name:
+            if ref_antenna != antenna_handle.antenna_name and clock_leader(antenna_handle) is None: # members: leader's rows
                 if phase_only is False:
                     clock_samples = antenna_handle.clock_samples.copy()
                     if antenna_handle.ppp_clock_active:
@@ -18155,6 +18947,7 @@ def calc_jac(state, ref_antenna, baselines, store_handle, antenna_handles, \
     analytical_jac = np.zeros((n_measurements, len(state))) # full Jacobian
     # set up idxs as list instead of slice for some later logic
     clock_idxs_list = np.arange(clock_idxs.start,clock_idxs.stop)
+    idx_start_clock = 1 if store_handle.global_linear_clock is True else (2 if store_handle.global_quadratic_clock is True else 0)
     if phase_delay is True:
         phase_clock_idxs_list = np.arange(phase_clock_idxs.start,phase_clock_idxs.stop)
     if store_handle.estimate_trop is True:
@@ -18232,6 +19025,19 @@ def calc_jac(state, ref_antenna, baselines, store_handle, antenna_handles, \
                 phase_clock_state = phase_clock_states[antenna_handle.phase_clock_idxs]
             else:
                 phase_clock_state = []
+
+            # linked clock member: partials per clock epoch, mapped to its offset and the leader's samples
+            leader_clock_cols, leader_phase_clock_cols = None, None
+            leader_handle = clock_leader(antenna_handle)
+            if leader_handle is not None:
+                if phase_only is False:
+                    clock_state = np.zeros(idx_start_clock + len(antenna_handle.clock_times))
+                    if not antenna_handle.clock_leader_ref:
+                        leader_clock_cols = clock_idxs_list[leader_handle.range_clock_idxs][idx_start_clock:]
+                if phase_delay is True:
+                    phase_clock_state = np.zeros(idx_start_clock + len(antenna_handle.phase_clock_times))
+                    if not antenna_handle.clock_leader_ref:
+                        leader_phase_clock_cols = phase_clock_idxs_list[leader_handle.phase_clock_idxs][idx_start_clock:]
             
             if store_handle.estimate_trop is True and antenna_handle.estimate_trop is True:
                 trop_state = trop_states[antenna_handle.trop_idxs]
@@ -18385,16 +19191,16 @@ def calc_jac(state, ref_antenna, baselines, store_handle, antenna_handles, \
                         if store_handle.sol_type == 'VLBI':
                             analytical_jac[num_samples:num_samples + len(baseline_handle.range_data_idxs), count_rx*3:count_rx*3+3] = \
                                     -antenna_jac[baseline_handle.range_data_idxs,:3]                       
-                            analytical_jac[num_samples:num_samples + len(baseline_handle.range_data_idxs), antenna_clock_idxs] = \
-                                    sign*antenna_jac[baseline_handle.range_data_idxs,3:3+len(clock_state)]
+                            add_clock_partials(analytical_jac, slice(num_samples, num_samples + len(baseline_handle.range_data_idxs)), antenna_handle, \
+                                    sign*antenna_jac[baseline_handle.range_data_idxs,3:3+len(clock_state)], antenna_clock_idxs, leader_clock_cols, idx_start_clock, False)
                             if store_handle.estimate_trop is True and antenna_handle.estimate_trop is True:
                                 analytical_jac[num_samples:num_samples + len(baseline_handle.range_data_idxs), antenna_trop_idxs] += \
                                         sign*antenna_jac[baseline_handle.range_data_idxs,3+len(clock_state)+len_ao+len_grav:3+len(clock_state)+len_ao+len_grav+len(trop_state)]  
                         elif store_handle.sol_type == 'GNSS':
                             analytical_jac[num_samples:num_samples + len(baseline_handle.range_data_idxs), count_rx*3:count_rx*3+3] = \
                                     sign*antenna_jac[ant_idxs[baseline_handle.range_data_idxs],:3]                       
-                            analytical_jac[num_samples:num_samples + len(baseline_handle.range_data_idxs), antenna_clock_idxs] = \
-                                    sign*antenna_jac[ant_idxs[baseline_handle.range_data_idxs],3:3+len(clock_state)]
+                            add_clock_partials(analytical_jac, slice(num_samples, num_samples + len(baseline_handle.range_data_idxs)), antenna_handle, \
+                                    sign*antenna_jac[ant_idxs[baseline_handle.range_data_idxs],3:3+len(clock_state)], antenna_clock_idxs, leader_clock_cols, idx_start_clock, False)
                             if store_handle.estimate_trop is True and antenna_handle.estimate_trop is True:
                                 analytical_jac[num_samples:num_samples + len(baseline_handle.range_data_idxs), antenna_trop_idxs] += \
                                         sign*antenna_jac[ant_idxs[baseline_handle.range_data_idxs],3+len(clock_state)+len_ao+len_grav:3+len(clock_state)+len_ao+len_grav+len(trop_state)]
@@ -18414,18 +19220,18 @@ def calc_jac(state, ref_antenna, baselines, store_handle, antenna_handles, \
                     if store_handle.sol_type == 'VLBI':
                         analytical_jac[num_samples:num_samples + len(baseline_handle.phase_data_idxs), count_rx*3:count_rx*3+3] = \
                                 -antenna_jac[baseline_handle.phase_data_idxs,:3]                        
-                        analytical_jac[num_samples:num_samples + len(baseline_handle.phase_data_idxs), antenna_phase_clock_idxs] = \
+                        add_clock_partials(analytical_jac, slice(num_samples, num_samples + len(baseline_handle.phase_data_idxs)), antenna_handle, \
                                 sign*antenna_jac[baseline_handle.phase_data_idxs,\
-                                3+len(clock_state)+len(trop_state)+len_ao+len_grav:3+len(clock_state)+len(trop_state)+len_ao+len_grav+len(phase_clock_state)]
+                                3+len(clock_state)+len(trop_state)+len_ao+len_grav:3+len(clock_state)+len(trop_state)+len_ao+len_grav+len(phase_clock_state)], antenna_phase_clock_idxs, leader_phase_clock_cols, idx_start_clock, True)
                         if store_handle.estimate_trop is True and antenna_handle.estimate_trop is True:
                             analytical_jac[num_samples:num_samples + len(baseline_handle.phase_data_idxs), antenna_trop_idxs] += \
                                     sign*antenna_jac[baseline_handle.phase_data_idxs,3+len(clock_state)+len_ao+len_grav:3+len(clock_state)+len_ao+len_grav+len(trop_state)]  
                     elif store_handle.sol_type == 'GNSS':
                         analytical_jac[num_samples:num_samples + len(baseline_handle.phase_data_idxs), count_rx*3:count_rx*3+3] = \
                                 sign*antenna_jac[ant_idxs[baseline_handle.phase_data_idxs],:3]                        
-                        analytical_jac[num_samples:num_samples + len(baseline_handle.phase_data_idxs), antenna_phase_clock_idxs] = \
+                        add_clock_partials(analytical_jac, slice(num_samples, num_samples + len(baseline_handle.phase_data_idxs)), antenna_handle, \
                                 sign*antenna_jac[ant_idxs[baseline_handle.phase_data_idxs],\
-                                3+len(clock_state)+len(trop_state)+len_ao+len_grav+len(disb_state):3+len(clock_state)+len(trop_state)+len_ao+len_grav+len(disb_state)+len(phase_clock_state)]
+                                3+len(clock_state)+len(trop_state)+len_ao+len_grav+len(disb_state):3+len(clock_state)+len(trop_state)+len_ao+len_grav+len(disb_state)+len(phase_clock_state)], antenna_phase_clock_idxs, leader_phase_clock_cols, idx_start_clock, True)
                         if store_handle.estimate_trop is True and antenna_handle.estimate_trop is True:
                             analytical_jac[num_samples:num_samples + len(baseline_handle.phase_data_idxs), antenna_trop_idxs] += \
                                     sign*antenna_jac[ant_idxs[baseline_handle.phase_data_idxs],3+len(clock_state)+len_ao+len_grav:3+len(clock_state)+len_ao+len_grav+len(trop_state)]
@@ -18504,16 +19310,16 @@ def calc_jac(state, ref_antenna, baselines, store_handle, antenna_handles, \
                         if store_handle.sol_type == 'VLBI':
                             analytical_jac[num_samples:num_samples + len(baseline_handle.range_data_idxs), count_rx*3:count_rx*3+3] = \
                                     -antenna_jac[baseline_handle.range_data_idxs,:3]  
-                            analytical_jac[num_samples:num_samples + len(baseline_handle.range_data_idxs), antenna_clock_idxs] = \
-                                    sign*antenna_jac[baseline_handle.range_data_idxs,3:3+len(clock_state)] 
+                            add_clock_partials(analytical_jac, slice(num_samples, num_samples + len(baseline_handle.range_data_idxs)), antenna_handle, \
+                                    sign*antenna_jac[baseline_handle.range_data_idxs,3:3+len(clock_state)], antenna_clock_idxs, leader_clock_cols, idx_start_clock, False)
                             if store_handle.estimate_trop is True and antenna_handle.estimate_trop is True:
                                 analytical_jac[num_samples:num_samples + len(baseline_handle.range_data_idxs), antenna_trop_idxs] += \
                                         sign*antenna_jac[baseline_handle.range_data_idxs,3+len(clock_state)+len_ao+len_grav:3+len(clock_state)+len_ao+len_grav+len(trop_state)]  
                         elif store_handle.sol_type == 'GNSS':
                             analytical_jac[num_samples:num_samples + len(baseline_handle.range_data_idxs), count_rx*3:count_rx*3+3] = \
                                     sign*antenna_jac[ant_idxs[baseline_handle.range_data_idxs],:3]  
-                            analytical_jac[num_samples:num_samples + len(baseline_handle.range_data_idxs), antenna_clock_idxs] = \
-                                    sign*antenna_jac[ant_idxs[baseline_handle.range_data_idxs],3:3+len(clock_state)]
+                            add_clock_partials(analytical_jac, slice(num_samples, num_samples + len(baseline_handle.range_data_idxs)), antenna_handle, \
+                                    sign*antenna_jac[ant_idxs[baseline_handle.range_data_idxs],3:3+len(clock_state)], antenna_clock_idxs, leader_clock_cols, idx_start_clock, False)
                             if store_handle.estimate_trop is True and antenna_handle.estimate_trop is True:
                                 analytical_jac[num_samples:num_samples + len(baseline_handle.range_data_idxs), antenna_trop_idxs] += \
                                         sign*antenna_jac[ant_idxs[baseline_handle.range_data_idxs],3+len(clock_state)+len_ao+len_grav:3+len(clock_state)+len_ao+len_grav+len(trop_state)]
@@ -18532,8 +19338,8 @@ def calc_jac(state, ref_antenna, baselines, store_handle, antenna_handles, \
                         antenna_clock_idxs = clock_idxs_list[antenna_handle.range_clock_idxs]
                         analytical_jac[num_samples:num_samples + len(datetime_array), count_rx*3:count_rx*3+3] = \
                                 sign*antenna_jac[ant_idxs,:3]  
-                        analytical_jac[num_samples:num_samples + len(datetime_array), antenna_clock_idxs] = \
-                                sign*antenna_jac[ant_idxs,3:3+len(clock_state)]
+                        add_clock_partials(analytical_jac, slice(num_samples, num_samples + len(datetime_array)), antenna_handle, \
+                                sign*antenna_jac[ant_idxs,3:3+len(clock_state)], antenna_clock_idxs, leader_clock_cols, idx_start_clock, False)
                         if store_handle.estimate_trop is True and antenna_handle.estimate_trop is True:
                             analytical_jac[num_samples:num_samples + len(datetime_array), antenna_trop_idxs] += \
                                     sign*antenna_jac[ant_idxs,3+len(clock_state)+len_ao+len_grav:3+len(clock_state)+len_ao+len_grav+len(trop_state)]
@@ -18608,8 +19414,9 @@ def calc_jac(state, ref_antenna, baselines, store_handle, antenna_handles, \
                 ref_handle = antenna_handle
 
         for idx, antenna_handle in enumerate(antenna_handles):
-            if ref_antenna != antenna_handle.antenna_name:
-                # pseudo-observation rows act on the stochastic clock samples only (global polynomial excluded)
+            if ref_antenna != antenna_handle.antenna_name and clock_leader(antenna_handle) is None:
+                # pseudo-observation rows act on the stochastic clock samples only (global polynomial excluded);
+                # a linked member's stochastic clock is its leader's
                 if phase_only is False:
                     clock_cols = np.arange(clock_idxs.start, clock_idxs.stop)[antenna_handle.range_clock_idxs][idx_start:]
                     S_clock = clock_process_operator(store_handle, antenna_handle, ref_handle, False)['S']
@@ -18703,5 +19510,8 @@ def calc_jac(state, ref_antenna, baselines, store_handle, antenna_handles, \
         analytical_jac = np.vstack([analytical_jac, np.sqrt(tikhonov_lambda) * tikhonov_L])
 
     analytical_jac[:weights.shape[0],:] = weights@analytical_jac[:weights.shape[0],:]
+    if antenna_covariance_active(store_handle):
+        analytical_jac[:weights.shape[0],:] = antenna_cov_whiten_marginal(store_handle, antenna_handles, baselines, baseline_handles, \
+                phase_delay, phase_only, use_phase_weights, analytical_jac[:weights.shape[0],:])
 
     return analytical_jac
