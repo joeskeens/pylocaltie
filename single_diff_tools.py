@@ -346,62 +346,153 @@ def num_clock_states(antenna_handle, idx_start, n_epochs):
         linked member """
     return idx_start + (1 if clock_leader(antenna_handle) is not None else n_epochs)
 
-CLOCK_CYCLE_TOL = 0.1 #unwrap_clock_cycles: a step of 1 +/- this many cycles between consecutive clock samples
+CLOCK_STEP_NSIG = 4.0      # unwrap_clock_cycles: a clock step is significant beyond this many robust sigmas of the steps
+CLOCK_STEP_MAX_SIGMA = 0.12 # unwrap_clock_cycles: above this robust step sigma (cycles), one cycle is not detectable
+CLOCK_STEP_SPLIT_TOL = 0.2  # unwrap_clock_cycles: a step that arcs span is moved only within this of a whole cycle
+
+def clock_cycle_steps(process_cycles, dt=None, nsig=CLOCK_STEP_NSIG, max_sigma=CLOCK_STEP_MAX_SIGMA):
+    """ Integer-cycle steps of a stochastic clock series (in cycles).
+
+        Boundary b lies between samples b and b+1 (dt_b apart), with step d_b = x_b+1 - x_b. The drift (median rate)
+        is removed, r_b = d_b - rate*dt_b, and since a random walk's step grows as sqrt(dt), each step is judged against
+        sigma*sqrt(dt_b/dt_med), sigma the robust (MAD) spread of r_b*sqrt(dt_med/dt_b): a step is flagged beyond
+        max(0.5, nsig*sigma*sqrt(dt_b/dt_med)). A long gap is not a step just because the clock wandered across it.
+        Within a run of consecutive flagged boundaries the cumulative r is rounded to whole cycles, and a step is placed
+        wherever that rounded level changes: a smeared step (0.4 + 0.5) is one step where it passes half a cycle, and a
+        one-sample excursion (+1, -1) is two steps, which move that sample's cycle into the ambiguities.
+
+        args:
+            process_cycles: clock samples / wavelength (length n)
+            dt: sample spacing (length n-1, any unit); None: uniform
+        returns:
+            cumulative: integer cycles to remove from each sample (length n)
+            steps: list of (boundary index, integer step, step in cycles relative to the previous level)
+            sigma: robust step sigma (cycles) at the median spacing; nothing is returned when sigma > max_sigma
+    """
+    x = np.asarray(process_cycles, dtype=float)
+    n = len(x)
+    cumulative = np.zeros(n)
+    if n < 3:
+        return cumulative, [], np.nan
+    dt = np.ones(n - 1) if dt is None else np.maximum(np.asarray(dt, dtype=float), 1e-12)
+    scale = np.sqrt(dt/np.median(dt)) # random-walk step sigma relative to the median spacing
+    r = np.diff(x) - np.median(np.diff(x)/dt)*dt
+    sigma = 1.4826*np.median(np.abs(r/scale - np.median(r/scale)))
+    if sigma > max_sigma:
+        return cumulative, [], sigma
+    flagged = np.abs(r) > np.maximum(0.5, nsig*sigma*scale)
+    steps = []
+    b = 0
+    while b < n - 1:
+        if not flagged[b]:
+            b += 1
+            continue
+        end = b
+        while end + 1 < n - 1 and flagged[end + 1]:
+            end += 1
+        level = 0
+        for at, partial in zip(range(b, end + 1), np.cumsum(r[b:end + 1])):
+            k = int(np.round(partial)) - level
+            if k != 0:
+                cumulative[at + 1:] += k
+                steps.append((at, k, partial - level))
+                level += k
+        b = end + 1
+    return cumulative, steps, sigma
 
 def amb_wavelength(store_handle, baseline_handle):
     """ Wavelength the baseline's ambiguities are in (scalar or per observation) """
     return baseline_handle.comb_wavelength if store_handle.iono_free else baseline_handle.wavelength
 
-def unwrap_clock_cycles(store_handle, state, ls_args, res_fcn, bounds=None):
-    """ Move one-cycle steps of the stochastic phase clocks into the fixed integer ambiguities (--unwrap_clock_cycles).
+def clock_group_arcs(store_handle, baselines, antenna_handles, baseline_handles, group):
+    """ Arcs with data on the baselines with one end on a clock group: (ambiguity index, sign of the clock in the
+        baseline clock difference, data epochs, baseline index, arc index), and the wavelengths of their data """
+    amb_offsets = np.cumsum([0] + [baseline_handle.n_amb_state for baseline_handle in baseline_handles])
+    arcs = []
+    wavelengths = []
+    for jdx, baseline in enumerate(baselines):
+        clock_sign = int(antenna_handles[baseline[1]].antenna_name in group) - int(antenna_handles[baseline[0]].antenna_name in group)
+        if clock_sign == 0:
+            continue
+        baseline_handle = baseline_handles[jdx]
+        for arc_idx, slip_slice in enumerate(baseline_handle.slip_slices_arr):
+            used = np.intersect1d(slip_slice, baseline_handle.phase_data_idxs)
+            if len(used) == 0:
+                continue
+            arcs.append((amb_offsets[jdx] + arc_idx, clock_sign, np.asarray(baseline_handle.datetime_array)[used], jdx, arc_idx))
+            wavelengths.append(np.atleast_1d(wavelength_at(amb_wavelength(store_handle, baseline_handle), used)))
+    return arcs, wavelengths
 
-        A step of +-lambda between consecutive samples u_k, u_k+1 of an antenna's clock, with a -+1 cycle shift of the
-        integers of every later arc on the baselines with one end on that clock, leaves the data residuals unchanged
-        when no arc spans the step. Only the clock process rows see the step, and the PSD estimation reads it as
-        clock noise. Steps with |du|/lambda within 1 +/- CLOCK_CYCLE_TOL and no spanning arc are removed from the
-        leader's samples (and so from its linked members' clocks); a step that an arc spans is constrained by the data
-        and left alone. The data rows of the residuals are checked to be unchanged, otherwise nothing is changed.
+def split_arcs(baseline_handles, amb, split_arcs_at):
+    """ Split arcs at epochs: the later piece of an arc is a new arc, right after it, with the same integer.
+
+        args:
+            amb: integer ambiguities of all baselines (numpy.ndarray)
+            split_arcs_at: {(baseline index, arc index): split epochs}; an arc's data at or after a split epoch go to
+                the later piece
+        returns:
+            the integer ambiguities with the new arcs inserted
+    """
+    for jdx in sorted({jdx for jdx, _ in split_arcs_at}, reverse=True):
+        baseline_handle = baseline_handles[jdx]
+        offset = sum(handle.n_amb_state for handle in baseline_handles[:jdx])
+        epochs = np.asarray(baseline_handle.datetime_array)
+        slices = list(baseline_handle.slip_slices_arr)
+        for arc_idx in sorted({arc_idx for j, arc_idx in split_arcs_at if j == jdx}, reverse=True):
+            slip_slice = np.asarray(slices[arc_idx])
+            arc_epochs = epochs[slip_slice]
+            pieces = []
+            lower = None
+            for split_epoch in sorted(split_arcs_at[(jdx, arc_idx)]):
+                piece = slip_slice[(arc_epochs < split_epoch) if lower is None else ((arc_epochs >= lower) & (arc_epochs < split_epoch))]
+                pieces.append(piece)
+                lower = split_epoch
+            pieces.append(slip_slice[arc_epochs >= lower])
+            slices[arc_idx:arc_idx + 1] = pieces
+            amb = np.insert(amb, offset + arc_idx + 1, np.full(len(pieces) - 1, amb[offset + arc_idx]))
+        baseline_handle.slip_slices_arr = slices
+        baseline_handle.n_amb_state = len(slices)
+    return amb
+
+def unwrap_clock_cycles(store_handle, state, ls_args, res_fcn, bounds=None):
+    """ Move integer-cycle steps of the stochastic phase clocks into the fixed integer ambiguities.
+
+        A step of k*lambda in an antenna's clock at epoch t_b is removed from the clock samples after t_b, and the
+        phase data after t_b on the baselines with one end on that clock take it instead: through the integer of each
+        arc that starts after t_b, and for an arc with data on both sides of t_b, by splitting it there (a slip common
+        to every arc, which no model-differenced slip detector sees because the clock takes it up). The data residuals
+        are unchanged; only the clock process rows lose the step. Nothing is changed unless that holds and the cost of
+        the non-data (clock/ZWD process) rows goes down.
 
         args:
             state: phase-only fixed-ambiguity state
-            ls_args: its residual arguments, all ambiguities fixed (integer_amb = ls_args[20], changed in place)
+            ls_args: its residual arguments, all ambiguities fixed (integer_amb = ls_args[20])
             res_fcn: calc_residuals
             bounds: (low, high) of the state; a clock whose unwrapped samples leave them is left alone
         returns:
-            state with the steps removed (a copy), number of steps removed
+            state with the steps removed (a copy), number of steps removed, ls_args with the new integer_amb (the
+            baseline handles' slip_slices_arr and n_amb_state change with it)
     """
     if store_handle.stochastic_clock is False or len(ls_args) != 21 or bool(ls_args[12]):
         print('unwrap_clock_cycles: needs --stochastic_clock and all ambiguities fixed -- skipped')
-        return state, 0
+        return state, 0, ls_args
     ref_antenna, baselines, antenna_handles, baseline_handles = ls_args[0], ls_args[1], ls_args[3], ls_args[9]
     phase_only, phase_clock_idxs, integer_amb = ls_args[11], ls_args[17], ls_args[20]
     idx_start = 1 if store_handle.global_linear_clock else (2 if store_handle.global_quadratic_clock else 0)
-    amb_offsets = np.cumsum([0] + [baseline_handle.n_amb_state for baseline_handle in baseline_handles])
     phase_clock_cols = np.arange(len(state))[phase_clock_idxs]
     state_new = np.array(state, dtype=float)
     amb_new = np.array(integer_amb, dtype=float)
+    arcs_old = [(list(baseline_handle.slip_slices_arr), baseline_handle.n_amb_state) for baseline_handle in baseline_handles]
+    residuals_old = np.asarray(res_fcn(state, *ls_args))
     n_removed = 0
     for leader in antenna_handles:
         if leader.antenna_name == ref_antenna or clock_leader(leader) is not None or leader.ppp_clock_active:
             continue
         group = {leader.antenna_name} | {member.antenna_name for member in clock_members(antenna_handles, leader)
                                          if not getattr(member, 'clock_leader_ref', False)}
-        # arcs with data on the baselines with one end on this clock: (ambiguity index, sign of the clock in the
-        # baseline clock difference, data epochs)
-        arcs = []
-        wavelengths = []
-        for jdx, baseline in enumerate(baselines):
-            clock_sign = int(antenna_handles[baseline[1]].antenna_name in group) - int(antenna_handles[baseline[0]].antenna_name in group)
-            if clock_sign == 0:
-                continue
-            baseline_handle = baseline_handles[jdx]
-            for arc_idx, slip_slice in enumerate(baseline_handle.slip_slices_arr):
-                used = np.intersect1d(slip_slice, baseline_handle.phase_data_idxs)
-                if len(used) == 0:
-                    continue
-                arcs.append((amb_offsets[jdx] + arc_idx, clock_sign, np.asarray(baseline_handle.datetime_array)[used]))
-                wavelengths.append(np.atleast_1d(wavelength_at(amb_wavelength(store_handle, baseline_handle), used)))
-        if len(arcs) == 0:
+        arcs, wavelengths = clock_group_arcs(store_handle, baselines, antenna_handles, baseline_handles, group)
+        times = np.asarray(leader.phase_clock_times)
+        if len(arcs) == 0 or len(times) < 3:
             continue
         wavelengths = np.concatenate(wavelengths)
         wavelength = np.median(wavelengths)
@@ -409,55 +500,75 @@ def unwrap_clock_cycles(store_handle, state, ls_args, res_fcn, bounds=None):
             print(f'unwrap_clock_cycles: {leader.antenna_name} arcs have more than one wavelength -- skipped')
             continue
 
-        times = np.asarray(leader.phase_clock_times)
         cols = phase_clock_cols[leader.phase_clock_idxs][idx_start:]
         process = state_new[cols].copy() # what the clock process rows difference
         if getattr(leader, 'grdel_clock_active', False):
             leader.interp_grdel_clock(leader.phase_clock_times)
             process -= leader.grdel_clock_samples
-        step_cycles = np.diff(process)/wavelength
-        cumulative = np.zeros(len(times))
-        n_leader = 0
-        for step_idx in np.where(np.abs(np.abs(step_cycles) - 1) <= CLOCK_CYCLE_TOL)[0]:
-            step_time = times[step_idx + 1]
-            spanning = sum(1 for _, _, arc_times in arcs if arc_times[0] < step_time <= arc_times[-1])
-            label = f'{leader.antenna_name} clock step {step_cycles[step_idx]:+.3f} cycles {times[step_idx]} -> {step_time}'
-            if spanning > 0:
-                print(f'{label}: spanned by {spanning} arc(s), kept')
-                continue
-            cumulative[step_idx + 1:] += np.round(step_cycles[step_idx])
-            n_leader += 1
-            print(f'{label}: to be moved to the ambiguities')
-        if n_leader == 0:
+        cumulative, steps, step_sigma = clock_cycle_steps(process/wavelength, np.diff(times)/np.timedelta64(1, 's'))
+        if step_sigma > CLOCK_STEP_MAX_SIGMA:
+            print(f'unwrap_clock_cycles: {leader.antenna_name} clock steps too noisy to resolve one cycle '
+                  f'(robust sigma {step_sigma:.2f} cycles) -- skipped')
             continue
+        # a step that arcs span, with a fractional total, is not a common wrap: the arcs across it disagree with any
+        # whole-cycle step (a wrong integer on one of them, typically); moving it would keep that wrong integer
+        accepted = []
+        for step_idx, k, total in steps:
+            n_span = sum(1 for arc in arcs if arc[2][0] < times[step_idx + 1] <= arc[2][-1])
+            if n_span > 0 and abs(total - k) > CLOCK_STEP_SPLIT_TOL:
+                print(f'{leader.antenna_name} clock step {total:+.3f} cycle(s) {times[step_idx]} -> {times[step_idx + 1]}: '
+                      f'spanned by {n_span} arc(s) and not within {CLOCK_STEP_SPLIT_TOL} of a whole cycle -- left alone '
+                      f'(check the integers of the arcs across it)')
+            else:
+                accepted.append((step_idx, k, total))
+        steps = accepted
+        if len(steps) == 0:
+            continue
+        cumulative = np.zeros(len(times))
+        for step_idx, k, _ in steps:
+            cumulative[step_idx + 1:] += k
         unwrapped = state_new[cols] - wavelength*cumulative
         if bounds is not None and (np.any(unwrapped < bounds[0][cols]) or np.any(unwrapped > bounds[1][cols])):
             print(f'unwrap_clock_cycles: {leader.antenna_name} unwrapped clock outside its bounds -- left alone')
             continue
+        step_epochs = [times[step_idx + 1] for step_idx, _, _ in steps]
+        split_arcs_at = {}
+        for _, _, arc_times, jdx, arc_idx in arcs:
+            inside = [epoch for epoch in step_epochs if arc_times[0] < epoch <= arc_times[-1]]
+            if len(inside) > 0:
+                split_arcs_at[(jdx, arc_idx)] = inside
+        for step_idx, k, total in steps:
+            n_split = sum(1 for epochs in split_arcs_at.values() if times[step_idx + 1] in epochs)
+            print(f'{leader.antenna_name} clock step {k:+d} cycle(s) (total {total:+.3f}) {times[step_idx]} -> '
+                  f'{times[step_idx + 1]}' + (f', {n_split} arc(s) split' if n_split else ''))
+        amb_new = split_arcs(baseline_handles, amb_new, split_arcs_at)
+        arcs, _ = clock_group_arcs(store_handle, baselines, antenna_handles, baseline_handles, group)
+        for amb_idx, clock_sign, arc_times, _, _ in arcs:
+            amb_new[amb_idx] -= clock_sign*cumulative[max(np.searchsorted(times, arc_times[0], side='right') - 1, 0)]
         state_new[cols] = unwrapped
-        n_removed += n_leader
-        for amb_idx, clock_sign, arc_times in arcs:
-            epoch_idx = max(np.searchsorted(times, arc_times[0], side='right') - 1, 0)
-            amb_new[amb_idx] -= clock_sign*cumulative[epoch_idx]
+        n_removed += len(steps)
 
     if n_removed == 0:
-        return state, 0
+        return state, 0, ls_args
     n_data = sum(len(baseline_handle.phase_data_idxs) + (0 if phase_only else len(baseline_handle.range_data_idxs))
                  for baseline_handle in baseline_handles)
-    amb_old = np.array(integer_amb, copy=True)
-    residuals_old = np.asarray(res_fcn(state, *ls_args))
-    integer_amb[:] = amb_new
-    residuals_new = np.asarray(res_fcn(state_new, *ls_args))
+    ls_args_new = tuple(ls_args[:20]) + (amb_new,)
+    residuals_new = np.asarray(res_fcn(state_new, *ls_args_new))
     data_change = np.max(np.abs(residuals_new[:n_data] - residuals_old[:n_data]))
-    if data_change > 1e-2:
-        integer_amb[:] = amb_old
+    cost_old = 0.5*residuals_old[n_data:]@residuals_old[n_data:]
+    cost_new = 0.5*residuals_new[n_data:]@residuals_new[n_data:]
+    if data_change > 1e-2 or cost_new >= cost_old:
+        for baseline_handle, (slices, n_amb_state) in zip(baseline_handles, arcs_old):
+            baseline_handle.slip_slices_arr = slices
+            baseline_handle.n_amb_state = n_amb_state
         res_fcn(state, *ls_args) # restore the handles
-        print(f'unwrap_clock_cycles: data residuals changed by up to {data_change:.3g} sigma -- steps not removed')
-        return state, 0
+        reason = f'data residuals changed by up to {data_change:.3g} sigma' if data_change > 1e-2 else \
+                 f'clock/ZWD row cost not reduced ({cost_old:.4g} -> {cost_new:.4g})'
+        print(f'unwrap_clock_cycles: {reason} -- steps not removed')
+        return state, 0, ls_args
     print(f'unwrap_clock_cycles: {n_removed} step(s) removed; data residuals unchanged (max {data_change:.1e} sigma), '
-          f'clock/ZWD row cost {0.5*residuals_old[n_data:]@residuals_old[n_data:]:.4g} -> '
-          f'{0.5*residuals_new[n_data:]@residuals_new[n_data:]:.4g}')
-    return state_new, n_removed
+          f'clock/ZWD row cost {cost_old:.4g} -> {cost_new:.4g}')
+    return state_new, n_removed, ls_args_new
 
 def transmitter_antex_code(frequency_hz, system_char):
     """ ANTEX frequency code for a transmitting satellite antenna.
@@ -12480,6 +12591,25 @@ def remove_outliers(residuals, baseline_handles, phase_only=False, phase=True):
 
         baseline_handle.phase_data_idxs = baseline_handle.phase_data_idxs[use_idxs_phase]
 
+def print_removed_phase(baseline_handle, residuals_phase, trend, use_idxs_phase, n_window):
+    """ Diagnostic: the phase observations iterative_remove_outliers removes (epoch, source, whitened residual, its
+        running-median trend) and the runs of consecutive removed observations """
+    removed = np.flatnonzero(~np.asarray(use_idxs_phase[:len(residuals_phase)], dtype=bool))
+    epochs = np.asarray(baseline_handle.datetime_array)[baseline_handle.phase_data_idxs]
+    sources = getattr(baseline_handle, 'source_time_dict', None) or {}
+    kept = residuals_phase[np.asarray(use_idxs_phase[:len(residuals_phase)], dtype=bool)]
+    print(f'  phase outliers: {len(removed)} of {len(residuals_phase)} (median-filter window {n_window} obs; '
+          f'kept RMS {np.sqrt(np.mean(kept**2)) if len(kept) else np.nan:.2f}, removed RMS '
+          f'{np.sqrt(np.mean(residuals_phase[removed]**2)):.2f} whitened)')
+    for idx in removed:
+        print(f'    {epochs[idx]}  {str(sources.get(epochs[idx], "?")):>6s}  res {residuals_phase[idx]:+9.2f}  '
+              f'trend {trend[idx]:+9.2f}  res-trend {residuals_phase[idx] - trend[idx]:+9.2f}')
+    runs = np.split(removed, np.flatnonzero(np.diff(removed) != 1) + 1)
+    for run in runs:
+        if len(run) >= 3:
+            print(f'    run of {len(run)} consecutive observations removed: {epochs[run[0]]} -> {epochs[run[-1]]} '
+                  f'(sources {sorted({str(sources.get(epochs[idx], "?")) for idx in run})})')
+
 def iterative_remove_outliers(store_handle, ls_sol, bounds, ls_args, res_fcn, jac, sol_type, n_ao_state, n_grav_state, phase_only=False, phase=True):
     """ Iteratively remove outliers, adjusting the least squares solution each time """
     delta_samples = np.inf
@@ -12531,6 +12661,9 @@ def iterative_remove_outliers(store_handle, ls_sol, bounds, ls_args, res_fcn, ja
                 len_pts += len(use_idxs_range)
 
             delta_phase += len(baseline_handle.phase_data_idxs) - np.sum(use_idxs_phase)
+            if phase is True and np.any(~use_idxs_phase):
+                print_removed_phase(baseline_handle, residuals_phase, medfilt(residuals_phase, kernel_size=N_window),
+                                    use_idxs_phase, N_window)
             baseline_handle.phase_data_idxs = baseline_handle.phase_data_idxs[use_idxs_phase] 
             len_pts += len(use_idxs_phase)
 
@@ -13056,6 +13189,54 @@ def clock_psd_pair(antenna_handle, ref_handle, phase=False):
             psd_rw  += ref_handle.clock_psd_rw
             psd_irw += ref_handle.clock_psd_irw
     return float(psd_rw), float(psd_irw)
+
+PHASE_CLOCK_CAP_N = 10 # cap_phase_clock_psd: a one-cycle clock jump over any clock interval is 2n sigma
+def cap_phase_clock_psd(store_handle, antenna_handles, baselines, baseline_handles, ref_antenna, n=PHASE_CLOCK_CAP_N):
+    """ Cap the phase clock random-walk PSD (taken from the group delay solution) so that a one-cycle jump of the
+        single-difference clock is 2n sigma over the longest clock interval:
+
+            max_b sigma_Delta(dt_b) <= lambda/(2n),   sigma_Delta^2 = q_rw dt  ->  q_rw <= lambda^2/(4 n^2 dt_max)
+
+        q_rw is that of the single-difference clock process (antenna + reference, as in clock_psd_pair); the
+        antenna's own PSD is lowered to meet the cap exactly. lambda is the shortest ambiguity wavelength of the
+        antenna's baselines (the narrow lane for ionosphere-free processing). The IRW PSD is left as it is.
+    """
+    ref_handle = next((handle for handle in antenna_handles if handle.antenna_name == ref_antenna), None)
+    for adx, antenna_handle in enumerate(antenna_handles):
+        if antenna_handle is ref_handle or clock_leader(antenna_handle) is not None:
+            continue
+        times = np.asarray(getattr(antenna_handle, 'clock_times', None) if getattr(antenna_handle, 'clock_times', None) is not None
+                           else antenna_handle.phase_clock_times)
+        if len(times) < 2:
+            continue
+        dt_max = np.max(np.diff(times))/np.timedelta64(1, 's')/3600 # hr
+        wavelengths = []
+        for jdx, baseline in enumerate(baselines):
+            if adx not in baseline:
+                continue
+            baseline_handle = baseline_handles[jdx]
+            if store_handle.iono_free:
+                f2 = getattr(baseline_handle, 'f2', None) or BAND_FREQ['L2'] # narrow lane; L2 is the shorter one
+                wavelengths.append(const.c/(baseline_handle.f1 + f2))
+            else:
+                wavelengths.append(np.min(np.atleast_1d(baseline_handle.wavelength)))
+        if len(wavelengths) == 0 or dt_max <= 0:
+            continue
+        wavelength_ps = min(wavelengths)/const.c*1e12
+        q_cap = wavelength_ps**2/(4*n**2*dt_max) # ps^2/hr
+        q_ref = getattr(ref_handle, 'phase_clock_psd_rw', 0.0) or 0.0
+        q_pair = antenna_handle.phase_clock_psd_rw + q_ref
+        if q_pair <= q_cap:
+            continue
+        q_new = q_cap - q_ref
+        if q_new <= 0:
+            print(f'{antenna_handle.antenna_name} phase clock PSD: the reference PSD alone ({q_ref:.4g} ps^2/hr) exceeds the '
+                  f'cap {q_cap:.4g} ps^2/hr -- left at {antenna_handle.phase_clock_psd_rw:.4g} ps^2/hr')
+            continue
+        print(f'{antenna_handle.antenna_name} phase clock PSD: rw {q_pair:.4g} ps^2/hr from the group delay solution exceeds '
+              f'lambda^2/(4 n^2 dt_max) = {q_cap:.4g} ps^2/hr (lambda {wavelength_ps:.1f} ps, n {n}, dt_max '
+              f'{dt_max*60:.1f} min) -- replaced: rw {q_new:.4g} ps^2/hr' + (f' (+ reference {q_ref:.4g})' if q_ref > 0 else ''))
+        antenna_handle.phase_clock_psd_rw = q_new
 
 def clock_process_operator(store_handle, antenna_handle, ref_handle, phase=False):
     """ Pseudo-observations for a stochastic clock u sampled at the (phase) clock epochs, modeled as the
@@ -17025,7 +17206,7 @@ def iterative_weight_adjust_ls_vce(
 ):
     if antenna_covariance_active(store_handle):
         return iterative_weight_adjust_antenna_vce(store_handle, state_expanded, bounds, ls_args, res_fcn, jac, sol_type, observable, no_PSD)
-    max_iter, tol_var = 5, 1e-4
+    max_iter, tol_var = 10, 1e-4
     FIT_IRW = True
 
     ref_antenna, baselines = ls_args[0], ls_args[1]

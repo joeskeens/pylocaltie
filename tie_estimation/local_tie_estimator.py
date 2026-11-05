@@ -70,7 +70,7 @@ from single_diff_tools import import_key_gnss, import_vex_gnss, import_data_vlbi
                   write_vda_phase, NavStore, fit_phase_clock_params_grdel, nearest_rinex_ant_code, source_map, \
                   wavelength_at, PREFERRED_IONO_BAND, owns_trop_states, share_site_troposphere, \
                   antenna_noise_params, clock_leader, linked_stochastic_clock, merge_linked_clock_times, num_clock_states, \
-                  unwrap_clock_cycles
+                  unwrap_clock_cycles, cap_phase_clock_psd
 
 MIN_SLICE = 0
 MIN_TROP_DIST = 0.5e3 # 1 km
@@ -1972,6 +1972,9 @@ def lstsq_estimation(sol_type, plot_intermediate_results, ref_antenna, store_han
     elif store_handle.stochastic_clock:
         # using group delay variation as a priori --> solve for phase phi_rw, phi_irw
         fit_phase_clock_params_grdel(ls_grdel, clock_idxs, store_handle, ls_args, idx_start)
+    if store_handle.stochastic_clock:
+        # a one-cycle phase clock jump must not be cheap: cap the PSD taken from the group delay solution
+        cap_phase_clock_psd(store_handle, antenna_handles, baselines, baseline_handles, ref_antenna)
 
     grdel_clock_idxs = clock_idxs
     for baseline_handle in baseline_handles:
@@ -2543,14 +2546,15 @@ def lstsq_estimation(sol_type, plot_intermediate_results, ref_antenna, store_han
     ls_phfixed_phaseonly_first = least_squares(calc_residuals, state_phfinal, jac=jac, method='trf',\
             max_nfev=100, bounds=bounds, verbose=2, x_scale = 'jac', xtol=1e-15,\
             args=ls_args)
-    if store_handle.stochastic_clock:
-        # one-cycle clock steps -> integer ambiguities (integer_amb changed in place), before the clock PSDs are estimated
-        state_unwrapped, n_steps = unwrap_clock_cycles(store_handle, ls_phfixed_phaseonly_first.x, ls_args, calc_residuals, bounds)
-        if n_steps > 0:
-            print('Re-executing initial phase-only fixed ambiguity solution with the clock cycles unwrapped:', flush=True)
-            ls_phfixed_phaseonly_first = least_squares(calc_residuals, state_unwrapped, jac=jac, method='trf',\
-                    max_nfev=100, bounds=bounds, verbose=2, x_scale = 'jac', xtol=1e-15,\
-                    args=ls_args)
+    #if store_handle.stochastic_clock:
+    #    # integer-cycle clock steps -> integer ambiguities (a new integer_amb in ls_args; arcs spanning a step are
+    #    # split), before the clock PSDs are estimated; again below, once outliers are removed and the weights adjusted
+    #    state_unwrapped, n_steps, ls_args = unwrap_clock_cycles(store_handle, ls_phfixed_phaseonly_first.x, ls_args, calc_residuals, bounds)
+    #    if n_steps > 0:
+    #        print('Re-executing initial phase-only fixed ambiguity solution with the clock cycles unwrapped:', flush=True)
+    #        ls_phfixed_phaseonly_first = least_squares(calc_residuals, state_unwrapped, jac=jac, method='trf',\
+    #                max_nfev=100, bounds=bounds, verbose=2, x_scale = 'jac', xtol=1e-15,\
+    #                args=ls_args)
 
     if covariance_kernel_phase is None:
         print('running iterative weight adjustment')
@@ -2603,6 +2607,28 @@ def lstsq_estimation(sol_type, plot_intermediate_results, ref_antenna, store_han
         else:
             ls_phfixed_phaseonly_first = iterative_weight_adjust(store_handle, ls_phfixed_phaseonly_first.x, bounds,\
                     ls_args, calc_residuals, jac, sol_type, 'phase')
+    #if store_handle.stochastic_clock:
+    #    # second pass with the outliers removed and the weights adjusted: before, a step can be buried in the clock
+    #    # sample noise of the poorly weighted first solution
+    #    state_unwrapped, n_steps, ls_args = unwrap_clock_cycles(store_handle, ls_phfixed_phaseonly_first.x, ls_args, calc_residuals, bounds)
+    #    integer_amb = ls_args[20]
+    #    if n_steps > 0:
+    #        print('Re-executing phase-only fixed ambiguity solution with the clock cycles unwrapped:', flush=True)
+    #        ls_phfixed_phaseonly_first = least_squares(calc_residuals, state_unwrapped, jac=jac, method='trf',\
+    #                max_nfev=100, bounds=bounds, verbose=2, x_scale = 'jac', xtol=1e-15,\
+    #                args=ls_args)
+    #        if covariance_kernel_phase is None:
+    #            print('re-running iterative weight adjustment (clock cycles unwrapped)')
+    #            print('\n')
+    #            if sol_type == 'GNSS' and store_handle.vlbi_like is False:
+    #                ls_phfixed_phaseonly_first = iterative_weight_adjust_LS_VCE_full(store_handle, ls_phfixed_phaseonly_first.x, bounds,\
+    #                        ls_args, calc_residuals, jac, sol_type, 'phase')
+    #            else:
+    #                ls_phfixed_phaseonly_first = iterative_weight_adjust_ls_vce(store_handle, ls_phfixed_phaseonly_first.x, bounds,\
+    #                       ls_args, calc_residuals, jac, sol_type, 'phase')
+    # the state on the current index sets: outlier removal re-samples the stochastic epochs (adjust_stoch_params), so
+    # the state taken before it no longer lines up with clock_idxs_phfix, phase_clock_idxs_phfix, amb_state_idxs_phfix
+    state_phfinal = ls_phfixed_phaseonly_first.x
     end_range_state = len(rxpos)+n_ao_state+n_grav_state+n_trop_tot
     state_hold = state_phfinal
     if store_handle.stochastic_clock is False:
