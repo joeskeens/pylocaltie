@@ -5233,7 +5233,7 @@ class AntennaInfo(object):
         #    self.clock_psd_rw = 0.21  # cm^2/day -- for VLBA H maser
         
         self.clock_psd_irw = 0.078  # ps^2/hr^3 -- for VLBA H maser
-        self.clock_psd_rw = 3.45  # ps^2/hr -- for VLBA H maser
+        #self.clock_psd_rw = 3.45  # ps^2/hr -- for VLBA H maser
         self.clock_psd_rw = 1e6  # ps^2/hr -- AuScope
         self.phase_clock_psd_irw = 0.078  # ps^2/hr^3 -- for VLBA H maser
         #self.phase_clock_psd_rw = 3.45  # ps^2/hr -- for VLBA H maser
@@ -13191,16 +13191,27 @@ def clock_psd_pair(antenna_handle, ref_handle, phase=False):
     return float(psd_rw), float(psd_irw)
 
 PHASE_CLOCK_CAP_N = 10 # cap_phase_clock_psd: a one-cycle clock jump over any clock interval is 2n sigma
-def cap_phase_clock_psd(store_handle, antenna_handles, baselines, baseline_handles, ref_antenna, n=PHASE_CLOCK_CAP_N):
-    """ Cap the phase clock random-walk PSD (taken from the group delay solution) so that a one-cycle jump of the
-        single-difference clock is 2n sigma over the longest clock interval:
+def cap_phase_clock_psd(store_handle, antenna_handles, baselines, baseline_handles, ref_antenna, n=None):
+    """ Cap the phase clock PSDs (taken from the group delay solution) so that a one-cycle jump of the
+        single-difference clock is 2n sigma over every clock interval:
 
-            max_b sigma_Delta(dt_b) <= lambda/(2n),   sigma_Delta^2 = q_rw dt  ->  q_rw <= lambda^2/(4 n^2 dt_max)
+            max_b sigma_Delta(dt_b, t_b) <= lambda/(2n)
 
-        q_rw is that of the single-difference clock process (antenna + reference, as in clock_psd_pair); the
-        antenna's own PSD is lowered to meet the cap exactly. lambda is the shortest ambiguity wavelength of the
-        antenna's baselines (the narrow lane for ionosphere-free processing). The IRW PSD is left as it is.
+        with sigma_Delta^2 the variance of the clock increment over interval b of the process model itself
+        (clock_process_operator: the diagonal of Cov(du)),
+
+            sigma_Delta^2(dt_b, t_b) = q_rw (dt_b - D_b/6) + q_irw (dt_b^2 t_b + dt_b^3/3),
+
+        t_b the start of the interval from the first clock epoch (the IRW datum) and D_b the scan duration.
+        q_rw, q_irw are those of the single-difference clock process (antenna + reference, as in clock_psd_pair).
+        If the bound is violated, both PSDs of the pair are scaled by s = (lambda/2n)^2 / max_b sigma_Delta^2, so
+        that it holds exactly at the worst interval and the random-walk/integrated-random-walk ratio of the group
+        delay solution is kept; the antenna's own PSDs take the change. lambda is the shortest ambiguity
+        wavelength of the antenna's baselines (the narrow lane for ionosphere-free processing).
     """
+    changed = False
+    if n is None:
+        n = getattr(store_handle, 'phase_clock_cap_n', PHASE_CLOCK_CAP_N) # --phase_clock_cap_n
     ref_handle = next((handle for handle in antenna_handles if handle.antenna_name == ref_antenna), None)
     for adx, antenna_handle in enumerate(antenna_handles):
         if antenna_handle is ref_handle or clock_leader(antenna_handle) is not None:
@@ -13209,7 +13220,6 @@ def cap_phase_clock_psd(store_handle, antenna_handles, baselines, baseline_handl
                            else antenna_handle.phase_clock_times)
         if len(times) < 2:
             continue
-        dt_max = np.max(np.diff(times))/np.timedelta64(1, 's')/3600 # hr
         wavelengths = []
         for jdx, baseline in enumerate(baselines):
             if adx not in baseline:
@@ -13220,23 +13230,45 @@ def cap_phase_clock_psd(store_handle, antenna_handles, baselines, baseline_handl
                 wavelengths.append(const.c/(baseline_handle.f1 + f2))
             else:
                 wavelengths.append(np.min(np.atleast_1d(baseline_handle.wavelength)))
-        if len(wavelengths) == 0 or dt_max <= 0:
+        if len(wavelengths) == 0:
             continue
         wavelength_ps = min(wavelengths)/const.c*1e12
-        q_cap = wavelength_ps**2/(4*n**2*dt_max) # ps^2/hr
-        q_ref = getattr(ref_handle, 'phase_clock_psd_rw', 0.0) or 0.0
-        q_pair = antenna_handle.phase_clock_psd_rw + q_ref
-        if q_pair <= q_cap:
+        bound = (wavelength_ps/(2*n))**2 # ps^2
+
+        # increment variance per interval, as clock_process_operator builds it (hours here: PSDs in ps^2/hr, ps^2/hr^3)
+        times_sec = (times - times[0])/np.timedelta64(1, 's')
+        dt = np.diff(times_sec)
+        durations = np.array([store_handle.duration_dict[time] for time in times[1:]], dtype=float)
+        durations[dt - durations < 0] = 0
+        g_rw = dt - durations/6
+        g_rw[g_rw <= 0] = dt[g_rw <= 0]
+        g_rw = g_rw/3600
+        g_irw = (dt**2*times_sec[:-1] + dt**3/3)/3600**3
+        q_rw_ref = getattr(ref_handle, 'phase_clock_psd_rw', 0.0) or 0.0
+        q_irw_ref = getattr(ref_handle, 'phase_clock_psd_irw', 0.0) or 0.0
+        q_rw = antenna_handle.phase_clock_psd_rw + q_rw_ref
+        q_irw = antenna_handle.phase_clock_psd_irw + q_irw_ref
+        var = q_rw*g_rw + q_irw*g_irw
+        worst = int(np.argmax(var))
+        if var[worst] <= bound:
             continue
-        q_new = q_cap - q_ref
-        if q_new <= 0:
-            print(f'{antenna_handle.antenna_name} phase clock PSD: the reference PSD alone ({q_ref:.4g} ps^2/hr) exceeds the '
-                  f'cap {q_cap:.4g} ps^2/hr -- left at {antenna_handle.phase_clock_psd_rw:.4g} ps^2/hr')
+        scale = bound/var[worst]
+        q_rw_new, q_irw_new = scale*q_rw - q_rw_ref, scale*q_irw - q_irw_ref
+        if q_rw_new < 0 or q_irw_new < 0:
+            print(f'{antenna_handle.antenna_name} phase clock PSD: the reference PSDs alone exceed the cap '
+                  f'(max sigma_Delta {np.sqrt(var[worst]):.4g} ps > lambda/2n = {np.sqrt(bound):.4g} ps) -- left as they are')
             continue
-        print(f'{antenna_handle.antenna_name} phase clock PSD: rw {q_pair:.4g} ps^2/hr from the group delay solution exceeds '
-              f'lambda^2/(4 n^2 dt_max) = {q_cap:.4g} ps^2/hr (lambda {wavelength_ps:.1f} ps, n {n}, dt_max '
-              f'{dt_max*60:.1f} min) -- replaced: rw {q_new:.4g} ps^2/hr' + (f' (+ reference {q_ref:.4g})' if q_ref > 0 else ''))
-        antenna_handle.phase_clock_psd_rw = q_new
+        print(f'{antenna_handle.antenna_name} phase clock PSD: rw {q_rw:.4g} ps^2/hr, irw {q_irw:.4g} ps^2/hr^3 from the group '
+              f'delay solution give max sigma_Delta {np.sqrt(var[worst]):.4g} ps (dt {dt[worst]/60:.1f} min at '
+              f't {times_sec[worst]/3600:.2f} hr) > lambda/2n = {np.sqrt(bound):.4g} ps (lambda {wavelength_ps:.1f} ps, n {n:g}) '
+              f'-- scaled by {scale:.4g}: rw {q_rw_new:.4g} ps^2/hr, irw {q_irw_new:.4g} ps^2/hr^3'
+              + (f' (+ reference rw {q_rw_ref:.4g}, irw {q_irw_ref:.4g})' if q_rw_ref > 0 or q_irw_ref > 0 else ''))
+        antenna_handle.clock_psd_rw = q_rw_new
+        antenna_handle.clock_psd_irw = q_irw_new
+        antenna_handle.phase_clock_psd_rw = q_rw_new
+        antenna_handle.phase_clock_psd_irw = q_irw_new
+        changed = True
+    return changed
 
 def clock_process_operator(store_handle, antenna_handle, ref_handle, phase=False):
     """ Pseudo-observations for a stochastic clock u sampled at the (phase) clock epochs, modeled as the
@@ -17207,7 +17239,8 @@ def iterative_weight_adjust_ls_vce(
     if antenna_covariance_active(store_handle):
         return iterative_weight_adjust_antenna_vce(store_handle, state_expanded, bounds, ls_args, res_fcn, jac, sol_type, observable, no_PSD)
     max_iter, tol_var = 10, 1e-4
-    FIT_IRW = True
+    FIT_RW = True   # estimate the clock random-walk PSD (else held at its current value, its variance known)
+    FIT_IRW = True  # estimate the clock integrated-random-walk PSD (else held, likewise)
 
     ref_antenna, baselines = ls_args[0], ls_args[1]
     antenna_handles, baseline_handles = ls_args[3], ls_args[9]
@@ -17216,6 +17249,7 @@ def iterative_weight_adjust_ls_vce(
         phase_only = True
     else:
         #FIT_IRW = False
+        #FIT_RW = False
         phase_delay, use_phase_weights = False, None
         phase_only = False
 
@@ -17277,6 +17311,9 @@ def iterative_weight_adjust_ls_vce(
             if no_PSD or not FIT_IRW:
                 # IRW variance is known here, not estimated
                 var_apr[num_samples:num_samples+n] += op['psd_irw']*op['cof_irw']
+            if no_PSD or not FIT_RW:
+                # RW variance is known here, not estimated
+                var_apr[num_samples:num_samples+n] += op['psd_rw']*op['cof_rw']
             num_samples += n
 
         # ---------------- Stochastic troposphere ------------------------
@@ -17340,7 +17377,8 @@ def iterative_weight_adjust_ls_vce(
                     Q_full_rw[num_samples:num_samples+n] = op['cof_rw']      # m^2 per ps^2/hr
                     Q_full_irw[num_samples:num_samples+n] = op['cof_irw']    # m^2 per ps^2/hr^3
                     num_samples += n
-                    Q_vecs.append(Q_full_rw)
+                    if FIT_RW is True:
+                        Q_vecs.append(Q_full_rw)
                     if FIT_IRW is True:
                         Q_vecs.append(Q_full_irw)
 
@@ -17414,8 +17452,9 @@ def iterative_weight_adjust_ls_vce(
             for ant in antenna_handles:
                 if ant.antenna_name == ref_antenna or clock_leader(ant) is not None: # members: no clock rows
                     continue
-                sig_hat[idx] = max(sig_hat[idx], 1e-2)
-                idx += 1
+                if FIT_RW:
+                    sig_hat[idx] = max(sig_hat[idx], 1e-2)
+                    idx += 1
                 if FIT_IRW:
                     sig_hat[idx] = max(sig_hat[idx], 1e-3)
                     idx += 1
@@ -17449,7 +17488,10 @@ def iterative_weight_adjust_ls_vce(
                 if ant.antenna_name == ref_antenna or clock_leader(ant) is not None: # members: no clock rows
                     continue
                 print(f'for antenna {ant.antenna_name}:')
-                if observable == 'range':
+                if not FIT_RW:
+                    held = ant.clock_psd_rw if observable == 'range' else ant.phase_clock_psd_rw
+                    print(f"clock psd rw: {held} ps^2/hr (held)")
+                elif observable == 'range':
                     #ant.clock_psd_rw = min(max(sig_hat[idx], 1e-2), 3e6)
                     ant.clock_psd_rw = max(sig_hat[idx], 1e-2)
                     print(f"clock psd rw: {ant.clock_psd_rw} ps^2/hr")
@@ -17464,7 +17506,8 @@ def iterative_weight_adjust_ls_vce(
                     #    #ant.clock_psd_rw = min(max(sig_hat[idx], 1e-2), 345)
                     #    #ant.clock_psd_rw = min(max(sig_hat[idx], 1e-2), 50)
                     #    ant.clock_psd_rw = min(max(sig_hat[idx], 1e-2), 50)
-                idx += 1
+                if FIT_RW:
+                    idx += 1
                 if FIT_IRW:
                     if observable == 'range':
                         ant.clock_psd_irw = max(sig_hat[idx], 1e-4)
