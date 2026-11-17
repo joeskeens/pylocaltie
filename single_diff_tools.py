@@ -104,9 +104,11 @@ BLOCK_MAP = { # map for satellite blocks
     "GALILEO-0A": 14,
     "GALILEO-0B": 15
 }
+# merged per epoch in this order: pilot before data where a receiver records both -- Galileo E1C before E1B,
+# BeiDou B1C pilot (C1P) before data (C1D) -- for lower code noise and the same signal as pilot-only receivers
 mapping_dict = {
-    'C1': ['C1D', 'C1B', 'C1C', 'C1P'],
-    'L1': ['L1D', 'L1B', 'L1C', 'L1P'],
+    'C1': ['C1C', 'C1P', 'C1B', 'C1D'],
+    'L1': ['L1C', 'L1P', 'L1B', 'L1D'],
     'P2': ['C2S'],
     'L2': ['L2S']
 }
@@ -120,13 +122,15 @@ BAND_FREQ = {
     'E6': 1278.75e6,
 }
 CODE_PREF_ORDER = {
-    'L1': ['C1L', 'C1S', 'C1X', 'C1P', 'C1W', 'C1'],
+    #'L1': ['C1L', 'C1S', 'C1X', 'C1P', 'C1W', 'C1'],
+    'L1': ['C1', 'C1L', 'C1S', 'C1X', 'C1P', 'C1W'],
     'L2': ['C2L', 'C2S', 'C2X', 'C2P', 'C2W', 'C2', 'P2'],
     'L5': ['C5Q', 'C5X', 'C5P', 'C5I', 'C5'],
     'E6': ['C6C', 'C6X', 'C6Z', 'C6B', 'C6A', 'C6Q', 'C6I', 'C6'],
 }
 PHASE_PREF_ORDER = {
-    'L1': ['L1L', 'L1S', 'L1X', 'L1P', 'L1W', 'L1'],
+    #'L1': ['L1L', 'L1S', 'L1X', 'L1P', 'L1W', 'L1'], 
+    'L1': ['L1', 'L1L', 'L1S', 'L1X', 'L1P', 'L1W'],
     'L2': ['L2L', 'L2S', 'L2X', 'L2P', 'L2W', 'L2'],
     'L5': ['L5Q', 'L5X', 'L5P', 'L5I', 'L5'],
     'E6': ['L6C', 'L6X', 'L6Z', 'L6B', 'L6A', 'L6Q', 'L6I', 'L6'],
@@ -267,6 +271,26 @@ def clock_leader(antenna_handle):
     """ Antenna whose stochastic clock this antenna shares (--linked_clock), or None """
     return getattr(antenna_handle, 'clock_leader', None)
 
+# Range clock global only (--phase_stochastic_clock): the stochastic clock is estimated for the carrier phase only. The
+# range clock block of every non-reference antenna is [global polynomial coefficients, offset], with no clock process
+# rows -- the same layout as a linked member of the reference -- and the phase clock keeps its own stochastic samples.
+def range_clock_global(antenna_handle):
+    """ True when the antenna's range clock is its global polynomial and an offset only (--phase_stochastic_clock) """
+    return getattr(antenna_handle, 'range_clock_global', False)
+
+def clock_follows(antenna_handle, phase=False):
+    """ True when the antenna's (phase) clock block is [global coefficients, offset] with no clock process rows of its
+        own: a linked member, or a global-only range clock """
+    return clock_leader(antenna_handle) is not None or (not phase and range_clock_global(antenna_handle))
+
+def shared_clock_leader(antenna_handle, phase=False):
+    """ Leader whose stochastic (phase) clock samples this antenna's clock adds, or None (no leader, a reference leader,
+        or a global-only range clock) """
+    leader = clock_leader(antenna_handle)
+    if leader is None or getattr(antenna_handle, 'clock_leader_ref', False) or (not phase and range_clock_global(antenna_handle)):
+        return None
+    return leader
+
 def clock_members(antenna_handles, antenna_handle):
     """ Antennas that share antenna_handle's stochastic clock """
     return [handle for handle in antenna_handles if clock_leader(handle) is antenna_handle]
@@ -284,11 +308,11 @@ def linked_clock_epoch_indices(antenna_handle, phase=False):
 def linked_stochastic_clock(antenna_handle, stochastic_state, clock_states, idx_start, phase=False):
     """ Stochastic part of an antenna's clock at its epochs: its own samples, or for a linked member its offset plus
         the leader's samples (clock_states: the full (phase) clock block of the state) """
-    leader = clock_leader(antenna_handle)
-    if leader is None:
+    if not clock_follows(antenna_handle, phase):
         return stochastic_state
     clock = np.full(len(antenna_handle.phase_clock_times if phase else antenna_handle.clock_times), float(stochastic_state[0]))
-    if not getattr(antenna_handle, 'clock_leader_ref', False):
+    leader = shared_clock_leader(antenna_handle, phase)
+    if leader is not None:
         leader_state = clock_states[leader.phase_clock_idxs if phase else leader.range_clock_idxs][idx_start:]
         clock += leader_state[linked_clock_epoch_indices(antenna_handle, phase)]
     return clock
@@ -297,12 +321,12 @@ def linked_clock_partials(antenna_handle, partials, own_cols, leader_cols, idx_s
     """ (columns, partials) to add to the full Jacobian for an antenna's clock: partials are w.r.t. its global
         coefficients and one sample per clock epoch; a member's per-epoch partials go to its offset (summed) and to
         the leader's samples at its epochs (leader_cols: the leader's stochastic columns; None for the reference) """
-    if clock_leader(antenna_handle) is None:
+    if not clock_follows(antenna_handle, phase):
         return own_cols, partials
     per_epoch = partials[:, idx_start:]
     cols = [np.asarray(own_cols[:idx_start + 1])]
     vals = [partials[:, :idx_start], per_epoch.sum(axis=1, keepdims=True)]
-    if leader_cols is not None and not getattr(antenna_handle, 'clock_leader_ref', False):
+    if leader_cols is not None and shared_clock_leader(antenna_handle, phase) is not None:
         cols.append(np.asarray(leader_cols)[linked_clock_epoch_indices(antenna_handle, phase)])
         vals.append(per_epoch)
     return np.concatenate(cols), np.hstack(vals)
@@ -330,6 +354,8 @@ def merge_linked_clock_times(antenna_handles):
         for times_attr, samples_attr in (('clock_times', 'clock_samples'), ('phase_clock_times', 'phase_clock_samples')):
             if len(members) == 0 or getattr(leader, times_attr, None) is None:
                 continue
+            if times_attr == 'clock_times' and range_clock_global(leader):
+                continue # global-only range clock: no samples to share
             old_times = np.asarray(getattr(leader, times_attr))
             new_times = old_times
             for member in members:
@@ -341,10 +367,10 @@ def merge_linked_clock_times(antenna_handles):
                 setattr(leader, samples_attr, np.interp(new_sec, old_sec, np.asarray(samples, dtype=float)))
             setattr(leader, times_attr, new_times)
 
-def num_clock_states(antenna_handle, idx_start, n_epochs):
-    """ Clock states of a non-reference antenna: global coefficients plus a sample per epoch, or plus one offset for a
-        linked member """
-    return idx_start + (1 if clock_leader(antenna_handle) is not None else n_epochs)
+def num_clock_states(antenna_handle, idx_start, n_epochs, phase=False):
+    """ (Phase) clock states of a non-reference antenna: global coefficients plus a sample per epoch, or plus one offset
+        for a linked member or a global-only range clock """
+    return idx_start + (1 if clock_follows(antenna_handle, phase) else n_epochs)
 
 CLOCK_STEP_NSIG = 4.0      # unwrap_clock_cycles: a clock step is significant beyond this many robust sigmas of the steps
 CLOCK_STEP_MAX_SIGMA = 0.12 # unwrap_clock_cycles: above this robust step sigma (cycles), one cycle is not detectable
@@ -590,6 +616,19 @@ RECEIVER_ANTEX_FALLBACK = {'E01': 'G01', 'C01': 'G01', 'J01': 'G01', 'S01': 'G01
                            'E05': 'G05', 'C05': 'G05', 'J05': 'G05', 'S05': 'G05', 'E06': 'G02', 'C06': 'G02',
                            'J06': 'G02', 'E07': 'G05', 'E08': 'G05', 'C07': 'G05', 'C08': 'G05', 'G05': 'G02'}
 _receiver_antex_cache = {}
+def apply_ant_offset(antenna_handle, rxpos):
+    """ Shift a receiver position by the antenna's --ant_offset (NEU, m), as correct_PR_CP does in GNSS mode
+
+        args:
+            antenna_handle: AntennaInfo
+            rxpos: ECEF position (m)
+        returns:
+            ECEF position with the offset applied (a new array)
+    """
+    if antenna_handle.offset_NEU is None:
+        return rxpos
+    return rxpos + antenna_handle.R_mat.dot(antenna_handle.offset_NEU)
+
 def receiver_antex_code(antenna_pco, freq_code):
     """ ANTEX frequency code to use for a receiver antenna calibration: freq_code if the calibration has it,
         otherwise the first code of its RECEIVER_ANTEX_FALLBACK chain that it has (with a warning, once per antenna
@@ -1321,7 +1360,7 @@ def read_thermal_deformation_coeffs(ant_info_file, antenna_handles):
 
 # separation (m) below which two antennas are a local tie (same site) for the Ties-* baseline strategies
 LOCAL_TIE_MAX_LENGTH = 10e3
-BASELINE_STRATEGIES = ('Obs-Max', 'Shortest', 'Ties-GNSS', 'Ties-VLBI')
+BASELINE_STRATEGIES = ('Obs-Max', 'Shortest', 'Ties-GNSS', 'Ties-VLBI', 'Max-GNSS-VLBI')
 
 def get_spanning_tree(antenna_handles, strategy='Obs-Max'):
     """
@@ -1338,6 +1377,8 @@ def get_spanning_tree(antenna_handles, strategy='Obs-Max'):
                       receivers.
         'Ties-VLBI' : local ties first, then the sites joined by VLBI-VLBI baselines (maser clocks at both ends),
                       then GNSS-GNSS, then mixed.
+        'Max-GNSS-VLBI' : as many GNSS-VLBI baselines as the tree can hold (shortest first, whatever the length),
+                      then GNSS-GNSS, then VLBI-VLBI (shortest first within each).
         A bool is accepted for backward compatibility (True: 'Obs-Max', False: 'Shortest').
 
     Returns `baselines`: list of (i, j) index pairs (i < j) into
@@ -1381,6 +1422,18 @@ def get_spanning_tree(antenna_handles, strategy='Obs-Max'):
         def weight(edge):
             i, j = edge
             return float(np.linalg.norm(pos[i] - pos[j]))  # baseline length
+    elif strategy == 'Max-GNSS-VLBI':
+        # rank (class, length): 0 GNSS-VLBI, 1 GNSS-GNSS, 2 VLBI-VLBI. Kruskal over the classes in order gives a tree
+        # with the most GNSS-VLBI baselines possible (greedy on the graphic matroid)
+        pos = [antenna_position(idx) for idx in range(n)]
+        is_vlbi = [bool(getattr(handle, 'is_VLBI', False)) for handle in antenna_handles]
+
+        def weight(edge):
+            i, j = edge
+            length = float(np.linalg.norm(pos[i] - pos[j]))
+            if is_vlbi[i] != is_vlbi[j]:
+                return (0, length)
+            return (2 if is_vlbi[i] else 1, length)
     else:
         # Ties-*: rank (class, length) -- class 0 local ties; long baselines 1 preferred type, 2 the other
         # same-type pair, 3 mixed VLBI-GNSS (phase not connected between scans at the VLBI end, and no maser at the other)
@@ -7173,8 +7226,8 @@ class GNSSTKStores(object):
             eph_time.setTimeSystem(TimeSystem.UTC)
             sat_antenna = self.antenna_map[str(sat_id)]
             RSID = RinexSatID(str(sat_id))
-            rxpos1 = antenna1_handle.pos_series[pos_idxs1[idx],:]
-            rxpos2 = antenna2_handle.pos_series[pos_idxs2[idx],:]
+            rxpos1 = apply_ant_offset(antenna1_handle, antenna1_handle.pos_series[pos_idxs1[idx],:])
+            rxpos2 = apply_ant_offset(antenna2_handle, antenna2_handle.pos_series[pos_idxs2[idx],:])
 
             freq1 = transmitter_antex_code(f1, RSID.systemChar())
             if self.iono_free:
@@ -7634,8 +7687,8 @@ class GNSSTKStores(object):
             model_idxs.append(idx)
             eph_time = EphTime(times_common[pos_idxs1[idx]])
             eph_time.setTimeSystem(TimeSystem.UTC)
-            rxpos1 = antenna1_handle.pos_series[pos_idxs1[idx],:]
-            rxpos2 = antenna2_handle.pos_series[pos_idxs2[idx],:]
+            rxpos1 = apply_ant_offset(antenna1_handle, antenna1_handle.pos_series[pos_idxs1[idx],:])
+            rxpos2 = apply_ant_offset(antenna2_handle, antenna2_handle.pos_series[pos_idxs2[idx],:])
 
             R_T2I = self.get_ECEF2ECI(eph_time)
             
@@ -9280,8 +9333,8 @@ class GNSSTKStores(object):
             eph_time.setTimeSystem(TimeSystem.UTC)
             sat_antenna = self.antenna_map[str(sat_id)]
             RSID = RinexSatID(str(sat_id))
-            rxpos1 = antenna1_handle.pos_series[pos_idxs1[idx],:]
-            rxpos2 = antenna2_handle.pos_series[pos_idxs2[idx],:]
+            rxpos1 = apply_ant_offset(antenna1_handle, antenna1_handle.pos_series[pos_idxs1[idx],:])
+            rxpos2 = apply_ant_offset(antenna2_handle, antenna2_handle.pos_series[pos_idxs2[idx],:])
 
             freq1 = transmitter_antex_code(f1, RSID.systemChar())
             if self.iono_free:
@@ -9605,8 +9658,8 @@ class GNSSTKStores(object):
                 continue # satellite (mixed): row filled by compute_analytical_jac_vlbi
             eph_time = EphTime(times_common[idx])
             eph_time.setTimeSystem(TimeSystem.UTC)
-            rxpos1 = antenna1_handle.pos_series[pos_idxs1[idx],:]
-            rxpos2 = antenna2_handle.pos_series[pos_idxs2[idx],:]
+            rxpos1 = apply_ant_offset(antenna1_handle, antenna1_handle.pos_series[pos_idxs1[idx],:])
+            rxpos2 = apply_ant_offset(antenna2_handle, antenna2_handle.pos_series[pos_idxs2[idx],:])
 
             R_T2I = self.get_ECEF2ECI(eph_time)
 
@@ -12706,6 +12759,123 @@ def iterative_remove_outliers(store_handle, ls_sol, bounds, ls_args, res_fcn, ja
 
     return ls_sol, ls_args, bounds
 
+PHASE_RESTORE_NSIG = 3.5 # iterative_restore_phase: restore an excluded phase observation within this many sigmas
+
+def phase_data_finite(store_handle, baseline_handle):
+    """ Mask of the baseline's epochs that carry phase data (the combination for ionosphere-free processing) """
+    if store_handle.sol_type == 'VLBI':
+        finite = np.isfinite(np.asarray(baseline_handle.phase_delays, dtype=float))
+        if store_handle.iono_free and getattr(baseline_handle, 'phase_delays_dual', None) is not None:
+            finite &= np.isfinite(np.asarray(baseline_handle.phase_delays_dual, dtype=float))
+        return finite
+    data = baseline_handle.cp_combination if store_handle.iono_free else baseline_handle.cp_diff
+    return np.isfinite(np.asarray(data, dtype=float))
+
+def phase_restore_window(baseline_handle):
+    """ Running-median window (observations) of iterative_remove_outliers for the baseline """
+    if len(baseline_handle.datetime_array) > 1:
+        t_delta = np.mean(np.diff((baseline_handle.datetime_array-baseline_handle.datetime_array[0])/np.timedelta64(1, 's')))
+        n_window = int(np.round(1800/t_delta))
+    else:
+        n_window = 1
+    return n_window + 1 if n_window % 2 == 0 else n_window
+
+def set_phase_idxs(store_handle, ls_sol_x, bounds, ls_args, phase_idxs, n_ao_state, n_grav_state):
+    """ Set every baseline's phase_data_idxs and move the state onto them: the stochastic clock and ZWD samples are
+        re-sampled on the new epochs (adjust_stoch_params; new epochs linearly interpolated from the closest samples).
+        Returns the state, bounds (padded with +-inf when the state grows) and ls_args """
+    baseline_handles = ls_args[9]
+    for baseline_handle, idxs in zip(baseline_handles, phase_idxs):
+        baseline_handle.phase_data_idxs = np.asarray(idxs, dtype=int)
+    state = np.asarray(ls_sol_x, dtype=float)
+    if store_handle.stochastic_clock or store_handle.stochastic_trop:
+        state, _, clock_idxs, trop_idxs, disb_idxs, phase_clock_idxs, phase_disb_idxs, amb_state_idxs = \
+                adjust_stoch_params(store_handle, ls_args[3], baseline_handles, ls_args[1], ls_args[0], state, ls_args[4], \
+                ls_args[6], ls_args[8], n_ao_state, n_grav_state, True, ls_args[17], ls_args[18], ls_args[13], ls_args[11])
+        ls_args_list = list(ls_args)
+        ls_args_list[4], ls_args_list[6], ls_args_list[8] = clock_idxs, trop_idxs, disb_idxs
+        ls_args_list[13], ls_args_list[17], ls_args_list[18] = amb_state_idxs, phase_clock_idxs, phase_disb_idxs
+        ls_args = tuple(ls_args_list)
+    n_state = len(state)
+    def fit(bound, fill):
+        bound = np.asarray(bound, dtype=float)[:n_state]
+        return np.concatenate((bound, np.full(n_state - len(bound), fill)))
+    return state, (fit(bounds[0], -np.inf), fit(bounds[1], np.inf)), ls_args
+
+def iterative_restore_phase(store_handle, ls_sol, bounds, ls_args, res_fcn, jac, n_ao_state, n_grav_state, nsig=PHASE_RESTORE_NSIG):
+    """ Iteratively restore excluded phase observations (after the last LS-VCE of the phase-only fixed solution).
+
+        Candidates are the excluded epochs with phase data inside an arc that keeps its ambiguity. Each pass evaluates
+        them in the current solution without re-adjusting it: with a stochastic clock (troposphere), the samples at a
+        candidate epoch no other observation supports are linearly interpolated from the closest samples. A candidate
+        is restored when its standardized residual is within nsig sigmas of the running median of the included
+        residuals (the outlier test of iterative_remove_outliers, sigma the RMS of the included residuals about that
+        median). The restored observations enter the solution, which is re-adjusted, and the passes repeat until
+        no observation is restored.
+
+        returns:
+            ls_sol, ls_args, bounds -- as iterative_remove_outliers
+    """
+    baseline_handles = ls_args[9]
+    if len(ls_args) < 21 or not ls_args[11]:
+        print('phase restore: phase-only fixed solutions only -- skipped')
+        return ls_sol, ls_args, bounds
+    n_restored_total = 0
+    while True:
+        kept = [np.asarray(baseline_handle.phase_data_idxs, dtype=int) for baseline_handle in baseline_handles]
+        candidates = []
+        for baseline_handle, kept_idxs in zip(baseline_handles, kept):
+            arcs = [np.asarray(arc, dtype=int) for arc in baseline_handle.slip_slices_arr if len(np.intersect1d(arc, kept_idxs)) > 0]
+            in_arc = np.unique(np.concatenate(arcs)) if arcs else np.array([], dtype=int)
+            finite = phase_data_finite(store_handle, baseline_handle)
+            in_arc = in_arc[(in_arc < len(finite))]
+            candidates.append(np.setdiff1d(in_arc[finite[in_arc]], kept_idxs))
+        if sum(len(cand) for cand in candidates) == 0:
+            break
+
+        # evaluate the candidates in the current solution (stochastic samples interpolated at their epochs)
+        trial = [np.union1d(kept_idxs, cand) for kept_idxs, cand in zip(kept, candidates)]
+        state_trial, _, ls_args_trial = set_phase_idxs(store_handle, ls_sol.x, bounds, ls_args, trial, n_ao_state, n_grav_state)
+        residuals = antenna_cov_marginal_residuals(store_handle, ls_args_trial, res_fcn(state_trial, *ls_args_trial))
+        restored = []
+        num_samples = 0
+        for baseline_handle, kept_idxs, cand, trial_idxs in zip(baseline_handles, kept, candidates, trial):
+            res = residuals[num_samples:num_samples + len(trial_idxs)]
+            num_samples += len(trial_idxs)
+            is_kept = np.isin(trial_idxs, kept_idxs)
+            is_cand = ~is_kept
+            ok = np.zeros(len(trial_idxs), dtype=bool)
+            if np.sum(is_kept) > 0 and np.any(is_cand):
+                times = (np.asarray(baseline_handle.datetime_array)[trial_idxs] - baseline_handle.datetime_array[0])/np.timedelta64(1, 's')
+                n_window = min(phase_restore_window(baseline_handle), int(np.sum(is_kept)) - (1 - int(np.sum(is_kept)) % 2))
+                trend_kept = medfilt(res[is_kept], kernel_size=max(n_window, 1))
+                sigma = np.sqrt(np.mean((res[is_kept] - trend_kept)**2))
+                trend = np.interp(times, times[is_kept], trend_kept)
+                ok = is_cand & np.isfinite(res) & (np.abs(res - trend) <= nsig*sigma)
+            restored.append(trial_idxs[ok])
+            if np.any(ok):
+                epochs = np.asarray(baseline_handle.datetime_array)[trial_idxs[ok]]
+                sources = getattr(baseline_handle, 'source_time_dict', None) or {}
+                print(f'  phase restore: {int(np.sum(ok))} of {int(np.sum(is_cand))} excluded observations within {nsig:g} sigma '
+                      f'(sigma {sigma:.2f} whitened)')
+                for epoch, res_ok, trend_ok in zip(epochs, res[ok], trend[ok]):
+                    print(f'    {epoch}  {str(sources.get(epoch, "?")):>6s}  res {res_ok:+9.2f}  res-trend {res_ok - trend_ok:+9.2f}')
+        n_restored = sum(len(idxs) for idxs in restored)
+
+        # restored observations enter the solution (none: back to the solution's index sets)
+        new_idxs = [np.union1d(kept_idxs, idxs) for kept_idxs, idxs in zip(kept, restored)]
+        state, bounds, ls_args = set_phase_idxs(store_handle, state_trial, bounds, ls_args_trial, new_idxs, n_ao_state, n_grav_state)
+        if n_restored == 0:
+            ls_sol.x = state
+            ls_sol.fun = res_fcn(state, *ls_args)
+            break
+        n_restored_total += n_restored
+        ls_sol = least_squares(res_fcn, state, jac=jac, method='trf', max_nfev=100, bounds=bounds, verbose=0,
+                               x_scale='jac', xtol=1e-15, args=ls_args)
+        print('restored ' + str(n_restored) + ' phase observations')
+    print(f'phase restore: {n_restored_total} observations restored')
+    return ls_sol, ls_args, bounds
+
 def trim_amb(baseline_handles, start):
     """ find slip slices with insufficient data length and remove them """
     n_amb = 0
@@ -13010,8 +13180,8 @@ def adjust_stoch_params(store_handle, antenna_handles, baseline_handles, baselin
 
             if store_handle.stochastic_clock is True:
                 if phase_only is False:
-                    if clock_leader(antenna_handle) is not None:
-                        clock_state_adj = clock_state_ant # linked member: [global, offset]; leader's samples added below
+                    if clock_follows(antenna_handle):
+                        clock_state_adj = clock_state_ant # linked member / global-only range clock: [global, offset]
                     else:
                         clock_state_adj = np.zeros(len(times_full_range)+idx_start)
                         clock_state_adj[idx_start:] = sample_stoch_params_at_times(clock_state_ant[idx_start:], antenna_handle.clock_times, times_full_range)
@@ -13036,6 +13206,11 @@ def adjust_stoch_params(store_handle, antenna_handles, baseline_handles, baselin
                         if idx_start>0:
                             phase_clock_state_adj[:idx_start] = phase_clock_state_ant[:idx_start]
                         phase_clock_state_ant = phase_clock_state_adj
+                        phase_clock_samples += phase_clock_state_ant[idx_start:]
+                    elif range_clock_global(antenna_handle) and clock_leader(antenna_handle) is None:
+                        # global-only range clock: the phase clock's own stochastic samples start at the range offset
+                        phase_clock_state_ant = np.concatenate((clock_state_ant[:idx_start],
+                                                                np.full(len(times_full_phase), clock_state_ant[idx_start])))
                         phase_clock_samples += phase_clock_state_ant[idx_start:]
                     else:
                         # phase clock initialized as range clock state
@@ -13068,13 +13243,13 @@ def adjust_stoch_params(store_handle, antenna_handles, baseline_handles, baselin
                 trop_state_new = np.append(trop_state_new, trop_state_ant)
 
     if store_handle.stochastic_clock is True:
-        # linked members' held clocks follow their leaders' re-sampled clocks
+        # linked members' held clocks follow their leaders' re-sampled clocks (global-only range clocks: their offset)
         for antenna_handle in antenna_handles:
-            if clock_leader(antenna_handle) is None:
+            if antenna_handle.antenna_name == ref_antenna:
                 continue
-            if phase_only is False:
+            if phase_only is False and clock_follows(antenna_handle):
                 antenna_handle.hold_clock(linked_clock_samples(store_handle, antenna_handle, clock_state_new, idx_start))
-            if phase is True:
+            if phase is True and clock_leader(antenna_handle) is not None:
                 antenna_handle.hold_clock(linked_clock_samples(store_handle, antenna_handle, phase_clock_state_new, idx_start, True),
                                           phase_delay=True)
      
@@ -13475,6 +13650,8 @@ def set_bounds_phase_clock(bound_low, bound_high, clock_bound, store_handle, ant
 
             # set bounds for the phase clock function to agree with the range clock function
             clock_state_ant = clock_states[antenna_handle.range_clock_idxs][idx_start:] # range clock state
+            if store_handle.stochastic_clock is True and range_clock_global(antenna_handle):
+                clock_state_ant = linked_stochastic_clock(antenna_handle, clock_state_ant, clock_states, idx_start) # offset per epoch
 
             # initialize bounds
             bound_low_pc_ant = np.zeros(len(phase_clock_states[antenna_handle.phase_clock_idxs]))
@@ -13535,6 +13712,106 @@ def set_bounds_phase_clock(bound_low, bound_high, clock_bound, store_handle, ant
 
     return bound_low, bound_high, state_expanded
 
+def baseline_ppp_clock(antenna1_handle, antenna2_handle, ant1_idxs, ant2_idxs, baseline_handle, stochastic, phase=False):
+    """ PPP clock part (m) of the differential clock antenna2 - antenna1, on the epochs and in the order that
+        analyze_ls_solution builds diff_clock (phase False) or diff_clock_phase (phase True)
+
+        args:
+            antenna1_handle, antenna2_handle: AntennaInfo of the baseline
+            ant1_idxs, ant2_idxs: indices into each antenna's times_gps (used without a stochastic clock)
+            baseline_handle: BaselineInfo (used with a stochastic clock)
+            stochastic: True if the clock samples are held on clock_times / phase_clock_times
+            phase: use the phase clock epochs
+        returns:
+            differential PPP clock (m)
+    """
+    if not stochastic:
+        return antenna2_handle.ppp_clock_at(antenna2_handle.times_gps)[ant2_idxs] - \
+                antenna1_handle.ppp_clock_at(antenna1_handle.times_gps)[ant1_idxs]
+    diff_ppp = np.zeros(len(baseline_handle.datetime_array))
+    for sign, antenna_handle in ((1.0, antenna2_handle), (-1.0, antenna1_handle)):
+        clock_times = antenna_handle.phase_clock_times if phase else antenna_handle.clock_times
+        _, idxs_clock, idxs_baseline = np.intersect1d(clock_times, baseline_handle.datetime_array, return_indices=True)
+        diff_ppp[idxs_baseline] += sign*antenna_handle.ppp_clock_at(clock_times)[idxs_clock]
+    return diff_ppp
+
+def plot_clock_without_ppp(index_array, clock_m, residuals_m, weight_mat, sigmas_m, observable, antenna1_handle,
+                           antenna2_handle, interval_hr, file_prefix, file_suffix):
+    """ Residuals + clock function, clock function and residuals + clock variation (linear fit removed) plots as in
+        analyze_ls_solution, for a differential clock with the PPP clock(s) removed, so the shape of the estimated
+        clock function can be inspected
+
+        args:
+            index_array: epochs (datetime64)
+            clock_m: differential clock without the PPP clock (m)
+            residuals_m: postfit residuals (m)
+            weight_mat: observation weight matrix of the residuals (for the WRMS)
+            sigmas_m: 1-sigma of the clock function (m), or None
+            observable: 'range' or 'phase'
+            antenna1_handle, antenna2_handle: AntennaInfo of the baseline
+            interval_hr: hour interval of the date ticks
+            file_prefix: e.g. sol_type+'_'+sol_name+'_' (+'phase_' for phase)
+            file_suffix: '_ionofree' or ''
+    """
+    names = antenna2_handle.antenna_name + '—' + antenna1_handle.antenna_name
+    ppp_names = ', '.join(antenna_handle.antenna_name for antenna_handle in (antenna1_handle, antenna2_handle)
+                          if antenna_handle.ppp_clock_active)
+    file_names = antenna2_handle.antenna_name + '_' + antenna1_handle.antenna_name + file_suffix + '.png'
+
+    WRMS = np.sqrt(np.sum((weight_mat@residuals_m)**2)/np.trace(weight_mat@weight_mat.T))/const.c*1e12
+    fig, ax1 = plt.subplots(figsize=(10, 6))
+    ax1.scatter(index_array, (clock_m + residuals_m)/const.c*1e12, marker='.' if observable == 'range' else 'o',
+                color='g', label='res. + clock', zorder=1)
+    ax1.plot(index_array, clock_m/const.c*1e12, linestyle='--', color='slategray', label='clock function', zorder=0)
+    ax1.legend()
+    ax1.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d %H:%M'))
+    ax1.xaxis.set_major_locator(mdates.HourLocator(interval=interval_hr))
+    fig.autofmt_xdate()
+    ax1.set_title('postfit residuals + clock function, PPP clock removed (' + ppp_names + ') (' + names + ')'
+                  + ' WRMS: ' + str(np.round(WRMS, decimals=1)) + ' ps')
+    ax1.set_ylabel(observable + ' + clock function (ps)')
+    ax1.grid(True)
+    fig.savefig(file_prefix + 'clock_residuals_noPPP_' + file_names)
+    plt.close(fig)
+
+    fig, ax1 = plt.subplots(figsize=(10, 6))
+    ax2 = ax1.twinx()
+    if sigmas_m is not None:
+        ax1.fill_between(index_array, clock_m - sigmas_m, clock_m + sigmas_m, alpha=0.25, lw=0, color='C0', label=r'$1\sigma$')
+        ax2.fill_between(index_array, (clock_m - sigmas_m)*1e6/const.c, (clock_m + sigmas_m)*1e6/const.c,
+                         alpha=0.25, lw=0, color='C0', label=r'$1\sigma$')
+    ax1.plot(index_array, clock_m, linestyle='-', color='b')
+    ax1.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d %H:%M'))
+    ax1.xaxis.set_major_locator(mdates.HourLocator(interval=interval_hr))
+    fig.autofmt_xdate()
+    ax1.set_title('diff. clock function, PPP clock removed (' + ppp_names + ') (' + names + ')')
+    ax1.set_ylabel('diff. clock (m)')
+    ax1.grid(True)
+    ax2.plot(index_array, clock_m*1e6/const.c, linestyle='-', color='b')
+    ax2.set_ylabel('(microsec)')
+    fig.savefig(file_prefix + 'clock_fcn_noPPP_' + file_names)
+    plt.close(fig)
+
+    # clock variation: linear fit to the clock function removed
+    clock_ps = clock_m/const.c*1e12
+    time_array = (index_array - index_array[0])/np.timedelta64(1, 's')
+    fit = linregress(time_array, clock_ps)
+    best_fit_line = time_array*fit.slope + fit.intercept
+    fig, ax1 = plt.subplots(figsize=(10, 6))
+    ax1.scatter(index_array, clock_ps + residuals_m/const.c*1e12 - best_fit_line, marker='.' if observable == 'range' else 'o',
+                color='g', label='res. + clock', zorder=1)
+    ax1.plot(index_array, clock_ps - best_fit_line, linestyle='--', color='slategray', label='clock variation', zorder=0)
+    ax1.legend()
+    ax1.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d %H:%M'))
+    ax1.xaxis.set_major_locator(mdates.HourLocator(interval=interval_hr))
+    fig.autofmt_xdate()
+    ax1.set_title('postfit residuals + clock variation, PPP clock removed (' + ppp_names + ') (' + names + ')'
+                  + ' WRMS: ' + str(np.round(WRMS, decimals=1)) + ' ps')
+    ax1.set_ylabel(observable + ' + clock variation (ps)')
+    ax1.grid(True)
+    fig.savefig(file_prefix + 'clock_variation_residuals_noPPP_' + file_names)
+    plt.close(fig)
+
 def baseline_clock_fcn_sigma(cov_matrix_full, clock_idxs, antenna1_handle, antenna2_handle,
                              ref_antenna, store_handle, times_gps, eval_times, phase=False):
     """ 1-sigma of the differential clock function (antenna2 - antenna1) on a baseline.
@@ -13579,12 +13856,12 @@ def baseline_clock_fcn_sigma(cov_matrix_full, clock_idxs, antenna1_handle, anten
                 for epoch in eval_times])
         else:
             global_partials = np.zeros((len(eval_times), 0))
-        leader = clock_leader(antenna_handle)
-        if leader is not None:
-            # linked member: [global, offset] plus the leader's samples at its epochs
+        if clock_follows(antenna_handle, phase):
+            # linked member / global-only range clock: [global, offset] plus any leader's samples at its epochs
+            leader = shared_clock_leader(antenna_handle, phase)
             state_columns.append(clock_columns[antenna_columns])
             design_blocks.append(sign * np.hstack([global_partials, sample_matrix.sum(axis=1, keepdims=True)]))
-            if not antenna_handle.clock_leader_ref:
+            if leader is not None:
                 leader_columns = clock_columns[leader.phase_clock_idxs if phase else leader.range_clock_idxs][num_global:]
                 state_columns.append(leader_columns[linked_clock_epoch_indices(antenna_handle, phase)])
                 design_blocks.append(sign * sample_matrix)
@@ -13608,6 +13885,49 @@ def baseline_clock_fcn_sigma(cov_matrix_full, clock_idxs, antenna1_handle, anten
     sigma_absolute = np.sqrt(np.maximum(variance_absolute, 0.0))
     sigma_variation = np.sqrt(np.maximum(variance_variation, 0.0))
     return sigma_absolute, sigma_variation
+
+def plot_residual_skyplot(antenna1_handle, antenna2_handle, epochs, residuals, observable, filename):
+    """ Skyplot of a baseline's residuals, colored by residual, at the GNSS antenna of the baseline (antenna2 if both or
+        neither are GNSS): azimuth clockwise from north, elevation 90 deg at the center. On these short baselines the
+        azimuth/elevation of either antenna will do.
+
+        args:
+            epochs: numpy.datetime64 epochs of the residuals
+            residuals: unweighted residuals (m)
+            observable: 'range' (colored in m) or 'phase' (colored in mm)
+            filename: output file
+    """
+    gnss = [handle for handle in (antenna2_handle, antenna1_handle) if not getattr(handle, 'is_VLBI', False)]
+    handle = gnss[0] if gnss else antenna2_handle
+    times = np.asarray(handle.times_gps)
+    epochs = np.asarray(epochs)
+    idxs = np.clip(np.searchsorted(times, epochs), 0, max(len(times) - 1, 0))
+    matched = (times[idxs] == epochs) if len(times) > 0 else np.zeros(len(epochs), dtype=bool)
+    if not np.any(matched) or getattr(handle, 'azim_arr', None) is None or len(handle.azim_arr) != len(times):
+        print(f'skyplot: no azimuth/elevation for {handle.antenna_name} at the {observable} epochs -- skipped')
+        return
+    azim = np.radians(np.asarray(handle.azim_arr, dtype=float)[idxs[matched]])
+    elev = np.asarray(handle.elev_arr, dtype=float)[idxs[matched]]
+    scale, unit = (1e3, 'mm') if observable == 'phase' else (1.0, 'm')
+    values = np.asarray(residuals, dtype=float)[matched]*scale
+    rms = np.sqrt(np.mean(values**2))
+    limit = 3*1.4826*np.median(np.abs(values - np.median(values))) or np.max(np.abs(values)) or 1.0
+    order = np.argsort(np.abs(values)) # largest residuals drawn on top
+    fig = plt.figure(figsize=(8, 8))
+    ax = fig.add_subplot(projection='polar')
+    ax.set_theta_zero_location('N')
+    ax.set_theta_direction(-1)
+    scatter = ax.scatter(azim[order], 90 - elev[order], c=values[order], cmap='RdBu_r', vmin=-limit, vmax=limit, s=28,
+                         edgecolors='k', linewidths=0.3)
+    ax.set_rlim(0, 90)
+    ax.set_rticks([0, 15, 30, 45, 60, 75, 90])
+    ax.set_yticklabels(['90', '75', '60', '45', '30', '15', '0'])
+    ax.set_rlabel_position(135)
+    fig.colorbar(scatter, ax=ax, shrink=0.75, pad=0.08, label=f'{observable} residual ({unit})')
+    ax.set_title(f'{observable} residuals ({antenna2_handle.antenna_name}—{antenna1_handle.antenna_name}) at '
+                 f'{handle.antenna_name}, RMS {rms:.3g} {unit}', pad=20)
+    fig.savefig(filename)
+    plt.close(fig)
 
 def analyze_ls_solution(sol_type, plot_results, ref_antenna, clock_idxs, trop_idxs, disb_idxs, ls_sol, store_handle, antenna_handles, sol_name, baselines,\
                         n_ao_state, baseline_handles=[], phase_delay=False, phase_only=False, phase_clock_idxs=[], phase_disb_idxs=[], use_phase_weights=False, integer_amb=[]):
@@ -13912,6 +14232,16 @@ def analyze_ls_solution(sol_type, plot_results, ref_antenna, clock_idxs, trop_id
                 diff_clock_phase[ant2_dt] += antenna2_handle.phase_clock_samples[ant2_idxs_phase]
                 diff_clock_phase[ant1_dt] -= antenna1_handle.phase_clock_samples[ant1_idxs_phase]
 
+        has_ppp_clock = antenna1_handle.ppp_clock_active or antenna2_handle.ppp_clock_active
+        if has_ppp_clock and phase_only is False:
+            diff_ppp = baseline_ppp_clock(antenna1_handle, antenna2_handle, ant1_idxs, ant2_idxs,
+                    baseline_handle if len(baseline_handles)>0 else None,
+                    len(baseline_handles)>0 and store_handle.stochastic_clock)
+            dc_range_ppp = diff_ppp[baseline_handle.range_data_idxs] if len(baseline_handles)>0 else diff_ppp
+        if has_ppp_clock and phase_delay is True:
+            diff_ppp_phase = baseline_ppp_clock(antenna1_handle, antenna2_handle, ant1_idxs, ant2_idxs,
+                    baseline_handle, store_handle.stochastic_clock, phase=True)[baseline_handle.phase_data_idxs]
+
         if len(trop_states)>0:
             if len(baseline_handles) == 0 or store_handle.stochastic_trop is False:
                 diff_trop = antenna2_handle.trop_samples[ant2_idxs ] - \
@@ -14065,6 +14395,15 @@ def analyze_ls_solution(sol_type, plot_results, ref_antenna, clock_idxs, trop_id
                 plt.savefig(sol_type+'_'+sol_name+'_elev_residuals_'+antenna2_handle.antenna_name+'_' + antenna1_handle.antenna_name + '.png')
             plt.close()
 
+            # skyplot of the range residuals
+            if len(baseline_handles)>0:
+                epochs_range = baseline_handle.datetime_array[baseline_handle.range_data_idxs]
+            else:
+                epochs_range = np.intersect1d(antenna1_handle.times_gps, antenna2_handle.times_gps)
+            plot_residual_skyplot(antenna1_handle, antenna2_handle, epochs_range, residuals_range, 'range',
+                                  sol_type+'_'+sol_name+'_skyplot_range_residuals_'+antenna2_handle.antenna_name+'_' +
+                                  antenna1_handle.antenna_name + ('_ionofree' if iono_free is True else '') + '.png')
+
             # Set the datetime as the index
             data.set_index('Datetime', inplace=True)
             index_array = data.index.to_numpy() 
@@ -14206,6 +14545,11 @@ def analyze_ls_solution(sol_type, plot_results, ref_antenna, clock_idxs, trop_id
                 fig.savefig(sol_type+'_'+sol_name+'_clock_fcn_'+antenna2_handle.antenna_name+'_' + antenna1_handle.antenna_name + '.png')
             plt.close(fig)
 
+            if has_ppp_clock:
+                plot_clock_without_ppp(index_array, c_m - dc_range_ppp, data['Residuals'].to_numpy(), range_weight_mat,
+                        sigmas_absolute if store_handle.stochastic_clock else None, 'range', antenna1_handle, antenna2_handle,
+                        interval_hr, sol_type+'_'+sol_name+'_', '_ionofree' if iono_free is True else '')
+
             if len(trop_states)>0 and len(baseline_handles)>0 and phase_only is False:
                 # plot dZWD function
                 fig, ax1 = plt.subplots(figsize=(10, 6))
@@ -14323,6 +14667,10 @@ def analyze_ls_solution(sol_type, plot_results, ref_antenna, clock_idxs, trop_id
             data_phase.set_index('Datetime', inplace=True)
              
             phase_index_array = data_phase.index.to_numpy()
+            # skyplot of the phase residuals
+            plot_residual_skyplot(antenna1_handle, antenna2_handle, dt_phase, residuals_phase, 'phase',
+                                  sol_type+'_'+sol_name+'_skyplot_phase_residuals_'+antenna2_handle.antenna_name+'_' +
+                                  antenna1_handle.antenna_name + ('_ionofree' if iono_free is True else '') + '.png')
             # plot measurement residuals
             plt.figure(figsize=(10, 6))
             plt.plot(phase_index_array, data_phase['Residuals'].to_numpy(), marker='x', linestyle='None', color='b')         
@@ -14439,6 +14787,12 @@ def analyze_ls_solution(sol_type, plot_results, ref_antenna, clock_idxs, trop_id
             else:
                 fig.savefig(sol_type+'_'+sol_name+'_phase_clock_residuals_'+antenna2_handle.antenna_name+'_' + antenna1_handle.antenna_name + '.png')
             plt.close(fig)
+
+            if has_ppp_clock:
+                plot_clock_without_ppp(phase_index_array, c_m_phase - diff_ppp_phase, data_phase['Residuals'].to_numpy(),
+                        phase_weight_mat, sigmas_absolute_phase if store_handle.stochastic_clock else None, 'phase',
+                        antenna1_handle, antenna2_handle, interval_hr, sol_type+'_'+sol_name+'_phase_',
+                        '_ionofree' if iono_free is True else '')
 
             if phase_only is False:
                 # plot clock residuals
@@ -14797,7 +15151,7 @@ def analyze_ls_solution(sol_type, plot_results, ref_antenna, clock_idxs, trop_id
                 if phase_only is False:
                     tau_values_range = generate_tau_values(baseline_handle.datetime_array[baseline_handle.range_data_idxs], 200)
                     tau_values_range, allan_var_range, allan_dev_range = compute_allan_variance(residuals_range/const.c*1e12, \
-                                                       baseline_handle.datetime_array[baseline_handle.phase_data_idxs], tau_values_range)
+                                                       baseline_handle.datetime_array[baseline_handle.range_data_idxs], tau_values_range)
                     fig, ax2 = plt.subplots(figsize=(10, 6))
                     ax2.plot(tau_values_range, allan_dev_range)
                     ax2.set_xlabel('averaging time (s)')
@@ -17272,7 +17626,7 @@ def iterative_weight_adjust_ls_vce(
         clock_ops = []
         if store_handle.stochastic_clock:
             for ant in antenna_handles:
-                if ant.antenna_name == ref_antenna or clock_leader(ant) is not None: # members: no clock rows
+                if ant.antenna_name == ref_antenna or clock_follows(ant, phase_delay): # members, global-only range clocks: no clock rows
                     continue
                 clock_ops.append(clock_process_expansion(clock_process_operator(store_handle, ant, ref_handle, phase_delay)))
         fun_e, J_e = expand_clock_rows(ls_sol.fun, ls_sol.jac, n_data, clock_ops)
@@ -17450,7 +17804,7 @@ def iterative_weight_adjust_ls_vce(
             idx += 1
         if not no_PSD and store_handle.stochastic_clock:
             for ant in antenna_handles:
-                if ant.antenna_name == ref_antenna or clock_leader(ant) is not None: # members: no clock rows
+                if ant.antenna_name == ref_antenna or clock_follows(ant, phase_delay): # members, global-only range clocks: no clock rows
                     continue
                 if FIT_RW:
                     sig_hat[idx] = max(sig_hat[idx], 1e-2)
@@ -17485,7 +17839,7 @@ def iterative_weight_adjust_ls_vce(
 
         if not no_PSD and store_handle.stochastic_clock:
             for ant in antenna_handles:
-                if ant.antenna_name == ref_antenna or clock_leader(ant) is not None: # members: no clock rows
+                if ant.antenna_name == ref_antenna or clock_follows(ant, phase_delay): # members, global-only range clocks: no clock rows
                     continue
                 print(f'for antenna {ant.antenna_name}:')
                 if not FIT_RW:
@@ -18568,9 +18922,11 @@ def iterative_weight_adjust_antenna_vce(store_handle, state_expanded, bounds, ls
         pseudo = []
         if store_handle.stochastic_clock:
             for antenna_handle in antenna_handles:
-                if antenna_handle.antenna_name == ref_antenna or clock_leader(antenna_handle) is not None: # members: no clock rows
+                if antenna_handle.antenna_name == ref_antenna:
                     continue
                 for phase_clock in ([False] if phase_only is False else []) + ([True] if phase_delay is True else []):
+                    if clock_follows(antenna_handle, phase_clock): # members, global-only range clocks: no clock rows
+                        continue
                     n_rows = clock_process_operator(store_handle, antenna_handle, ref_handle, phase_clock)['S'].shape[0]
                     pseudo.append((f'{antenna_handle.antenna_name} {"phase " if phase_clock else ""}clock', 'clock', (antenna_handle, phase_clock), row, n_rows))
                     row += n_rows
@@ -19010,8 +19366,8 @@ def calc_residuals(state, ref_antenna, baselines, store_handle, antenna_handles,
                 ref_handle = antenna_handle
 
         for antenna_handle in antenna_handles:
-            if ref_antenna != antenna_handle.antenna_name and clock_leader(antenna_handle) is None: # members: leader's rows
-                if phase_only is False:
+            if ref_antenna != antenna_handle.antenna_name: # members: leader's rows; global-only range clocks: phase rows only
+                if phase_only is False and not clock_follows(antenna_handle):
                     clock_samples = antenna_handle.clock_samples.copy()
                     if antenna_handle.ppp_clock_active:
                         antenna_handle.interp_ppp_clock(antenna_handle.clock_times)
@@ -19025,7 +19381,7 @@ def calc_residuals(state, ref_antenna, baselines, store_handle, antenna_handles,
                         clock_stochastic = clock_samples
                     residuals = np.concatenate((residuals, clock_process_rows(store_handle, antenna_handle, ref_handle,
                                                                               clock_stochastic, False)))
-                if phase_delay is True:
+                if phase_delay is True and clock_leader(antenna_handle) is None:
                     phase_clock_samples = antenna_handle.phase_clock_samples.copy()
 
                     if antenna_handle.ppp_clock_active:
@@ -19252,16 +19608,15 @@ def calc_jac(state, ref_antenna, baselines, store_handle, antenna_handles, \
 
             # linked clock member: partials per clock epoch, mapped to its offset and the leader's samples
             leader_clock_cols, leader_phase_clock_cols = None, None
-            leader_handle = clock_leader(antenna_handle)
-            if leader_handle is not None:
-                if phase_only is False:
-                    clock_state = np.zeros(idx_start_clock + len(antenna_handle.clock_times))
-                    if not antenna_handle.clock_leader_ref:
-                        leader_clock_cols = clock_idxs_list[leader_handle.range_clock_idxs][idx_start_clock:]
-                if phase_delay is True:
-                    phase_clock_state = np.zeros(idx_start_clock + len(antenna_handle.phase_clock_times))
-                    if not antenna_handle.clock_leader_ref:
-                        leader_phase_clock_cols = phase_clock_idxs_list[leader_handle.phase_clock_idxs][idx_start_clock:]
+            if phase_only is False and clock_follows(antenna_handle):
+                # linked member / global-only range clock: per-epoch partials, summed into the offset by add_clock_partials
+                clock_state = np.zeros(idx_start_clock + len(antenna_handle.clock_times))
+                if shared_clock_leader(antenna_handle) is not None:
+                    leader_clock_cols = clock_idxs_list[shared_clock_leader(antenna_handle).range_clock_idxs][idx_start_clock:]
+            if phase_delay is True and clock_leader(antenna_handle) is not None:
+                phase_clock_state = np.zeros(idx_start_clock + len(antenna_handle.phase_clock_times))
+                if shared_clock_leader(antenna_handle, True) is not None:
+                    leader_phase_clock_cols = phase_clock_idxs_list[shared_clock_leader(antenna_handle, True).phase_clock_idxs][idx_start_clock:]
             
             if store_handle.estimate_trop is True and antenna_handle.estimate_trop is True:
                 trop_state = trop_states[antenna_handle.trop_idxs]
@@ -19638,17 +19993,17 @@ def calc_jac(state, ref_antenna, baselines, store_handle, antenna_handles, \
                 ref_handle = antenna_handle
 
         for idx, antenna_handle in enumerate(antenna_handles):
-            if ref_antenna != antenna_handle.antenna_name and clock_leader(antenna_handle) is None:
+            if ref_antenna != antenna_handle.antenna_name:
                 # pseudo-observation rows act on the stochastic clock samples only (global polynomial excluded);
-                # a linked member's stochastic clock is its leader's
-                if phase_only is False:
+                # a linked member's stochastic clock is its leader's; a global-only range clock has none
+                if phase_only is False and not clock_follows(antenna_handle):
                     clock_cols = np.arange(clock_idxs.start, clock_idxs.stop)[antenna_handle.range_clock_idxs][idx_start:]
                     S_clock = clock_process_operator(store_handle, antenna_handle, ref_handle, False)['S']
                     jac_ant_clock = np.zeros((S_clock.shape[0], analytical_jac.shape[1]))
                     jac_ant_clock[:, clock_cols] = S_clock
                     analytical_jac = np.vstack([analytical_jac, jac_ant_clock])
 
-                if phase_delay is True:
+                if phase_delay is True and clock_leader(antenna_handle) is None:
                     phase_clock_cols = np.arange(phase_clock_idxs.start, phase_clock_idxs.stop)[antenna_handle.phase_clock_idxs][idx_start:]
                     S_phase_clock = clock_process_operator(store_handle, antenna_handle, ref_handle, True)['S']
                     jac_ant_phase_clock = np.zeros((S_phase_clock.shape[0], analytical_jac.shape[1]))

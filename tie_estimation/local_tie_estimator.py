@@ -70,7 +70,7 @@ from single_diff_tools import import_key_gnss, import_vex_gnss, import_data_vlbi
                   write_vda_phase, NavStore, fit_phase_clock_params_grdel, nearest_rinex_ant_code, source_map, \
                   wavelength_at, PREFERRED_IONO_BAND, owns_trop_states, share_site_troposphere, \
                   antenna_noise_params, clock_leader, linked_stochastic_clock, merge_linked_clock_times, num_clock_states, \
-                  unwrap_clock_cycles, cap_phase_clock_psd
+                  unwrap_clock_cycles, cap_phase_clock_psd, shared_clock_leader, iterative_restore_phase
 
 MIN_SLICE = 0
 MIN_TROP_DIST = 0.5e3 # 1 km
@@ -102,8 +102,8 @@ BLOCK_MAP = { # map for satellite blocks
 }
 
 mapping_dict = {
-    'C1': ['C1D', 'C1B', 'C1C', 'C1P'],
-    'L1': ['L1D', 'L1B', 'L1C', 'L1P'],
+    'C1': ['C1C', 'C1P', 'C1B', 'C1D'],
+    'L1': ['L1C', 'L1P', 'L1B', 'L1D'],
     'P2': ['C2S'],
     'L2': ['L2S']
 }
@@ -319,10 +319,23 @@ def add_args_to_parser(parser_in):
                          default=False,
                          help="Use a stochastic (Kalman filter-like) model for clock bias. Replaces clock_poly_length",
                          )
+    parser.add_argument("--no_phase_restore",
+                         action="store_true",
+                         default=False,
+                         help="Skip the iterative restore of excluded phase observations (within 3.5 sigma) after the last "
+                              "LS-VCE of the phase-only fixed ambiguity solution",
+                         )
+    parser.add_argument("--phase_stochastic_clock",
+                         action="store_true",
+                         default=False,
+                         help="Stochastic clock for the carrier phase only (implies --stochastic_clock): the range clock of "
+                              "every antenna is its global polynomial (--global_linear_clock/--global_quadratic_clock) plus an "
+                              "offset, in the range solution and in the range part of the combined solutions",
+                         )
     parser.add_argument("--baseline_strategy",
                          type=str,
                          default='Obs-Max',
-                         help="If using GNSS observables, choose a strategy for forming the spanning tree of baselines. Options: Obs-Max, Shortest, Ties-GNSS (local ties, then GNSS-GNSS baselines between sites), Ties-VLBI (local ties, then VLBI-VLBI baselines between sites)",
+                         help="If using GNSS observables, choose a strategy for forming the spanning tree of baselines. Options: Obs-Max, Shortest, Ties-GNSS (local ties, then GNSS-GNSS baselines between sites), Ties-VLBI (local ties, then VLBI-VLBI baselines between sites), Max-GNSS-VLBI (as many GNSS-VLBI baselines as possible, then GNSS-GNSS, then VLBI-VLBI; shortest first within each)",
                          )
     parser.add_argument("--stochastic_trop",
                          action="store_true",
@@ -390,6 +403,11 @@ def add_args_to_parser(parser_in):
                          action="store_true",
                          default=False,
                          help="Do tropospheric delay modeling with VieVS GPT3/pressure model.",
+                         )
+    parser.add_argument("--exclude_satellite",
+                         action="append",
+                         default=[],
+                         help="Usage: --exclude_satellite {RINEX_ID}, e.g. G15 (repeatable). Exclude a satellite from the solution",
                          )
     parser.add_argument("--igs_data",
                          action="store_true",
@@ -1170,8 +1188,8 @@ def assign_clock_links(antenna_handles, ref_antenna, stochastic_clock):
 
 def initial_clock_offset(antenna_handle):
     """ Initial stochastic clock value: the bulk clock, or for a linked member its offset from the leader's """
-    leader = clock_leader(antenna_handle)
-    if leader is None or antenna_handle.clock_leader_ref:
+    leader = shared_clock_leader(antenna_handle) # range clock (global-only range clocks share no samples)
+    if leader is None:
         return antenna_handle.bulk_clock
     return antenna_handle.bulk_clock - leader.bulk_clock
 
@@ -1971,6 +1989,8 @@ def lstsq_estimation(sol_type, plot_intermediate_results, ref_antenna, store_han
 
     if not store_handle.grdel_clock_apriori and store_handle.stochastic_clock:
         for antenna_handle in antenna_handles:
+            if getattr(antenna_handle, 'range_clock_global', False):
+                continue # no range clock PSD estimated: the phase clock keeps its a priori PSD
             antenna_handle.phase_clock_psd_rw = antenna_handle.clock_psd_rw
             antenna_handle.phase_clock_psd_irw = antenna_handle.clock_psd_irw
     elif store_handle.stochastic_clock:
@@ -2632,6 +2652,14 @@ def lstsq_estimation(sol_type, plot_intermediate_results, ref_antenna, store_han
                 else:
                     ls_phfixed_phaseonly_first = iterative_weight_adjust_ls_vce(store_handle, ls_phfixed_phaseonly_first.x, bounds,\
                            ls_args, calc_residuals, jac, sol_type, 'phase')
+    if getattr(store_handle, 'phase_restore', True):
+        # restore excluded phase observations consistent with the final weights (3.5 sigma), until none is added
+        print('iteratively restoring phase observations')
+        ls_phfixed_phaseonly_first, ls_args, bounds = iterative_restore_phase(store_handle, ls_phfixed_phaseonly_first, bounds, \
+                ls_args, calc_residuals, jac, n_ao_state, n_grav_state)
+        (clock_idxs_phfix, trop_idxs_phfix, disb_idxs_phfix, amb_state_idxs_phfix, phase_clock_idxs_phfix, phase_disb_idxs_phfix) = \
+                (ls_args[4], ls_args[6], ls_args[8], ls_args[13], ls_args[17], ls_args[18])
+        bound_low_phfinal, bound_high_phfinal = bounds
     # the state on the current index sets: outlier removal re-samples the stochastic epochs (adjust_stoch_params), so
     # the state taken before it no longer lines up with clock_idxs_phfix, phase_clock_idxs_phfix, amb_state_idxs_phfix
     state_phfinal = ls_phfixed_phaseonly_first.x
@@ -2699,8 +2727,20 @@ def lstsq_estimation(sol_type, plot_intermediate_results, ref_antenna, store_han
     # put the range clock state back in 
     ao_state_phfix = ls_phfixed_phaseonly.x[ao_idxs_phfix] 
     grav_state_phfix =  ls_phfixed_phaseonly.x[grav_idxs_phfix] 
+    if store_handle.stochastic_trop:
+        # stochastic ZWD on the phase-only solution's epochs: the antenna handles hold those epochs now
+        trop_state_pre_fix = ls_phfixed_phaseonly.x[trop_idxs_phfix]
     state_apriori_phfix = np.concatenate((state_apriori_phfix[:clock_idxs.start], clock_state_pre_fix, ao_state_phfix, grav_state_phfix,\
             trop_state_pre_fix, disb_state_pre_fix, ls_phfixed_phaseonly.x[phase_clock_idxs_phfix.start:]))
+    if store_handle.stochastic_clock or store_handle.stochastic_trop:
+        # index sets of the assembled state: the phase-only solution's stochastic epochs (outlier removal, phase
+        # restore) set the lengths of its ZWD, phase clock, phase DISB and ambiguity blocks
+        trop_start = clock_idxs.start + len(clock_state_pre_fix) + len(ao_state_phfix) + len(grav_state_phfix)
+        trop_idxs = slice(trop_start, trop_start + len(trop_state_pre_fix))
+        disb_idxs_prefix = slice(trop_idxs.stop, trop_idxs.stop + len(disb_state_pre_fix))
+        shift = disb_idxs_prefix.stop - phase_clock_idxs_phfix.start
+        phase_clock_idxs, phase_disb_idxs, amb_state_idxs = [slice(idxs.start + shift, idxs.stop + shift) for idxs in
+                                                             (phase_clock_idxs_phfix, phase_disb_idxs_phfix, amb_state_idxs_phfix)]
     if store_handle.stochastic_clock is False:
         state_apriori_phfix, phase_clock_idxs, phase_disb_idxs, _ = gen_phase_clock_state(store_handle, antenna_handles, baseline_handles,\
                 baselines, ref_antenna, state_apriori_phfix, end_range_state, clock_idxs, clock_poly_length, trop_idxs, trop_poly_length, disb_idxs_prefix, \
@@ -2727,6 +2767,11 @@ def lstsq_estimation(sol_type, plot_intermediate_results, ref_antenna, store_han
                        phase_disb_idxs, combination_type, z_par, iZt)
     bound_low_phfixed = union_of_slices(bound_low_phfix, rxpos_idxs, clock_idxs, ao_idxs, grav_idxs, trop_idxs, disb_idxs, phase_clock_idxs, phase_disb_idxs, amb_state_idxs)
     bound_high_phfixed = union_of_slices(bound_high_phfix, rxpos_idxs, clock_idxs,  ao_idxs, grav_idxs, trop_idxs, disb_idxs, phase_clock_idxs, phase_disb_idxs, amb_state_idxs)
+    if len(bound_low_phfixed) < len(state_apriori_phfix):
+        # the state grew since the bounds were set (phase restore added stochastic epochs): unbounded new elements
+        n_pad = len(state_apriori_phfix) - len(bound_low_phfixed)
+        bound_low_phfixed = np.concatenate((bound_low_phfixed, np.full(n_pad, -np.inf)))
+        bound_high_phfixed = np.concatenate((bound_high_phfixed, np.full(n_pad, np.inf)))
     bounds = (bound_low_phfixed, bound_high_phfixed)
     ls_phfixed_initial = least_squares(calc_residuals, state_apriori_phfix, jac=jac, method='trf',\
             max_nfev=100, bounds=bounds, verbose=2, x_scale = 'jac', xtol=1e-15,\
@@ -2858,6 +2903,18 @@ if __name__ == '__main__':
            
            rinex_sats.append(rinex_id)
 
+        # --exclude_satellite: drop the satellites from the solution (GNSS data and VLBI fringe import both select on rinex_sats)
+        for excluded_sat in args.exclude_satellite:
+            excluded_id = excluded_sat.strip().upper()
+            if len(excluded_id) < 2 or excluded_id[0] not in 'GEC' or not excluded_id[1:].isdigit():
+                raise ValueError(f'--exclude_satellite {excluded_sat}: expected a RINEX satellite ID such as G15, E07 or C30')
+            excluded_id = excluded_id[0] + excluded_id[1:].zfill(2)
+            if excluded_id in rinex_sats:
+                rinex_sats.remove(excluded_id)
+                print(f'excluding satellite {excluded_id} (--exclude_satellite)')
+            else:
+                print(f'--exclude_satellite {excluded_id}: not in the ephemeris satellites -- nothing to exclude')
+
     if args.src_type in ('VLBI', 'mixed'):
         if args.fringe_file is not None:
             src_dict = read_src(args.src_file)
@@ -2951,7 +3008,7 @@ if __name__ == '__main__':
             
             # use only satellites in ephemeris -- otherwise will cause GNSSTK errors
             started=0
-            for sat in rinex_sats[1:]:
+            for sat in rinex_sats:
                 try:
                     rinex_data_sat = rinex_data_full.sel(sv=sat)
                     if started == 0:
@@ -3093,12 +3150,17 @@ if __name__ == '__main__':
 
     if args.global_linear_clock and args.global_quadratic_clock:
         raise ValueError('Must choose --global_linear_clock or --global_quadratic clock (not both)')
+    if args.phase_stochastic_clock:
+        args.stochastic_clock = True # the phase clock is stochastic; the range clock global (range_clock_global)
+        if args.grdel_clock_apriori:
+            raise ValueError('--phase_stochastic_clock cannot be combined with --grdel_clock_apriori (no group delay clock variation)')
      
     # initialize the stores handle
     store_handle = GNSSTKStores(sol_type, args.src_type, sol_sys, antenna_store, ocean_store, atm_store, nav_store, \
             args.iono_free, args.iono_freq, args.analytical_delay, args.stochastic_clock, args.stochastic_trop, args.global_linear_clock,\
             args.global_quadratic_clock, args.estimate_disb, args.estimate_phase_disb)
     store_handle.grdel_clock_apriori = args.grdel_clock_apriori
+    store_handle.phase_restore = not args.no_phase_restore
     store_handle.phase_clock_cap_n = args.phase_clock_cap_n
     store_handle.mw_widelane = not args.no_mw_widelane
     store_handle.antenna_covariance = args.antenna_covariance
@@ -3315,6 +3377,11 @@ if __name__ == '__main__':
         antenna_handles.append(antenna_handle)
 
     assign_clock_links(antenna_handles, args.ref_antenna, args.stochastic_clock)
+    for antenna_handle in antenna_handles:
+        # --phase_stochastic_clock: range clock block [global, offset], no range clock process rows
+        antenna_handle.range_clock_global = args.phase_stochastic_clock and antenna_handle.antenna_name != args.ref_antenna
+    if args.phase_stochastic_clock:
+        print('Range clocks: global polynomial and offset only; stochastic clock for the carrier phase (--phase_stochastic_clock)')
     if args.grdel_clock_apriori and any(clock_leader(antenna_handle) is not None for antenna_handle in antenna_handles):
         raise ValueError('--linked_clock cannot be combined with --grdel_clock_apriori')
 
